@@ -282,6 +282,8 @@ def get_args() -> argparse.Namespace:
                         help="Fail if audio file is missing a corresponding prompt file (default: skip missing)")
     parser.add_argument("--skip_tags", type=str, default=None,
                         help="Comma-separated list of tags to skip (e.g. 'vocals,speech')")
+    parser.add_argument("--scratch", action="store_true",
+                        help="Train from scratch (random initialization) instead of loading a checkpoint.")
 
     return parser.parse_args()
 
@@ -1086,73 +1088,83 @@ def run_ddp_worker(rank: int, world_size: int, args):
             no_decay_embed = args.no_decay_embed,
         )
 
-        # load model checkpoint
-        if args.local_ckpt:
-            ckpt_file = args.local_ckpt
-        else:
-            ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
+        # Initialize model
         model = DiaModel(dia_cfg)
-        state = torch.load(ckpt_file, map_location="cpu")
-        # Track if we performed expansion to know if we should warm-start stereo
-        expanded_stereo = False
 
-        # Adapt checkpoint for stereo (9 -> 18 channels) before loading to avoid size mismatch
-        try:
-            key = "decoder.logits_dense.weight"
-            if key in state:
-                expected_W = model.decoder.logits_dense.weight
-                W_ckpt = state[key]
-                if (
-                    W_ckpt is not None
-                    and expected_W is not None
-                    and W_ckpt.dim() == 3
-                    and expected_W.dim() == 3
-                    and W_ckpt.shape[0] == expected_W.shape[0]
-                    and W_ckpt.shape[2] == expected_W.shape[2]
-                    and W_ckpt.shape[1] != expected_W.shape[1]
-                ):
-                    # If checkpoint has 9 channels and model expects 18, duplicate along channel dim
-                    if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
-                        state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
-                        expanded_stereo = True
-                        logger.info(
-                            f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication"
-                        )
-                    else:
-                        # Fallback: drop the mismatched tensor so it's treated as missing
-                        del state[key]
-                        logger.warning(
-                            f"Removed {key} from checkpoint due to incompatible shape {tuple(W_ckpt.shape)} -> expected {tuple(expected_W.shape)}"
-                        )
-        except Exception as e:
-            logger.warning(f"While adapting checkpoint weights: {e}")
-        
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        logger.info(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
-        
-        # Warm-start stereo by duplicating left channel params into right, ONLY if expanding 9->18
-        # If we loaded an existing stereo checkpoint, expanded_stereo is False, so we skip this
-        if expanded_stereo:
-            try:
-                if dia_cfg.data.channels == 18:
-                    logger.info("Warm-starting stereo channels (copying Left -> Right)...")
-                    if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
-                        for i in range(9, 18):
-                            model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
-                    W = model.decoder.logits_dense.weight  # (E, C, V)
-                    if W.dim() == 3 and W.shape[1] >= 18:
-                        W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
-            except Exception as e:
-                logger.warning(f"Stereo warm-start duplication skipped: {e}")
+        if args.scratch:
+            if rank == 0:
+                print("Initializing model from scratch (random weights)...")
+            if hasattr(model, '_init_weights'):
+                model._init_weights()
+            expanded_stereo = False
         else:
-            if dia_cfg.data.channels == 18:
-                logger.info("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
-        # Release checkpoint tensors from CPU memory ASAP to reduce per-rank RSS
-        del state
-        gc.collect()
+            # load model checkpoint
+            if args.local_ckpt:
+                ckpt_file = args.local_ckpt
+            else:
+                ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
+            
+            state = torch.load(ckpt_file, map_location="cpu")
+            # Track if we performed expansion to know if we should warm-start stereo
+            expanded_stereo = False
 
-        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        logger.info(f"Rank {rank} after checkpoint load RSS ~{rss_mb:.1f} MB (PID {os.getpid()})")
+            # Adapt checkpoint for stereo (9 -> 18 channels) before loading to avoid size mismatch
+            try:
+                key = "decoder.logits_dense.weight"
+                if key in state:
+                    expected_W = model.decoder.logits_dense.weight
+                    W_ckpt = state[key]
+                    if (
+                        W_ckpt is not None
+                        and expected_W is not None
+                        and W_ckpt.dim() == 3
+                        and expected_W.dim() == 3
+                        and W_ckpt.shape[0] == expected_W.shape[0]
+                        and W_ckpt.shape[2] == expected_W.shape[2]
+                        and W_ckpt.shape[1] != expected_W.shape[1]
+                    ):
+                        # If checkpoint has 9 channels and model expects 18, duplicate along channel dim
+                        if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
+                            state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
+                            expanded_stereo = True
+                            logger.info(
+                                f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication"
+                            )
+                        else:
+                            # Fallback: drop the mismatched tensor so it's treated as missing
+                            del state[key]
+                            logger.warning(
+                                f"Removed {key} from checkpoint due to incompatible shape {tuple(W_ckpt.shape)} -> expected {tuple(expected_W.shape)}"
+                            )
+            except Exception as e:
+                logger.warning(f"While adapting checkpoint weights: {e}")
+            
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            logger.info(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
+            
+            # Warm-start stereo by duplicating left channel params into right, ONLY if expanding 9->18
+            # If we loaded an existing stereo checkpoint, expanded_stereo is False, so we skip this
+            if expanded_stereo:
+                try:
+                    if dia_cfg.data.channels == 18:
+                        logger.info("Warm-starting stereo channels (copying Left -> Right)...")
+                        if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
+                            for i in range(9, 18):
+                                model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
+                        W = model.decoder.logits_dense.weight  # (E, C, V)
+                        if W.dim() == 3 and W.shape[1] >= 18:
+                            W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
+                except Exception as e:
+                    logger.warning(f"Stereo warm-start duplication skipped: {e}")
+            else:
+                if dia_cfg.data.channels == 18:
+                    logger.info("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
+            # Release checkpoint tensors from CPU memory ASAP to reduce per-rank RSS
+            del state
+            gc.collect()
+
+            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            logger.info(f"Rank {rank} after checkpoint load RSS ~{rss_mb:.1f} MB (PID {os.getpid()})")
 
         # Ensure all parameters have consistent dtype for DDP
         if args.half:
@@ -1238,58 +1250,68 @@ def main():
             no_decay_embed = args.no_decay_embed,
         )
 
-        if args.local_ckpt:
-            ckpt_file = args.local_ckpt
-        else:
-            ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
         model = DiaModel(dia_cfg)
-        state = torch.load(ckpt_file, map_location="cpu")
-        # Track if we performed expansion to know if we should warm-start stereo
-        expanded_stereo = False
+        
+        if args.scratch:
+            if rank == 0:
+                print("Initializing model from scratch (random weights)...")
+            if hasattr(model, '_init_weights'):
+                model._init_weights()
+            expanded_stereo = False
+        else:
+            if args.local_ckpt:
+                ckpt_file = args.local_ckpt
+            else:
+                ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
+            
+            state = torch.load(ckpt_file, map_location="cpu")
+            # Track if we performed expansion to know if we should warm-start stereo
+            expanded_stereo = False
 
-        # Adapt checkpoint for stereo (9 -> 18 channels) before loading to avoid size mismatch
-        try:
-            key = "decoder.logits_dense.weight"
-            if key in state:
-                expected_W = model.decoder.logits_dense.weight
-                W_ckpt = state[key]
-                if (
-                    W_ckpt is not None
-                    and expected_W is not None
-                    and W_ckpt.dim() == 3
-                    and expected_W.dim() == 3
-                    and W_ckpt.shape[0] == expected_W.shape[0]
-                    and W_ckpt.shape[2] == expected_W.shape[2]
-                    and W_ckpt.shape[1] != expected_W.shape[1]
-                ):
-                    if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
-                        state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
-                        expanded_stereo = True
-                        logger.info(
-                            f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication"
-                        )
-                    else:
-                        del state[key]
-                        logger.warning(
-                            f"Removed {key} from checkpoint due to incompatible shape {tuple(W_ckpt.shape)} -> expected {tuple(expected_W.shape)}"
-                        )
-        except Exception as e:
-            logger.warning(f"While adapting checkpoint weights: {e}")
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        logger.info(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
-        try:
-            if expanded_stereo and dia_cfg.data.channels == 18:
-                logger.info("Warm-starting stereo channels (copying Left -> Right)...")
-                if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
-                    for i in range(9, 18):
-                        model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
-                W = model.decoder.logits_dense.weight
-                if W.dim() == 3 and W.shape[1] >= 18:
-                    W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
-            elif dia_cfg.data.channels == 18:
-                logger.info("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
-        except Exception as e:
-            logger.warning(f"Stereo warm-start duplication skipped: {e}")
+            # Adapt checkpoint for stereo (9 -> 18 channels) before loading to avoid size mismatch
+            try:
+                key = "decoder.logits_dense.weight"
+                if key in state:
+                    expected_W = model.decoder.logits_dense.weight
+                    W_ckpt = state[key]
+                    if (
+                        W_ckpt is not None
+                        and expected_W is not None
+                        and W_ckpt.dim() == 3
+                        and expected_W.dim() == 3
+                        and W_ckpt.shape[0] == expected_W.shape[0]
+                        and W_ckpt.shape[2] == expected_W.shape[2]
+                        and W_ckpt.shape[1] != expected_W.shape[1]
+                    ):
+                        if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
+                            state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
+                            expanded_stereo = True
+                            logger.info(
+                                f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication"
+                            )
+                        else:
+                            del state[key]
+                            logger.warning(
+                                f"Removed {key} from checkpoint due to incompatible shape {tuple(W_ckpt.shape)} -> expected {tuple(expected_W.shape)}"
+                            )
+            except Exception as e:
+                logger.warning(f"While adapting checkpoint weights: {e}")
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            logger.info(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
+            try:
+                if expanded_stereo and dia_cfg.data.channels == 18:
+                    logger.info("Warm-starting stereo channels (copying Left -> Right)...")
+                    if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
+                        for i in range(9, 18):
+                            model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
+                    W = model.decoder.logits_dense.weight
+                    if W.dim() == 3 and W.shape[1] >= 18:
+                        W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
+                elif dia_cfg.data.channels == 18:
+                    logger.info("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
+            except Exception as e:
+                logger.warning(f"Stereo warm-start duplication skipped: {e}")
+
         
         # Ensure all parameters have consistent dtype
         if args.half:

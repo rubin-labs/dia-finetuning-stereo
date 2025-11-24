@@ -114,6 +114,8 @@ def get_args() -> argparse.Namespace:
                         help="Fraction of unconditional training steps.")
     parser.add_argument("--eval_step", type=int, default=200,
                         help="Evaluate every N steps.")
+    parser.add_argument("--scratch", action="store_true",
+                        help="Train from scratch (random initialization) instead of loading a checkpoint.")
     
     return parser.parse_args()
 
@@ -293,8 +295,15 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, writer, step, globa
         valid_time = time_idx < (lens.unsqueeze(1) - 1)                # (B, Tm1)
         mask = valid_time.unsqueeze(-1).expand(-1, -1, C)             # (B, Tm1, C)
 
-        # apply 4× weight on first channel, 1× on others
-        channel_weights = [4.0] + [1.0] * (C - 1)
+        # custom weighting: use uniform weights for musicgen style
+        codebook_pattern = [1.0] * 9
+        channel_weights = []
+        num_groups = C // 9
+        if num_groups > 0:
+            for _ in range(num_groups):
+                channel_weights.extend(codebook_pattern)
+        else:
+            channel_weights = [1.0] * C
         loss_c = 0.0
         _, _, _, V = logits.size()
 
@@ -364,8 +373,16 @@ def eval_step(model, val_loader, dia_cfg, dac_model, writer, global_step):
             B_e, T_e, C_e = target.shape
             V_e = logits.size(-1)
 
-            loss_e = 0.0
-            weights_e = [4.0] + [1.0] * (C_e - 1)
+            # Custom weighting for eval as well to match training objective
+            codebook_pattern = [1.0] * 9
+            weights_e = []
+            num_groups = C_e // 9
+            if num_groups > 0:
+                for _ in range(num_groups):
+                    weights_e.extend(codebook_pattern)
+            else:
+                weights_e = [1.0] * C_e
+            
             for c, w in enumerate(weights_e):
                 lc = logits[:, :, c, :].reshape(-1, V_e)
                 tc = target[:, :, c].reshape(-1)
@@ -538,16 +555,23 @@ def main():
     )
 
     # load model checkpoint
-    if args.local_ckpt:
-        ckpt_file = args.local_ckpt
-    else:
-        ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
     model = DiaModel(dia_cfg)
+    if args.scratch:
+        print("Initializing model from scratch (random weights)...")
+        if hasattr(model, '_init_weights'):
+            model._init_weights()
+    else:
+        if args.local_ckpt:
+            ckpt_file = args.local_ckpt
+        else:
+            ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
+        state = torch.load(ckpt_file, map_location="cpu")
+        model.load_state_dict(state, strict=False)
+
     if args.half:
         model=model.half()
     if args.compile:
         model = torch.compile(model, backend="inductor")
-    model.load_state_dict(torch.load(ckpt_file, map_location="cpu"))
     
 
     # start training

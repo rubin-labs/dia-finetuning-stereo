@@ -40,7 +40,7 @@ class DataConfig(BaseModel, frozen=True):
     audio_eos_value: int = Field(default=1024)
     audio_pad_value: int = Field(default=1025)
     audio_bos_value: int = Field(default=1026)
-    delay_pattern: list[Annotated[int, Field(ge=0)]] = Field(default_factory=lambda: [0, 8, 9, 10, 11, 12, 13, 14, 15])
+    delay_pattern: list[Annotated[int, Field(ge=0)]] = Field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7, 8])
 
     def __hash__(self) -> int:
         """Generate a hash based on all fields of the config."""

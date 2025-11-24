@@ -837,7 +837,7 @@ class DiaModel(nn.Module):
         self.config = config
         self.encoder = Encoder(config)
         self.decoder = Decoder(config)
-        #self._init_weights()
+        self._init_weights()
 
     
     def _init_weights(self):
@@ -845,6 +845,10 @@ class DiaModel(nn.Module):
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, DenseGeneral):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if getattr(module, 'bias', None) is not None:
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, torch.nn.Embedding):
                 torch.nn.init.xavier_uniform_(module.weight)

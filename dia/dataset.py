@@ -9,11 +9,15 @@ import dac
 from .config import DiaConfig
 import random
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class MusicDataset(Dataset):
     """Load from audio folder and audio_prompts folder structure."""
-    def __init__(self, audio_folder: Path, config: DiaConfig, dac_model: dac.DAC, use_sliding_window: bool = True):
+    def __init__(self, audio_folder: Path, config: DiaConfig, dac_model: dac.DAC, use_sliding_window: bool = True, ignore_missing_prompts: bool = True, skip_tags: list = None):
+        print("WARNING: MusicDataset performs on-the-fly DAC encoding which is very slow and blocks training. Consider using scripts/preencode_audio.py and --preencoded_dir for much faster training.")
         self.audio_folder = Path(audio_folder)
         self.prompts_folder = self.audio_folder.parent / "audio_prompts"
         self.config = config
@@ -29,18 +33,66 @@ class MusicDataset(Dataset):
         
         # Filter to only include files that have corresponding prompt files
         self.valid_files = []
+        skipped_missing = 0
+        skipped_tags = 0
+
         for audio_file in self.audio_files:
             prompt_file = self.prompts_folder / f"{audio_file.stem}_prompt.txt"
-            if prompt_file.exists():
-                self.valid_files.append(audio_file)
+            
+            if not prompt_file.exists():
+                if ignore_missing_prompts:
+                    skipped_missing += 1
+                    continue
+                else:
+                    raise FileNotFoundError(f"Missing prompt file: {prompt_file}")
+            
+            # Check for skip tags if provided
+            if skip_tags:
+                try:
+                    with open(prompt_file, 'r', encoding='utf-8') as f:
+                        text = f.read().strip().lower()
+                    
+                    should_skip = False
+                    for tag in skip_tags:
+                        if tag.strip().lower() in text:
+                            should_skip = True
+                            break
+                    
+                    if should_skip:
+                        skipped_tags += 1
+                        continue
+                except Exception as e:
+                    print(f"Warning: error reading prompt {prompt_file}: {e}")
+                    skipped_missing += 1
+                    continue
+
+            self.valid_files.append(audio_file)
         
         if not self.valid_files:
-            raise ValueError(f"No valid audio-prompt pairs found in {self.audio_folder}")
+            raise ValueError(f"No valid audio-prompt pairs found in {self.audio_folder}. Skipped {skipped_missing} missing, {skipped_tags} by tags.")
         
-        print(f"Found {len(self.valid_files)} audio-prompt pairs")
+        print(f"Found {len(self.valid_files)} audio-prompt pairs. Skipped: {skipped_missing} missing prompts, {skipped_tags} filtered by tags.")
 
     def __len__(self) -> int:
         return len(self.valid_files)
+    
+    def _encode_mono_channel(self, wav_1xS: torch.Tensor) -> torch.Tensor:
+        """Encode a single mono channel with DAC.
+        
+        Args:
+            wav_1xS: Audio tensor of shape (1, samples)
+            
+        Returns:
+            Encoded tensor of shape (T, 9)
+        """
+        device = next(self.dac_model.parameters()).device
+        audio_tensor = self.dac_model.preprocess(
+            wav_1xS.unsqueeze(0),  # -> (1, 1, S)
+            44100
+        ).to(device)
+        _, enc, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)  # (1, 9, T)
+        enc = enc.squeeze(0).transpose(0, 1).to(torch.long)  # (T, 9)
+        return enc
 
     def __getitem__(self, idx: int):
         audio_file = self.valid_files[idx]
@@ -59,10 +111,10 @@ class MusicDataset(Dataset):
         
         if not self.use_sliding_window:
             # Original behavior: crop to target length here
-            # DAC compression ratio is ~86 tokens per second
-            # Convert audio_length (tokens) to samples: tokens * (44100 samples/sec) / (86 tokens/sec)
+            # DAC compression ratio: 44100 samples/sec ÷ 512 hop_length = ~86.13 tokens/sec
+            # Convert audio_length (tokens) to samples: tokens * (44100 samples/sec) / (44100/512 tokens/sec)
             target_length_tokens = self.config.data.audio_length
-            target_length_samples = int(target_length_tokens * 44100 / 86)
+            target_length_samples = int(target_length_tokens * 512)
             total_samples = waveform.shape[1]
             
             if total_samples > target_length_samples:
@@ -74,27 +126,18 @@ class MusicDataset(Dataset):
         
         # Encode with DAC: process mono per channel and build stereo codes (9->18)
         with torch.no_grad():
-            device = next(self.dac_model.parameters()).device
-
-            def encode_mono(wav_1xS: torch.Tensor) -> torch.Tensor:
-                # wav_1xS: shape (1, samples)
-                audio_tensor = self.dac_model.preprocess(
-                    wav_1xS.unsqueeze(0),  # -> (1, 1, S)
-                    44100
-                ).to(device)
-                _, enc, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)  # (1, 9, T)
-                enc = enc.squeeze(0).transpose(0, 1).to(torch.long)  # (T, 9)
-                return enc
-
-            if waveform.shape[0] >= 2:
+            num_channels = waveform.shape[0]
+            if num_channels > 2:
+                raise ValueError(f"Audio file {audio_file} has {num_channels} channels. Only mono (1) or stereo (2) are supported.")
+            elif num_channels == 2:
                 left = waveform[0:1, :]
                 right = waveform[1:2, :]
-                enc_L = encode_mono(left)
-                enc_R = encode_mono(right)
+                enc_L = self._encode_mono_channel(left)
+                enc_R = self._encode_mono_channel(right)
             else:
                 # Duplicate mono to both channels
                 mono = waveform[0:1, :]
-                enc_L = encode_mono(mono)
+                enc_L = self._encode_mono_channel(mono)
                 enc_R = enc_L.clone()
 
             encoded = torch.cat([enc_L, enc_R], dim=1)  # (T, 18)
@@ -154,25 +197,22 @@ class PreEncodedDACDataset(Dataset):
         encoded_file = self.encoded_files[idx]
         
         # Load pre-encoded DAC tensor
-        encoded_stereo = torch.load(encoded_file, map_location='cpu')  # Shape: (T, 18) for stereo
-        
-        # Keep stereo codes as-is (expect shape (T, 18) for stereo)
-        encoded_mono = encoded_stereo
+        encoded = torch.load(encoded_file, map_location='cpu')  # Shape: (T, 18) for stereo or (T, 9) for mono
         
         if not self.use_sliding_window:
             # Original behavior: crop to target length here
             target_length = self.config.data.audio_length
-            if encoded_mono.shape[0] > target_length:
+            if encoded.shape[0] > target_length:
                 # Random crop for training variety
-                max_start = encoded_mono.shape[0] - target_length
+                max_start = encoded.shape[0] - target_length
                 start_idx = random.randint(0, max_start)
-                encoded_mono = encoded_mono[start_idx:start_idx + target_length]
-            elif encoded_mono.shape[0] < target_length:
+                encoded = encoded[start_idx:start_idx + target_length]
+            elif encoded.shape[0] < target_length:
                 # Pad if too short
-                pad_length = target_length - encoded_mono.shape[0]
+                pad_length = target_length - encoded.shape[0]
                 pad_value = self.config.data.audio_pad_value
-                padding = torch.full((pad_length, encoded_mono.shape[1]), pad_value, dtype=encoded_mono.dtype)
-                encoded_mono = torch.cat([encoded_mono, padding], dim=0)
+                padding = torch.full((pad_length, encoded.shape[1]), pad_value, dtype=encoded.dtype)
+                encoded = torch.cat([encoded, padding], dim=0)
         # If using sliding window, keep the full sequence - cropping happens in collate_fn
         
         # Use filename as prompt (full filename, not just first few words)
@@ -181,11 +221,28 @@ class PreEncodedDACDataset(Dataset):
         if encoded_file.name in self.metadata and 'text' in self.metadata[encoded_file.name]:
             text_prompt = self.metadata[encoded_file.name]['text']
         else:
-            # Use full filename as prompt, replacing underscores/hyphens with spaces
-            text_prompt = filename.replace('_', ' ').replace('-', ' ')
+            # Try finding a prompt file
+            # 1. Same dir, .txt
+            prompt_path = encoded_file.with_suffix('.txt')
+            prompt_path_alt = self.preprocessed_dir / "prompts" / f"{encoded_file.stem}.txt"
+            prompt_path_alt2 = self.preprocessed_dir / "prompts" / f"{encoded_file.stem}_prompt.txt"
+            
+            if prompt_path.exists():
+                with open(prompt_path, 'r', encoding='utf-8') as f:
+                    text_prompt = f.read().strip()
+            elif prompt_path_alt.exists():
+                with open(prompt_path_alt, 'r', encoding='utf-8') as f:
+                    text_prompt = f.read().strip()
+            elif prompt_path_alt2.exists():
+                with open(prompt_path_alt2, 'r', encoding='utf-8') as f:
+                    text_prompt = f.read().strip()
+            else:
+                # Fallback to empty string (unconditional training) if no prompt found
+                # We do NOT fallback to filename to avoid polluting the model with bad prompts
+                text_prompt = ""
         
         # Ensure integer token dtype expected by training
-        encoded_mono = encoded_mono.to(torch.long)
+        encoded = encoded.to(torch.long)
 
         # Return format expected by collate_fn: (text, encoded_audio, waveforms)
-        return text_prompt, encoded_mono, None  # No waveform since we have encoded data
+        return text_prompt, encoded, None  # No waveform since we have encoded data

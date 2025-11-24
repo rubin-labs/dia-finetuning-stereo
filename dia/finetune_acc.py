@@ -39,6 +39,7 @@ import time
 import signal
 import sys
 import datetime
+import re
 
 import dac
 from .config import DiaConfig
@@ -90,11 +91,11 @@ def _augment_tags(text: str) -> str:
 
 def seed_everything(seed: int, rank: int = 0):
     """Set seeds for reproducible training across all ranks."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    random.seed(seed + rank)
+    np.random.seed(seed + rank)
+    torch.manual_seed(seed + rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(seed + rank)
 
 
 def _worker_init_fn(worker_id):
@@ -106,8 +107,8 @@ def _worker_init_fn(worker_id):
 
 # Music-specific processing can be added here if needed
 test_prompts = {
-    "travis_scott": "travis scott",
-    "house": "house"
+    "synthesizer": "synthesizer",
+    "mix": "synthesizer, rap"
 }
 
 
@@ -117,8 +118,10 @@ def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):
         return
     
     # Find all checkpoint files (both step and epoch checkpoints)
-    step_checkpoints = sorted(glob.glob(str(output_dir / "ckpt_step*.pth")))
-    epoch_checkpoints = sorted(glob.glob(str(output_dir / "ckpt_epoch*.pth")))
+    step_checkpoints = sorted(glob.glob(str(output_dir / "ckpt_step*.pth")), 
+                            key=lambda x: int(re.search(r'ckpt_step(\d+).pth', x).group(1)) if re.search(r'ckpt_step(\d+).pth', x) else 0)
+    epoch_checkpoints = sorted(glob.glob(str(output_dir / "ckpt_epoch*.pth")),
+                             key=lambda x: int(re.search(r'ckpt_epoch(\d+).pth', x).group(1)) if re.search(r'ckpt_epoch(\d+).pth', x) else 0)
     
     # Keep latest N of each type
     if len(step_checkpoints) > keep_last_n:
@@ -252,16 +255,20 @@ def get_args() -> argparse.Namespace:
                         help="AdamW weight decay coefficient.")
     parser.add_argument("--warmup_steps", type=int, default=500,
                         help="Number of warmup steps.")
-    parser.add_argument("--unconditional_frac", type=float, default=1,
+    parser.add_argument("--unconditional_frac", type=float, required=True,
                         help="Fraction of unconditional training steps.")
     parser.add_argument("--eval_step", type=int, default=200,
-                        help="Evaluate every N steps.")
+                        help="Calculate validation loss every N steps.")
+    parser.add_argument("--demo_every", type=int, default=None,
+                        help="Generate audio demos every N steps (if None, defaults to same as --eval_step).")
     parser.add_argument("--eval_every_epochs", type=int, default=None,
                         help="Evaluate at the end of every N epochs (overrides step-based eval).")
     parser.add_argument("--save_every_epochs", type=int, default=None,
                         help="Save checkpoint at the end of every N epochs (overrides step-based save).")
     parser.add_argument("--early_stop_loss", type=float, default=None,
                         help="Early stop when training loss <= this value; saves final checkpoint then exits.")
+    parser.add_argument("--stop_on_overfit", action="store_true",
+                        help="Stop training and generate demo when eval loss > train loss")
     
     # Sliding window augmentation (default: enabled)
     parser.add_argument("--disable_sliding_window", action="store_true",
@@ -270,12 +277,31 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no_decay_embed", action="store_true",
                         help="Exclude nn.Embedding parameters from weight decay")
     
+    # Dataset filtering
+    parser.add_argument("--require_prompts", action="store_true",
+                        help="Fail if audio file is missing a corresponding prompt file (default: skip missing)")
+    parser.add_argument("--skip_tags", type=str, default=None,
+                        help="Comma-separated list of tags to skip (e.g. 'vocals,speech')")
+
     return parser.parse_args()
 
 
 
 def collate_fn(batch, config: DiaConfig, device: torch.device):
     texts, encodings, waveforms = zip(*batch)
+
+    # -- Audio random sliding window --
+    # Use configured audio length (in tokens)
+    window_size = config.data.audio_length
+    
+    cropped_encodings = []
+    for e in encodings:
+        if e.size(0) > window_size:
+            start = random.randint(0, e.size(0) - window_size)
+            cropped_encodings.append(e[start : start + window_size])
+        else:
+            cropped_encodings.append(e)
+    encodings = cropped_encodings
 
     # -- Text inputs ---------------------------------------------------------
 
@@ -306,7 +332,7 @@ def collate_fn(batch, config: DiaConfig, device: torch.device):
             # Pad shorter sequences to batch_max
             pad_length = batch_max - e.size(0)
             pad_value = config.data.audio_pad_value
-            padding = torch.full((pad_length, e.size(1)), pad_value, dtype=e.dtype)
+            padding = torch.full((pad_length, e.size(1)), pad_value, dtype=e.dtype, device=e.device)
             padded_e = torch.cat([e, padding], dim=0)
         else:
             # Already at batch_max length
@@ -408,10 +434,8 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, r
     )
     
     # Set steps_per_epoch attribute for tqdm
-    if use_ddp:
-        steps_per_epoch = len(sampler) // train_cfg.batch_size  # Samples per GPU ÷ batch_size
-    else:
-        steps_per_epoch = len(train_ds) // train_cfg.batch_size
+    # DataLoader already handles batch_size division, so just use its length
+    steps_per_epoch = len(train_loader)
     
     train_loader.steps_per_epoch = steps_per_epoch
     
@@ -476,111 +500,16 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
     total_training_steps = steps_per_epoch * train_cfg.epochs
     sched = get_scheduler(
         'cosine', opt,
-        num_warmup_steps=train_cfg.warmup_steps / train_cfg.grad_accum_steps,
-        num_training_steps=total_training_steps / train_cfg.grad_accum_steps
+        num_warmup_steps=train_cfg.warmup_steps // train_cfg.grad_accum_steps,
+        num_training_steps=total_training_steps // train_cfg.grad_accum_steps
     )
     return opt, sched
 
 
 
-def train_step(model, batch, dia_cfg, train_cfg, opt, sched, writer, step, global_step, accelerator):
+def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_cfg, rank=0, use_ddp=False, do_demo=True, current_train_loss=None, stop_on_overfit=False):
     """
-    Perform a single training step: forward, loss, backward, update, log.
-    Now uses per‑sample tgt_lens to mask out padding after each EOS,
-    and applies uniform loss across all channels.
-    """
-    # (optional) unconditional conditioning
-    if random.random() < train_cfg.unconditional_frac:
-        pad_tok = dia_cfg.data.text_pad_value
-        batch['src_tokens'] = torch.zeros_like(batch['src_tokens'])
-        batch['enc_self_attn_mask'] = torch.zeros_like(batch['enc_self_attn_mask'])
-        batch['dec_cross_attn_mask'] = torch.zeros_like(batch['dec_cross_attn_mask'])
-
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        # forward pass
-        logits = model(
-            src_BxS=batch['src_tokens'],
-            tgt_BxTxC=batch['tgt_tokens'],
-            src_positions=batch['src_positions'],
-            tgt_positions=batch['tgt_positions'],
-            enc_self_attn_mask=batch['enc_self_attn_mask'],
-            dec_self_attn_mask=batch['dec_self_attn_mask'],
-            dec_cross_attn_mask=batch['dec_cross_attn_mask'],
-            enable_dropout=False,
-        )
-        # fetch per-sample target‑lengths (including BOS+frames+EOS)
-        lens = batch['tgt_lens']                   # shape: (B,)
-        max_L = int(lens.max().item())             # maximum over batch
-
-        # keep only up through the last possible EOS slot
-        # logits: (B, T, C, V) -> (B, max_L-1, C, V)
-        logits = logits[:, : max_L - 1]
-
-        # targets: shift off the BOS so 0..<max_L-1> align with logits
-        # target: (B, T, C) -> (B, max_L-1, C)
-        target = batch['tgt_tokens'][:, 1:max_L, :]
-
-        B, Tm1, C = target.shape
-        pad_val = dia_cfg.data.audio_pad_value
-
-        # build a mask [B x (max_L-1)] that is True for t < (lens[i]-1)
-        time_idx = torch.arange(Tm1, device=lens.device).unsqueeze(0)  # (1, Tm1)
-        valid_time = time_idx < (lens.unsqueeze(1) - 1)                # (B, Tm1)
-        mask = valid_time.unsqueeze(-1).expand(-1, -1, C)             # (B, Tm1, C)
-
-        # use uniform channel weights
-        channel_weights = [1.0] * C
-        loss_c = 0.0
-        _, _, _, V = logits.size()
-
-        for c, w in enumerate(channel_weights):
-            # flatten this channel
-            lc = logits[:, :, c, :].reshape(-1, V)   # (B*Tm1, V)
-            tc = target[:, :, c].reshape(-1)         # (B*Tm1,)
-            mc = mask[:, :, c].reshape(-1)           # (B*Tm1,)
-
-            # mask out padding and compute cross-entropy
-            lc_valid = lc[mc]
-            tc_valid = tc[mc]
-            loss_c += w * F.cross_entropy(
-                lc_valid, tc_valid,
-                ignore_index=pad_val
-            )
-
-        # normalize by sum of weights
-        loss = loss_c / sum(channel_weights)
-
-    # scale + backward
-    loss = loss / train_cfg.grad_accum_steps
-    accelerator.backward(loss)
-
-    # step & log
-    if (step + 1) % train_cfg.grad_accum_steps == 0:
-        # Clip once after accumulation, right before optimizer step
-        pre_clip = clip_grad_norm_(model.parameters(), max_norm=5.0)
-        writer.add_scalar('GradNorm/pre_clip', pre_clip, global_step)
-        # Optional post-clip norm computation
-        post_clip_sq = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                g = p.grad.detach()
-                post_clip_sq += g.float().norm(2).item() ** 2
-        writer.add_scalar('GradNorm/post_clip', post_clip_sq ** 0.5, global_step)
-        opt.step()
-        sched.step()
-        opt.zero_grad()
-        true_loss = loss.item() * train_cfg.grad_accum_steps
-        current_lr = sched.get_last_lr()[0]
-        writer.add_scalar('LR', current_lr, global_step)
-        writer.add_scalar('Loss/train', true_loss, global_step)
-
-    return loss.item() * train_cfg.grad_accum_steps
-
-
-
-def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_cfg, rank=0, use_ddp=False):
-    """
-    Run evaluation: generate audio demo samples
+    Run evaluation: calculate loss and optionally generate audio demos
     """
     eval_losses = []
     last_batch = None
@@ -607,7 +536,16 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
             V_e = logits.size(-1)
 
             loss_e = 0.0
-            weights_e = [1.0] * C_e
+            # Custom weighting for eval as well to match training objective
+            codebook_pattern = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+            weights_e = []
+            num_groups = C_e // 9
+            if num_groups > 0:
+                for _ in range(num_groups):
+                    weights_e.extend(codebook_pattern)
+            else:
+                weights_e = [1.0] * C_e
+            
             for c, w in enumerate(weights_e):
                 lc = logits[:, :, c, :].reshape(-1, V_e)
                 tc = target[:, :, c].reshape(-1)
@@ -618,13 +556,24 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
 
             eval_losses.append(loss_e)
 
+    should_stop = False
     if len(eval_losses) > 0:
         avg_eval_loss = sum(eval_losses) / len(eval_losses)
         if rank == 0:
             wandb.log({'eval_loss': avg_eval_loss.item()}, step=global_step)
+            
+            if stop_on_overfit and current_train_loss is not None:
+                if avg_eval_loss > current_train_loss:
+                    logger.info(f"Stop trigger: Eval loss {avg_eval_loss:.4f} > Train loss {current_train_loss:.4f}. Generating demo and stopping.")
+                    should_stop = True
+                    do_demo = True
     else:
         if rank == 0:
             logger.warning("No validation samples available for evaluation - check split_ratio")
+
+    # Only generate demos if requested
+    if not do_demo:
+        return should_stop
 
     # Only rank 0 does audio generation to avoid conflicts
     if rank == 0:
@@ -656,7 +605,11 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                             try:
                                 seed_everything(s)
                                 logger.info(f"Generating unconditional audio (seed={s})")
-                                audio = dia_gen.generate(text="")
+                                audio = dia_gen.generate(
+                                    text="",
+                                    cfg_scale=0.0,
+                                    temperature=1.0
+                                )
                                 
                                 # Save audio file to mono_demos directory
                                 audio_filename = f"step_{global_step}_unconditional_seed{s}.wav"
@@ -692,7 +645,12 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                     for test_name, prompt in test_prompts.items():
                         try:
                             logger.info(f"Generating audio for '{test_name}' with prompt: '{prompt}'")
-                            audio = dia_gen.generate(text=prompt)
+                            audio = dia_gen.generate(
+                                text=prompt,
+                                cfg_scale=4.0,
+                                temperature=1.0,
+                                top_p=0.95
+                            )
                             
                             # Save audio file to mono_demos directory
                             audio_filename = f"step_{global_step}_{test_name}.wav"
@@ -738,6 +696,8 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
     # Synchronize all processes before returning to training
     if use_ddp:
         dist.barrier()
+    
+    return should_stop
 
 
 def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: TrainConfig, args, rank=0, world_size=1, use_ddp=False):
@@ -838,10 +798,29 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 torch.cuda.reset_peak_memory_stats()
 
             # evaluation during epoch (only if epoch-based eval is not requested)
-            if args.eval_every_epochs is None and step > 0 and step % train_cfg.eval_step == 0:
+            if args.eval_every_epochs is None and global_step > 0 and global_step % train_cfg.eval_step == 0:
                 model.eval()
+                # Determine if we should generate demos
+                demo_interval = args.demo_every if args.demo_every is not None else train_cfg.eval_step
+                do_demo = (global_step % demo_interval == 0)
+                
                 with torch.no_grad():
-                    eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_cfg, rank, use_ddp)
+                    should_stop = eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_cfg, rank, use_ddp, do_demo=do_demo, current_train_loss=loss, stop_on_overfit=args.stop_on_overfit)
+                
+                if args.stop_on_overfit:
+                    if use_ddp:
+                        flag = torch.tensor(1 if (rank == 0 and should_stop) else 0, device=device)
+                        dist.broadcast(flag, src=0)
+                        should_stop = bool(flag.item())
+                    
+                    if should_stop:
+                        stop_training = True
+                        if rank == 0:
+                            ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{global_step}.pth"
+                            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                            torch.save(state_dict, ckpt_path)
+                            logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
+                            
                 model.train()
 
             # checkpoint saving logic (only on rank 0) - step-based unless epoch-based save is requested
@@ -849,14 +828,14 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             if args.save_every_epochs is None:
                 if args.save_last is None:  # Normal saving behavior
                     if args.save_every is not None:
-                        should_save = step > 0 and step % args.save_every == 0
+                        should_save = global_step > 0 and global_step % args.save_every == 0
                     else:
-                        should_save = step > 0 and step % train_cfg.save_step == 0
+                        should_save = global_step > 0 and global_step % train_cfg.save_step == 0
                 else:  # save_last is enabled, save every step/epoch but cleanup old ones
                     if args.save_every is not None:
-                        should_save = step > 0 and step % args.save_every == 0
+                        should_save = global_step > 0 and global_step % args.save_every == 0
                     else:
-                        should_save = step > 0 and step % train_cfg.save_step == 0
+                        should_save = global_step > 0 and global_step % train_cfg.save_step == 0
             
             if should_save and rank == 0:
                 ckpt = train_cfg.output_dir / f"ckpt_step{global_step}.pth"
@@ -902,7 +881,28 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             model.eval()
             with torch.no_grad():
                 gsp = ((epoch + 1) * (steps_per_epoch or 0)) - 1
-                eval_step(model, val_loader, dia_cfg, dac_model, gsp if gsp >= 0 else 0, device, train_cfg, rank, use_ddp)
+                # For epoch-based eval, always do demos unless demo_every is set and we're not on a multiple
+                if args.demo_every is None:
+                    do_demo = True
+                else:
+                    do_demo = (gsp > 0 and gsp % args.demo_every == 0)
+                
+                should_stop = eval_step(model, val_loader, dia_cfg, dac_model, gsp if gsp >= 0 else 0, device, train_cfg, rank, use_ddp, do_demo=do_demo, current_train_loss=loss, stop_on_overfit=args.stop_on_overfit)
+                
+                if args.stop_on_overfit:
+                    if use_ddp:
+                        flag = torch.tensor(1 if (rank == 0 and should_stop) else 0, device=device)
+                        dist.broadcast(flag, src=0)
+                        should_stop = bool(flag.item())
+                    
+                    if should_stop:
+                        stop_training = True
+                        if rank == 0:
+                            ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{gsp}.pth"
+                            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                            torch.save(state_dict, ckpt_path)
+                            logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
+
             model.train()
 
         # end of epoch checkpoint (only on rank 0)
@@ -943,9 +943,12 @@ def train_step_ddp(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     """
     Training step for DDP version.
     """
-    if random.random() < train_cfg.unconditional_frac:
+    # Deterministic unconditional decision to keep ranks in sync independent of local random state
+    # (which might drift due to data loader differences)
+    gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
+    if gen_val < train_cfg.unconditional_frac:
         pad_tok = dia_cfg.data.text_pad_value
-        batch['src_tokens'] = torch.zeros_like(batch['src_tokens'])
+        batch['src_tokens'].fill_(pad_tok)
         batch['enc_self_attn_mask'] = torch.zeros_like(batch['enc_self_attn_mask'])
         batch['dec_cross_attn_mask'] = torch.zeros_like(batch['dec_cross_attn_mask'])
 
@@ -970,7 +973,17 @@ def train_step_ddp(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
         time_idx = torch.arange(Tm1, device=lens.device).unsqueeze(0)
         valid_time = time_idx < (lens.unsqueeze(1) - 1)
         mask = valid_time.unsqueeze(-1).expand(-1, -1, C)
-        channel_weights = [1.0] * C
+        
+        # Custom weighting: emphasize later codebooks
+        codebook_pattern = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        channel_weights = []
+        num_groups = C // 9
+        if num_groups > 0:
+            for _ in range(num_groups):
+                channel_weights.extend(codebook_pattern)
+        else:
+            channel_weights = [1.0] * C
+
         loss_c = 0.0
         _, _, _, V = logits.size()
         for c, w in enumerate(channel_weights):
@@ -1014,78 +1027,6 @@ def train_step_ddp(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     return loss.item() * train_cfg.grad_accum_steps
 
 
-def train_step_accelerate(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator):
-    """
-    Like train_step, but uses accelerator for backward and logging.
-    """
-    if random.random() < train_cfg.unconditional_frac:
-        pad_tok = dia_cfg.data.text_pad_value
-        batch['src_tokens'] = torch.zeros_like(batch['src_tokens'])
-        batch['enc_self_attn_mask'] = torch.zeros_like(batch['enc_self_attn_mask'])
-        batch['dec_cross_attn_mask'] = torch.zeros_like(batch['dec_cross_attn_mask'])
-
-    # forward pass (autocast handled by caller)
-    logits = model(
-        src_BxS=batch['src_tokens'],
-        tgt_BxTxC=batch['tgt_tokens'],
-        src_positions=batch['src_positions'],
-        tgt_positions=batch['tgt_positions'],
-        enc_self_attn_mask=batch['enc_self_attn_mask'],
-        dec_self_attn_mask=batch['dec_self_attn_mask'],
-        dec_cross_attn_mask=batch['dec_cross_attn_mask'],
-        enable_dropout=False,
-    )
-    lens = batch['tgt_lens']
-    max_L = int(lens.max().item())
-    logits = logits[:, : max_L - 1]
-    target = batch['tgt_tokens'][:, 1:max_L, :]
-    B, Tm1, C = target.shape
-    pad_val = dia_cfg.data.audio_pad_value
-    time_idx = torch.arange(Tm1, device=lens.device).unsqueeze(0)
-    valid_time = time_idx < (lens.unsqueeze(1) - 1)
-    mask = valid_time.unsqueeze(-1).expand(-1, -1, C)
-    channel_weights = [1.0] * C
-    loss_c = 0.0
-    _, _, _, V = logits.size()
-    for c, w in enumerate(channel_weights):
-        lc = logits[:, :, c, :].reshape(-1, V)
-        tc = target[:, :, c].reshape(-1)
-        mc = mask[:, :, c].reshape(-1)
-        lc_valid = lc[mc]
-        tc_valid = tc[mc]
-        loss_c += w * F.cross_entropy(
-            lc_valid, tc_valid,
-            ignore_index=pad_val
-        )
-    loss = loss_c / sum(channel_weights)
-    loss = loss / train_cfg.grad_accum_steps
-    accelerator.backward(loss)
-    if (step + 1) % train_cfg.grad_accum_steps == 0:
-        # Clip once after accumulation, right before optimizer step
-        pre_clip = clip_grad_norm_(model.parameters(), max_norm=5.0)
-        if accelerator.is_main_process:
-            wandb.log({'grad_norm/pre_clip': pre_clip}, step=global_step)
-            # Optional post-clip norm computation
-            post_clip_sq = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    g = p.grad.detach()
-                    post_clip_sq += g.float().norm(2).item() ** 2
-            wandb.log({'grad_norm/post_clip': post_clip_sq ** 0.5}, step=global_step)
-        opt.step()
-        sched.step()
-        opt.zero_grad()
-        true_loss = loss.item() * train_cfg.grad_accum_steps
-        current_lr = sched.get_last_lr()[0]
-        if accelerator.is_main_process:
-            wandb.log({
-                'learning_rate': current_lr,
-                'train_loss': true_loss,
-            }, step=global_step)
-    return loss.item() * train_cfg.grad_accum_steps
-
-
-
 def run_ddp_worker(rank: int, world_size: int, args):
     """Worker function for DDP training."""
     try:
@@ -1118,18 +1059,17 @@ def run_ddp_worker(rank: int, world_size: int, args):
             print("Loading DAC model...")
         dac_model = dac.DAC.load(dac.utils.download()).to(device)
 
-        dataset=None
-
-
-        # choose dataset
-        if not dataset:
-            use_sliding_window = not args.disable_sliding_window
-            if args.preencoded_dir:
-                dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
-            elif args.audio_folder:
-                dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window)
-            else:
-                raise ValueError("Must specify either --audio_folder or --preencoded_dir")
+        # Choose dataset
+        use_sliding_window = not args.disable_sliding_window
+        if args.preencoded_dir:
+            dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
+        elif args.audio_folder:
+            skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
+            dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
+                                 ignore_missing_prompts=not args.require_prompts,
+                                 skip_tags=skip_tags_list)
+        else:
+            raise ValueError("Must specify either --audio_folder or --preencoded_dir")
 
         train_cfg = TrainConfig(
             epochs = args.epochs,
@@ -1153,6 +1093,9 @@ def run_ddp_worker(rank: int, world_size: int, args):
             ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
         model = DiaModel(dia_cfg)
         state = torch.load(ckpt_file, map_location="cpu")
+        # Track if we performed expansion to know if we should warm-start stereo
+        expanded_stereo = False
+
         # Adapt checkpoint for stereo (9 -> 18 channels) before loading to avoid size mismatch
         try:
             key = "decoder.logits_dense.weight"
@@ -1171,6 +1114,7 @@ def run_ddp_worker(rank: int, world_size: int, args):
                     # If checkpoint has 9 channels and model expects 18, duplicate along channel dim
                     if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
                         state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
+                        expanded_stereo = True
                         logger.info(
                             f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication"
                         )
@@ -1182,19 +1126,27 @@ def run_ddp_worker(rank: int, world_size: int, args):
                         )
         except Exception as e:
             logger.warning(f"While adapting checkpoint weights: {e}")
+        
         missing, unexpected = model.load_state_dict(state, strict=False)
         logger.info(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
-        # Warm-start stereo by duplicating left channel params into right, if expanding 9->18
-        try:
+        
+        # Warm-start stereo by duplicating left channel params into right, ONLY if expanding 9->18
+        # If we loaded an existing stereo checkpoint, expanded_stereo is False, so we skip this
+        if expanded_stereo:
+            try:
+                if dia_cfg.data.channels == 18:
+                    logger.info("Warm-starting stereo channels (copying Left -> Right)...")
+                    if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
+                        for i in range(9, 18):
+                            model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
+                    W = model.decoder.logits_dense.weight  # (E, C, V)
+                    if W.dim() == 3 and W.shape[1] >= 18:
+                        W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
+            except Exception as e:
+                logger.warning(f"Stereo warm-start duplication skipped: {e}")
+        else:
             if dia_cfg.data.channels == 18:
-                if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
-                    for i in range(9, 18):
-                        model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
-                W = model.decoder.logits_dense.weight  # (E, C, V)
-                if W.dim() == 3 and W.shape[1] >= 18:
-                    W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
-        except Exception as e:
-            logger.warning(f"Stereo warm-start duplication skipped: {e}")
+                logger.info("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
         # Release checkpoint tensors from CPU memory ASAP to reduce per-rank RSS
         del state
         gc.collect()
@@ -1259,15 +1211,17 @@ def main():
         device = torch.device("cuda:0")
         dac_model = dac.DAC.load(dac.utils.download()).to(device)
         
-        dataset=None
-        if not dataset:
-            use_sliding_window = not args.disable_sliding_window
-            if args.preencoded_dir:
-                dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
-            elif args.audio_folder:
-                dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window)
-            else:
-                raise ValueError("Must specify either --audio_folder or --preencoded_dir")
+        # Choose dataset
+        use_sliding_window = not args.disable_sliding_window
+        if args.preencoded_dir:
+            dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
+        elif args.audio_folder:
+            skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
+            dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
+                                 ignore_missing_prompts=not args.require_prompts,
+                                 skip_tags=skip_tags_list)
+        else:
+            raise ValueError("Must specify either --audio_folder or --preencoded_dir")
 
         train_cfg = TrainConfig(
             epochs = args.epochs,
@@ -1290,6 +1244,9 @@ def main():
             ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
         model = DiaModel(dia_cfg)
         state = torch.load(ckpt_file, map_location="cpu")
+        # Track if we performed expansion to know if we should warm-start stereo
+        expanded_stereo = False
+
         # Adapt checkpoint for stereo (9 -> 18 channels) before loading to avoid size mismatch
         try:
             key = "decoder.logits_dense.weight"
@@ -1307,6 +1264,7 @@ def main():
                 ):
                     if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
                         state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
+                        expanded_stereo = True
                         logger.info(
                             f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication"
                         )
@@ -1320,13 +1278,16 @@ def main():
         missing, unexpected = model.load_state_dict(state, strict=False)
         logger.info(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
         try:
-            if dia_cfg.data.channels == 18:
+            if expanded_stereo and dia_cfg.data.channels == 18:
+                logger.info("Warm-starting stereo channels (copying Left -> Right)...")
                 if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
                     for i in range(9, 18):
                         model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
                 W = model.decoder.logits_dense.weight
                 if W.dim() == 3 and W.shape[1] >= 18:
                     W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
+            elif dia_cfg.data.channels == 18:
+                logger.info("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
         except Exception as e:
             logger.warning(f"Stereo warm-start duplication skipped: {e}")
         

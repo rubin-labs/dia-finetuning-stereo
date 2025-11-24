@@ -60,7 +60,10 @@ class LoRAWrappedDenseGeneral1D(nn.Module):
         x_dtype = x.dtype
         x2 = self.dropout(x)
         x_flat = x2.reshape(-1, x2.shape[-1])  # (..., F_in)
-        delta_flat = (x_flat @ self.lora_A) @ self.lora_B  # (..., out_flat)
+        # Cast LoRA weights to match input dtype for mixed precision compatibility
+        A = self.lora_A.to(x_dtype)
+        B = self.lora_B.to(x_dtype)
+        delta_flat = (x_flat @ A) @ B  # (..., out_flat)
         delta = delta_flat.view(*x2.shape[:-1], *self.out_features)
         return (base_out + self.scaling * delta).to(x_dtype)
 
@@ -94,7 +97,10 @@ class LoRAWrappedDenseGeneral2D(nn.Module):
         x2 = self.dropout(x)
         prefix = x2.shape[:-2]
         x_flat = x2.reshape(-1, x2.shape[-2] * x2.shape[-1])  # (..., N*H)
-        delta_flat = (x_flat @ self.lora_A) @ self.lora_B  # (..., D_out)
+        # Cast LoRA weights to match input dtype for mixed precision compatibility
+        A = self.lora_A.to(x_dtype)
+        B = self.lora_B.to(x_dtype)
+        delta_flat = (x_flat @ A) @ B  # (..., D_out)
         delta = delta_flat.view(*prefix, self.out_features)
         return (base_out + self.scaling * delta).to(x_dtype)
 
@@ -191,7 +197,10 @@ def run_ddp_worker_lora(rank: int, world_size: int, args):
         if args.preencoded_dir:
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
         elif args.audio_folder:
-            dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window)
+            skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
+            dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
+                                 ignore_missing_prompts=not args.require_prompts,
+                                 skip_tags=skip_tags_list)
         else:
             raise ValueError("Must specify either --audio_folder or --preencoded_dir")
 
@@ -215,6 +224,9 @@ def run_ddp_worker_lora(rank: int, world_size: int, args):
         ckpt_file = args.local_ckpt or hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
         model = DiaModel(dia_cfg)
         state = torch.load(ckpt_file, map_location="cpu")
+        # Track if we performed expansion to know if we should warm-start stereo
+        expanded_stereo = False
+        
         # Adapt checkpoint for stereo (9 -> 18 channels) before loading to avoid size mismatch
         try:
             key = "decoder.logits_dense.weight"
@@ -231,6 +243,7 @@ def run_ddp_worker_lora(rank: int, world_size: int, args):
                 ):
                     if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
                         state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
+                        expanded_stereo = True
                         print(f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication")
                     else:
                         del state[key]
@@ -239,17 +252,24 @@ def run_ddp_worker_lora(rank: int, world_size: int, args):
             print(f"While adapting checkpoint weights: {e}")
         missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
-        # Warm-start stereo by duplicating left-channel params into right if expanding 9->18
-        try:
+        
+        # Warm-start stereo by duplicating left-channel params into right, ONLY if expanding 9->18
+        # If we loaded an existing stereo checkpoint, expanded_stereo is False, so we skip this
+        if expanded_stereo:
+            try:
+                if dia_cfg.data.channels == 18:
+                    print("Warm-starting stereo channels (copying Left -> Right)...")
+                    if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
+                        for i in range(9, 18):
+                            model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
+                    W = model.decoder.logits_dense.weight  # (E, C, V)
+                    if W.dim() == 3 and W.shape[1] >= 18:
+                        W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
+            except Exception as e:
+                print(f"Stereo warm-start duplication skipped: {e}")
+        else:
             if dia_cfg.data.channels == 18:
-                if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
-                    for i in range(9, 18):
-                        model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
-                W = model.decoder.logits_dense.weight  # (E, C, V)
-                if W.dim() == 3 and W.shape[1] >= 18:
-                    W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
-        except Exception as e:
-            print(f"Stereo warm-start duplication skipped: {e}")
+                print("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
 
         # Dtype consistency first
         if args.half:
@@ -265,6 +285,14 @@ def run_ddp_worker_lora(rank: int, world_size: int, args):
         # Inject LoRA on CPU, then move/model.to(rank) happens inside train()
         targets = set(t.strip() for t in args.lora_targets.split(",") if t.strip())
         inject_lora_into_model(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets)
+
+        # Reload state dict to capture any pre-existing LoRA weights that were ignored before injection
+        # (e.g. if resuming from a LoRA checkpoint)
+        if any("lora_" in k for k in state.keys()):
+            print("Detected LoRA weights in checkpoint, reloading after injection...")
+            missing_lora, unexpected_lora = model.load_state_dict(state, strict=False)
+            print(f"Reloaded checkpoint after LoRA injection; missing={len(missing_lora)}")
+
         freeze_non_lora_params(model)
 
         # Barrier before training
@@ -334,7 +362,10 @@ def main():
         if args.preencoded_dir:
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
         elif args.audio_folder:
-            dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window)
+            skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
+            dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
+                                 ignore_missing_prompts=not args.require_prompts,
+                                 skip_tags=skip_tags_list)
         else:
             raise ValueError("Must specify either --audio_folder or --preencoded_dir")
 
@@ -358,6 +389,9 @@ def main():
         ckpt_file = args.local_ckpt or hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
         model = DiaModel(dia_cfg)
         state = torch.load(ckpt_file, map_location="cpu")
+        # Track if we performed expansion to know if we should warm-start stereo
+        expanded_stereo = False
+        
         # Adapt checkpoint for stereo (9 -> 18 channels) before loading to avoid size mismatch
         try:
             key = "decoder.logits_dense.weight"
@@ -374,6 +408,7 @@ def main():
                 ):
                     if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
                         state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
+                        expanded_stereo = True
                         print(f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication")
                     else:
                         del state[key]
@@ -382,17 +417,24 @@ def main():
             print(f"While adapting checkpoint weights: {e}")
         missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
-        # Warm-start stereo by duplicating left-channel params into right if expanding 9->18
-        try:
+        
+        # Warm-start stereo by duplicating left-channel params into right, ONLY if expanding 9->18
+        # If we loaded an existing stereo checkpoint, expanded_stereo is False, so we skip this
+        if expanded_stereo:
+            try:
+                if dia_cfg.data.channels == 18:
+                    print("Warm-starting stereo channels (copying Left -> Right)...")
+                    if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
+                        for i in range(9, 18):
+                            model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
+                    W = model.decoder.logits_dense.weight
+                    if W.dim() == 3 and W.shape[1] >= 18:
+                        W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
+            except Exception as e:
+                print(f"Stereo warm-start duplication skipped: {e}")
+        else:
             if dia_cfg.data.channels == 18:
-                if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
-                    for i in range(9, 18):
-                        model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
-                W = model.decoder.logits_dense.weight
-                if W.dim() == 3 and W.shape[1] >= 18:
-                    W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
-        except Exception as e:
-            print(f"Stereo warm-start duplication skipped: {e}")
+                print("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
 
         # Dtype consistency
         if args.half:
@@ -408,6 +450,13 @@ def main():
         # Inject LoRA and freeze
         targets = set(t.strip() for t in args.lora_targets.split(",") if t.strip())
         inject_lora_into_model(model, args.lora_r, args.lora_alpha, args.lora_dropout, targets)
+
+        # Reload state dict to capture any pre-existing LoRA weights that were ignored before injection
+        if any("lora_" in k for k in state.keys()):
+            print("Detected LoRA weights in checkpoint, reloading after injection...")
+            missing_lora, unexpected_lora = model.load_state_dict(state, strict=False)
+            print(f"Reloaded checkpoint after LoRA injection; missing={len(missing_lora)}")
+
         freeze_non_lora_params(model)
 
         # Report trainable count

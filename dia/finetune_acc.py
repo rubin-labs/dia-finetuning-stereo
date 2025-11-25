@@ -323,6 +323,7 @@ def load_train_config(config_path: Path) -> dict:
     flat['experiment_id'] = cfg.get('experiment_id')
     if 'data' in cfg:
         flat['preencoded_dir'] = cfg['data'].get('preencoded_dir')
+        flat['audio_folder'] = cfg['data'].get('audio_folder')
         flat['config'] = cfg['data'].get('config')
     if 'training' in cfg:
         flat['batch_size'] = cfg['training'].get('batch_size')
@@ -340,6 +341,8 @@ def load_train_config(config_path: Path) -> dict:
     if 'eval' in cfg:
         flat['eval_step'] = cfg['eval'].get('eval_step')
         flat['demo_every'] = cfg['eval'].get('demo_every')
+        flat['eval_every_epochs'] = cfg['eval'].get('eval_every_epochs')
+        flat['demo_every_epochs'] = cfg['eval'].get('demo_every_epochs')
     if 'flags' in cfg:
         flat['scratch'] = cfg['flags'].get('scratch')
         flat['tag_no_shuffle'] = cfg['flags'].get('tag_no_shuffle')
@@ -365,7 +368,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--config",    type=Path, default=Path(cfg_defaults.get('config', 'dia/config.json')))
     parser.add_argument("--hub_model", type=str,  default="nari-labs/Dia-1.6B")
     parser.add_argument("--local_ckpt", type=str,  default=None)
-    parser.add_argument("--audio_folder", type=Path, default=None,
+    parser.add_argument("--audio_folder", type=Path, default=cfg_defaults.get('audio_folder'),
                         help="Path to audio folder (expects audio_prompts folder at same level).")
     parser.add_argument("--preencoded_dir", type=Path, default=cfg_defaults.get('preencoded_dir'),
                         help="Directory with pre-encoded DAC codes (encoded_audio/*.pt) and optional metadata.json.")
@@ -415,9 +418,9 @@ def get_args() -> argparse.Namespace:
                         help="Calculate validation loss every N steps.")
     parser.add_argument("--demo_every", type=int, default=cfg_defaults.get('demo_every'),
                         help="Generate audio demos every N steps (if None, defaults to same as --eval_step).")
-    parser.add_argument("--eval_every_epochs", type=int, default=None,
+    parser.add_argument("--eval_every_epochs", type=int, default=cfg_defaults.get('eval_every_epochs'),
                         help="Evaluate at the end of every N epochs (overrides step-based eval).")
-    parser.add_argument("--demo_every_epochs", type=int, default=None,
+    parser.add_argument("--demo_every_epochs", type=int, default=cfg_defaults.get('demo_every_epochs'),
                         help="Generate audio demos every N epochs (use with --eval_every_epochs).")
     parser.add_argument("--save_every_epochs", type=int, default=None,
                         help="Save checkpoint at the end of every N epochs (overrides step-based save).")

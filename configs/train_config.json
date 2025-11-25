@@ -1,34 +1,34 @@
 {
-  "experiment_id": "20251124_dia_001_removing_tags_and_fixing_cfg",
+  "experiment_id": "new_delay_overfit",
   
   "data": {
-    "preencoded_dir": "/home/ocamp/dia-new-delay/1sampledata/test1/preprocessed",
+    "audio_folder": "./1sampledata/test1/audio",
     "config": "./dia/config_overfit.json"
   },
   
   "training": {
-    "batch_size": 20,
-    "grad_accum_steps": 1,
+    "batch_size": 4,
+    "grad_accum_steps": 4,
     "epochs": 10000,
     "learning_rate": 1e-4,
     "warmup_steps": 0,
-    "unconditional_frac": 0
+    "unconditional_frac": 0.5
   },
   
   "output": {
     "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/DONT_DELETE/new_delay_overfit",
     "run_name": "new_delay_overfit",
-    "save_every": 100,
-    "save_after_epoch": 500
+    "save_every": 100000
   },
   
   "eval": {
-    "eval_step": 20,
-    "demo_every": 100
+    "eval_every_epochs": 10,
+    "demo_every_epochs": 100
   },
   
   "flags": {
     "scratch": true,
-    "tag_no_shuffle": true
+    "tag_no_shuffle": false,
+    "use_sliding_window": true
   }
 }

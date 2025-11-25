@@ -10,3 +10,4 @@
 
 
 - `2025-11-25 03:14` [`5c28760`] **main**: 20251124_dia_001: removing tags and fixing cfg
+- `2025-11-25 03:44` [`e6b6b0b`] **main**: 20251124_dia_002_removing special tokens from loss calculation

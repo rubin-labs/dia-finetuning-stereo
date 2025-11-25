@@ -202,20 +202,24 @@ class PreEncodedDACDataset(Dataset):
         encoded = torch.load(encoded_file, map_location='cpu')  # Shape: (T, 18) for stereo or (T, 9) for mono
         
         # Cropping behavior:
-        # - use_sliding_window=True: return full sequence, let collate_fn do random cropping
-        # - use_sliding_window=False: fixed crop from start here (deterministic)
-        # Note: Do NOT pad here — let collate_fn handle padding so it can track
-        # the true sequence length for proper loss masking
+        # - use_sliding_window=True: random crop (data augmentation)
+        # - use_sliding_window=False: fixed crop from start (deterministic)
         target_length = self.config.data.audio_length
-        if not self.use_sliding_window:
-            # Fixed crop from start for deterministic training
-            if encoded.shape[0] > target_length:
+        
+        if encoded.shape[0] > target_length:
+            if self.use_sliding_window:
+                # Random crop
+                max_start = encoded.shape[0] - target_length
+                start = random.randint(0, max_start)
+                encoded = encoded[start : start + target_length]
+            else:
+                # Fixed crop
                 encoded = encoded[:target_length]
-            # If shorter than target_length, return as-is. collate_fn will:
-            # 1. Record the true length in seq_lens
-            # 2. Pad to batch_max
-            # 3. Use seq_lens to mask out PAD tokens from loss
-        # If using sliding window, keep the full sequence - collate_fn does random cropping
+        
+        # If shorter than target_length, return as-is. collate_fn will:
+        # 1. Record the true length in seq_lens
+        # 2. Pad to batch_max
+        # 3. Use seq_lens to mask out PAD tokens from loss
         
         # Use filename as prompt (full filename, not just first few words)
         filename = encoded_file.stem

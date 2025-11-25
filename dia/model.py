@@ -349,7 +349,7 @@ class Dia:
             [
                 generated_BxTxC,
                 torch.full(
-                    (2, max_tokens, num_channels),
+                    (batch_size, max_tokens, num_channels),
                     fill_value=-1,
                     dtype=torch.long,
                     device=self.device,
@@ -378,7 +378,7 @@ class Dia:
         for step in range(current_step, current_step + max_tokens):
             tgt_ids_Bx1xC = generated_BxTxC[:, step, :].unsqueeze(1)
             tgt_pos_Bx1 = torch.full(
-                (2, 1),
+                (batch_size, 1),
                 fill_value=step,
                 dtype=torch.long,
                 device=self.device,

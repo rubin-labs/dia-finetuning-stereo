@@ -739,12 +739,20 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                 else:
                     weights_e = [1.0] * C_e
                 
+                # CRITICAL: Only compute loss on actual audio tokens (0-1023)
+                # Match training loss by excluding BOS/EOS/PAD tokens
+                audio_token_mask_e = (target >= 0) & (target <= 1023)  # (B, T, C)
+                
                 for c, w in enumerate(weights_e):
                     lc = logits[:, :, c, :].reshape(-1, V_e)
                     tc = target[:, :, c].reshape(-1)
-                    loss_e += w * F.cross_entropy(
-                        lc, tc, ignore_index=dia_cfg.data.audio_pad_value
-                    )
+                    audio_mc = audio_token_mask_e[:, :, c].reshape(-1)
+                    lc_valid = lc[audio_mc]
+                    tc_valid = tc[audio_mc]
+                    if tc_valid.numel() > 0:  # Only compute if we have valid tokens
+                        loss_e += w * F.cross_entropy(
+                            lc_valid, tc_valid, ignore_index=dia_cfg.data.audio_pad_value
+                        )
                 loss_e = loss_e / sum(weights_e)
 
                 eval_losses.append(loss_e)
@@ -1242,16 +1250,26 @@ def train_step_ddp(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
 
         loss_c = 0.0
         _, _, _, V = logits.size()
+        
+        # CRITICAL: Only compute loss on actual audio tokens (0-1023)
+        # Mask out BOS (1026), EOS (1024), and PAD (1025) - these are trivial to predict
+        # and cause artificially low loss if included (model "cheats" by learning delay pattern)
+        audio_token_mask = (target >= 0) & (target <= 1023)  # (B, T, C)
+        
         for c, w in enumerate(channel_weights):
             lc = logits[:, :, c, :].reshape(-1, V)
             tc = target[:, :, c].reshape(-1)
             mc = mask[:, :, c].reshape(-1)
-            lc_valid = lc[mc]
-            tc_valid = tc[mc]
-            loss_c += w * F.cross_entropy(
-                lc_valid, tc_valid,
-                ignore_index=pad_val
-            )
+            # Combine time mask with audio token mask
+            audio_mc = audio_token_mask[:, :, c].reshape(-1)
+            combined_mask = mc & audio_mc
+            lc_valid = lc[combined_mask]
+            tc_valid = tc[combined_mask]
+            if tc_valid.numel() > 0:  # Only compute if we have valid tokens
+                loss_c += w * F.cross_entropy(
+                    lc_valid, tc_valid,
+                    ignore_index=pad_val
+                )
         loss = loss_c / sum(channel_weights)
         
         # Compute output entropy every 50 steps (measures model confidence)

@@ -311,18 +311,67 @@ class TrainConfig:
     no_decay_embed: bool = False
 
 
+def load_train_config(config_path: Path) -> dict:
+    """Load training config from JSON file."""
+    import json
+    if not config_path.exists():
+        return {}
+    with open(config_path) as f:
+        cfg = json.load(f)
+    # Flatten nested config into flat dict for argparse defaults
+    flat = {}
+    flat['experiment_id'] = cfg.get('experiment_id')
+    if 'data' in cfg:
+        flat['preencoded_dir'] = cfg['data'].get('preencoded_dir')
+        flat['config'] = cfg['data'].get('config')
+    if 'training' in cfg:
+        flat['batch_size'] = cfg['training'].get('batch_size')
+        flat['grad_accum_steps'] = cfg['training'].get('grad_accum_steps')
+        flat['epochs'] = cfg['training'].get('epochs')
+        flat['learning_rate'] = cfg['training'].get('learning_rate')
+        flat['warmup_steps'] = cfg['training'].get('warmup_steps')
+        flat['unconditional_frac'] = cfg['training'].get('unconditional_frac')
+        flat['weight_decay'] = cfg['training'].get('weight_decay')
+    if 'output' in cfg:
+        flat['output_dir'] = cfg['output'].get('output_dir')
+        flat['run_name'] = cfg['output'].get('run_name')
+        flat['save_every'] = cfg['output'].get('save_every')
+        flat['save_after_epoch'] = cfg['output'].get('save_after_epoch')
+    if 'eval' in cfg:
+        flat['eval_step'] = cfg['eval'].get('eval_step')
+        flat['demo_every'] = cfg['eval'].get('demo_every')
+    if 'flags' in cfg:
+        flat['scratch'] = cfg['flags'].get('scratch')
+        flat['tag_no_shuffle'] = cfg['flags'].get('tag_no_shuffle')
+        flat['force_single_gpu'] = cfg['flags'].get('force_single_gpu')
+        flat['use_sliding_window'] = cfg['flags'].get('use_sliding_window')
+    # Remove None values
+    return {k: v for k, v in flat.items() if v is not None}
+
+
 def get_args() -> argparse.Namespace:
+    # First pass: just get train_config path
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--train_config", type=Path, default=Path("configs/train_config.json"),
+                            help="Path to training config JSON (defaults loaded from here, CLI overrides)")
+    pre_args, _ = pre_parser.parse_known_args()
+    
+    # Load defaults from train config
+    cfg_defaults = load_train_config(pre_args.train_config)
+    
     parser = argparse.ArgumentParser(description="Train the Dia audio model")
-    parser.add_argument("--config",    type=Path, default=Path("dia/config.json"))
+    parser.add_argument("--train_config", type=Path, default=Path("configs/train_config.json"),
+                        help="Path to training config JSON (defaults loaded from here, CLI overrides)")
+    parser.add_argument("--config",    type=Path, default=Path(cfg_defaults.get('config', 'dia/config.json')))
     parser.add_argument("--hub_model", type=str,  default="nari-labs/Dia-1.6B")
     parser.add_argument("--local_ckpt", type=str,  default=None)
     parser.add_argument("--audio_folder", type=Path, default=None,
                         help="Path to audio folder (expects audio_prompts folder at same level).")
-    parser.add_argument("--preencoded_dir", type=Path, default=None,
+    parser.add_argument("--preencoded_dir", type=Path, default=cfg_defaults.get('preencoded_dir'),
                         help="Directory with pre-encoded DAC codes (encoded_audio/*.pt) and optional metadata.json.")
-    parser.add_argument("--run_name",  type=str,  default=None)
-    parser.add_argument("--output_dir",type=Path, required=True,
-                        help="Output directory for checkpoints (required).")
+    parser.add_argument("--run_name",  type=str,  default=cfg_defaults.get('run_name'))
+    parser.add_argument("--output_dir",type=Path, default=cfg_defaults.get('output_dir'),
+                        help="Output directory for checkpoints.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility.")
     parser.add_argument("--half", action="store_true", help="load model in fp16")
@@ -331,16 +380,16 @@ def get_args() -> argparse.Namespace:
                         help="Weights & Biases project name.")
     parser.add_argument("--wandb_entity", type=str, default=None,
                         help="Weights & Biases entity/team name.")
-    parser.add_argument("--save_every", type=int, default=None,
+    parser.add_argument("--save_every", type=int, default=cfg_defaults.get('save_every'),
                         help="Save checkpoint every N steps (overrides TrainConfig.save_step).")
     parser.add_argument("--save_last", type=int, default=None,
                         help="Keep only the last N checkpoints (e.g., --save_last 4). Saves disk space.")
-    parser.add_argument("--force_single_gpu", action="store_true",
+    parser.add_argument("--force_single_gpu", action="store_true", default=cfg_defaults.get('force_single_gpu', False),
                         help="Force single GPU training even with multiple GPUs available")
     # Tag augmentation flags
     parser.add_argument("--tag_shuffle", action="store_true", default=True,
                         help="Shuffle comma-separated tags in prompts (default: on)")
-    parser.add_argument("--tag_no_shuffle", action="store_true",
+    parser.add_argument("--tag_no_shuffle", action="store_true", default=cfg_defaults.get('tag_no_shuffle', False),
                         help="Disable tag shuffling (overrides --tag_shuffle)")
     parser.add_argument("--tag_dropout", type=float, default=0.0,
                         help="Per-tag dropout probability in [0,1] (default: 0.0)")
@@ -348,23 +397,23 @@ def get_args() -> argparse.Namespace:
                         help="Keep at most this many tags after shuffle/dropout (default: unlimited)")
     
     # Training hyperparameters
-    parser.add_argument("--epochs", type=int, default=500,
+    parser.add_argument("--epochs", type=int, default=cfg_defaults.get('epochs', 500),
                         help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int, default=4,
+    parser.add_argument("--batch_size", type=int, default=cfg_defaults.get('batch_size', 4),
                         help="Batch size per GPU.")
-    parser.add_argument("--grad_accum_steps", type=int, default=1,
+    parser.add_argument("--grad_accum_steps", type=int, default=cfg_defaults.get('grad_accum_steps', 1),
                         help="Gradient accumulation steps.")
-    parser.add_argument("--learning_rate", type=float, default=1e-5,
+    parser.add_argument("--learning_rate", type=float, default=cfg_defaults.get('learning_rate', 1e-5),
                         help="Learning rate.")
-    parser.add_argument("--weight_decay", type=float, default=0.1,
+    parser.add_argument("--weight_decay", type=float, default=cfg_defaults.get('weight_decay', 0.1),
                         help="AdamW weight decay coefficient.")
-    parser.add_argument("--warmup_steps", type=int, default=500,
+    parser.add_argument("--warmup_steps", type=int, default=cfg_defaults.get('warmup_steps', 500),
                         help="Number of warmup steps.")
-    parser.add_argument("--unconditional_frac", type=float, required=True,
+    parser.add_argument("--unconditional_frac", type=float, default=cfg_defaults.get('unconditional_frac'),
                         help="Fraction of unconditional training steps.")
-    parser.add_argument("--eval_step", type=int, default=200,
+    parser.add_argument("--eval_step", type=int, default=cfg_defaults.get('eval_step', 200),
                         help="Calculate validation loss every N steps.")
-    parser.add_argument("--demo_every", type=int, default=None,
+    parser.add_argument("--demo_every", type=int, default=cfg_defaults.get('demo_every'),
                         help="Generate audio demos every N steps (if None, defaults to same as --eval_step).")
     parser.add_argument("--eval_every_epochs", type=int, default=None,
                         help="Evaluate at the end of every N epochs (overrides step-based eval).")
@@ -372,7 +421,7 @@ def get_args() -> argparse.Namespace:
                         help="Generate audio demos every N epochs (use with --eval_every_epochs).")
     parser.add_argument("--save_every_epochs", type=int, default=None,
                         help="Save checkpoint at the end of every N epochs (overrides step-based save).")
-    parser.add_argument("--save_after_epoch", type=int, default=0,
+    parser.add_argument("--save_after_epoch", type=int, default=cfg_defaults.get('save_after_epoch', 0),
                         help="Only start saving checkpoints after this epoch (default: 0, save from start).")
     parser.add_argument("--demo_after_epoch", type=int, default=0,
                         help="Only start generating demos after this epoch (default: 0, demo from start).")
@@ -382,7 +431,7 @@ def get_args() -> argparse.Namespace:
                         help="Stop training and generate demo when eval loss > train loss")
     
     # Sliding window augmentation (default: disabled for deterministic training)
-    parser.add_argument("--use_sliding_window", action="store_true", default=False,
+    parser.add_argument("--use_sliding_window", action="store_true", default=cfg_defaults.get('use_sliding_window', False),
                         help="Enable sliding window: random cropping for data augmentation (default: off for deterministic training)")
     # Optimizer param-group controls
     parser.add_argument("--no_decay_embed", action="store_true",
@@ -393,10 +442,18 @@ def get_args() -> argparse.Namespace:
                         help="Fail if audio file is missing a corresponding prompt file (default: skip missing)")
     parser.add_argument("--skip_tags", type=str, default=None,
                         help="Comma-separated list of tags to skip (e.g. 'vocals,speech')")
-    parser.add_argument("--scratch", action="store_true",
+    parser.add_argument("--scratch", action="store_true", default=cfg_defaults.get('scratch', False),
                         help="Train from scratch (random initialization) instead of loading a checkpoint.")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    
+    # Validate required fields
+    if args.output_dir is None:
+        parser.error("--output_dir is required (set in train_config.json or via CLI)")
+    if args.unconditional_frac is None:
+        parser.error("--unconditional_frac is required (set in train_config.json or via CLI)")
+    
+    return args
 
 
 
@@ -797,13 +854,14 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                     total_demos = len(TEST_PROMPTS) * len(temperatures)
                     logger.info(f"Generating {total_demos} conditional demos ({len(TEST_PROMPTS)} prompts × {len(temperatures)} temperatures)")
                     
+                    cfg_scale = EVAL_CFG_SCALE if train_cfg.unconditional_frac > 0 else None
                     for temp in temperatures:
                         for test_name, prompt in TEST_PROMPTS.items():
                             try:
                                 logger.info(f"Generating audio for '{test_name}' (temp={temp}) with prompt: '{prompt}'")
                                 audio = dia_gen.generate(
                                     text=prompt,
-                                    cfg_scale=EVAL_CFG_SCALE,
+                                    cfg_scale=cfg_scale,
                                     temperature=temp,
                                     top_p=EVAL_TOP_P
                                 )

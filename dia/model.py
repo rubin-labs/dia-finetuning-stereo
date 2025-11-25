@@ -216,7 +216,7 @@ class Dia:
     def generate(
         self,
         text: str,
-        cfg_scale: float = 2.0,
+        cfg_scale: float | None = 2.0,
         temperature: float = 0.9,
         top_p: float = 0.9,
         use_cfg_filter: bool = True,
@@ -247,11 +247,20 @@ class Dia:
             cond_enc_self_attn_mask_Bx1xSxS,
         ) = self._prepare_text_input(text)
 
-        unc_src_BxS = torch.zeros_like(cond_src_BxS)
-        src_BxS = torch.cat([unc_src_BxS, cond_src_BxS], dim=0)
-        src_positions_BxS = cond_src_positions_BxS.expand(2, -1)
-        src_padding_mask_BxS = cond_src_padding_mask_BxS.expand(2, -1)
-        enc_self_attn_mask_Bx1xSxS = cond_enc_self_attn_mask_Bx1xSxS.expand(2, -1, -1, -1)
+        use_cfg = cfg_scale is not None
+        batch_size = 2 if use_cfg else 1
+
+        if use_cfg:
+            unc_src_BxS = torch.zeros_like(cond_src_BxS)
+            src_BxS = torch.cat([unc_src_BxS, cond_src_BxS], dim=0)
+            src_positions_BxS = cond_src_positions_BxS.expand(batch_size, -1)
+            src_padding_mask_BxS = cond_src_padding_mask_BxS.expand(batch_size, -1)
+            enc_self_attn_mask_Bx1xSxS = cond_enc_self_attn_mask_Bx1xSxS.expand(batch_size, -1, -1, -1)
+        else:
+            src_BxS = cond_src_BxS
+            src_positions_BxS = cond_src_positions_BxS
+            src_padding_mask_BxS = cond_src_padding_mask_BxS
+            enc_self_attn_mask_Bx1xSxS = cond_enc_self_attn_mask_Bx1xSxS
 
         # 2. Encoder Pass
         # with torch.autocast(device_type="cuda", dtype=forward_dtype):
@@ -282,7 +291,7 @@ class Dia:
 
         # 3-2. Initialize Decoder Inputs
         generated_BxTxC = torch.full(
-            (2, 1, num_channels),
+            (batch_size, 1, num_channels),
             fill_value=audio_bos_value,
             dtype=torch.long,
             device=self.device,
@@ -298,11 +307,11 @@ class Dia:
                 audio_prompt = torchaudio.functional.resample(audio_prompt, sr, 44100)
             audio_prompt = audio_prompt.to(self.device).unsqueeze(0)  # 1, C, T
             audio_prompt = audio_to_codebook(self.dac_model, audio_prompt, data_config=self.config.data)
-            generated_BxTxC = torch.cat([generated_BxTxC, audio_prompt.expand(2, -1, -1)], dim=1)
+            generated_BxTxC = torch.cat([generated_BxTxC, audio_prompt.expand(batch_size, -1, -1)], dim=1)
 
             prefill_len = generated_BxTxC.shape[1]
             prompt_len_inc_bos = prefill_len
-            prefill_tgt_pos = torch.arange(prefill_len, device=self.device).unsqueeze(0).expand(2, -1)
+            prefill_tgt_pos = torch.arange(prefill_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
             prefill_tgt_padding_mask = (generated_BxTxC != audio_pad_value).any(dim=2)
 
             prefill_self_attn_mask = self._create_attn_mask(
@@ -390,10 +399,12 @@ class Dia:
 
             V = self.config.model.tgt_vocab_size
             logits_last_BxCxV = logits_Bx1xCxV[:, -1, :, :]  # B, C, V
-            uncond_logits_CxV = logits_last_BxCxV[0, :, :]
-            cond_logits_CxV = logits_last_BxCxV[1, :, :]
-
-            cfg_logits_CxV = uncond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
+            if use_cfg:
+                uncond_logits_CxV = logits_last_BxCxV[0, :, :]
+                cond_logits_CxV = logits_last_BxCxV[1, :, :]
+                cfg_logits_CxV = uncond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
+            else:
+                cfg_logits_CxV = logits_last_BxCxV[0, :, :]
 
             logits_CxV = cfg_logits_CxV.reshape((-1, V))  # C, V
             logits_CxV[:, 1025:] = -torch.inf
@@ -415,7 +426,7 @@ class Dia:
                     audio_bos_value,
                 )
 
-            generated_BxTxC[:, step + 1, :] = pred_C.unsqueeze(0).expand(2, -1)
+            generated_BxTxC[:, step + 1, :] = pred_C.unsqueeze(0).expand(batch_size, -1)
 
             if not eos_detected_channel_0 and pred_C[0] == audio_eos_value:
                 eos_detected_channel_0 = True

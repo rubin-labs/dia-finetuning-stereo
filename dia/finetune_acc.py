@@ -263,8 +263,14 @@ def get_args() -> argparse.Namespace:
                         help="Generate audio demos every N steps (if None, defaults to same as --eval_step).")
     parser.add_argument("--eval_every_epochs", type=int, default=None,
                         help="Evaluate at the end of every N epochs (overrides step-based eval).")
+    parser.add_argument("--demo_every_epochs", type=int, default=None,
+                        help="Generate audio demos every N epochs (use with --eval_every_epochs).")
     parser.add_argument("--save_every_epochs", type=int, default=None,
                         help="Save checkpoint at the end of every N epochs (overrides step-based save).")
+    parser.add_argument("--save_after_epoch", type=int, default=0,
+                        help="Only start saving checkpoints after this epoch (default: 0, save from start).")
+    parser.add_argument("--demo_after_epoch", type=int, default=0,
+                        help="Only start generating demos after this epoch (default: 0, demo from start).")
     parser.add_argument("--early_stop_loss", type=float, default=None,
                         help="Early stop when training loss <= this value; saves final checkpoint then exits.")
     parser.add_argument("--stop_on_overfit", action="store_true",
@@ -802,9 +808,10 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             # evaluation during epoch (only if epoch-based eval is not requested)
             if args.eval_every_epochs is None and global_step > 0 and global_step % train_cfg.eval_step == 0:
                 model.eval()
-                # Determine if we should generate demos
+                # Determine if we should generate demos (respecting demo_after_epoch)
                 demo_interval = args.demo_every if args.demo_every is not None else train_cfg.eval_step
-                do_demo = (global_step % demo_interval == 0)
+                past_demo_threshold = (epoch + 1) > args.demo_after_epoch
+                do_demo = (global_step % demo_interval == 0) and past_demo_threshold
                 
                 with torch.no_grad():
                     should_stop = eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_cfg, rank, use_ddp, do_demo=do_demo, current_train_loss=loss, stop_on_overfit=args.stop_on_overfit)
@@ -827,7 +834,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
 
             # checkpoint saving logic (only on rank 0) - step-based unless epoch-based save is requested
             should_save = False
-            if args.save_every_epochs is None:
+            past_save_threshold = (epoch + 1) > args.save_after_epoch
+            if args.save_every_epochs is None and past_save_threshold:
                 if args.save_last is None:  # Normal saving behavior
                     if args.save_every is not None:
                         should_save = global_step > 0 and global_step % args.save_every == 0
@@ -883,11 +891,15 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             model.eval()
             with torch.no_grad():
                 gsp = ((epoch + 1) * (steps_per_epoch or 0)) - 1
-                # For epoch-based eval, always do demos unless demo_every is set and we're not on a multiple
-                if args.demo_every is None:
-                    do_demo = True
+                # For epoch-based eval, check demo_every_epochs first, then fallback to demo_every (steps)
+                # Also respect demo_after_epoch threshold
+                past_demo_threshold = (epoch + 1) > args.demo_after_epoch
+                if args.demo_every_epochs is not None:
+                    do_demo = ((epoch + 1) % args.demo_every_epochs == 0) and past_demo_threshold
+                elif args.demo_every is None:
+                    do_demo = past_demo_threshold
                 else:
-                    do_demo = (gsp > 0 and gsp % args.demo_every == 0)
+                    do_demo = (gsp > 0 and gsp % args.demo_every == 0) and past_demo_threshold
                 
                 should_stop = eval_step(model, val_loader, dia_cfg, dac_model, gsp if gsp >= 0 else 0, device, train_cfg, rank, use_ddp, do_demo=do_demo, current_train_loss=loss, stop_on_overfit=args.stop_on_overfit)
                 
@@ -910,10 +922,12 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
         # end of epoch checkpoint (only on rank 0)
         if rank == 0:
             is_last_epoch = (epoch + 1) == train_cfg.epochs
+            past_save_threshold = (epoch + 1) > args.save_after_epoch
             
             if args.save_every_epochs is not None:
-                # Save every N epochs and always on the final epoch
-                if ((epoch + 1) % args.save_every_epochs == 0) or is_last_epoch:
+                # Save every N epochs and always on the final epoch (respecting save_after_epoch)
+                should_save_epoch = ((epoch + 1) % args.save_every_epochs == 0) and past_save_threshold
+                if should_save_epoch or is_last_epoch:
                     ckpt_e = train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth"
                     state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
                     torch.save(state_dict, ckpt_e)
@@ -925,7 +939,9 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                     cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
             else:
                 # Default behavior: save epoch checkpoints if no step-based save_every provided, or always save final epoch
-                if args.save_every is None or is_last_epoch:
+                # (respecting save_after_epoch threshold)
+                should_save_epoch = (args.save_every is None and past_save_threshold) or is_last_epoch
+                if should_save_epoch:
                     ckpt_e = train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth"
                     state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
                     torch.save(state_dict, ckpt_e)
@@ -1253,8 +1269,7 @@ def main():
         model = DiaModel(dia_cfg)
         
         if args.scratch:
-            if rank == 0:
-                print("Initializing model from scratch (random weights)...")
+            print("Initializing model from scratch (random weights)...")
             if hasattr(model, '_init_weights'):
                 model._init_weights()
             expanded_stereo = False

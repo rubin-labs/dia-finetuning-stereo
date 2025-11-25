@@ -109,20 +109,22 @@ class MusicDataset(Dataset):
         if sr != 44100:
             waveform = torchaudio.functional.resample(waveform, sr, 44100)
         
-        if not self.use_sliding_window:
-            # Original behavior: crop to target length here
-            # DAC compression ratio: 44100 samples/sec ÷ 512 hop_length = ~86.13 tokens/sec
-            # Convert audio_length (tokens) to samples: tokens * (44100 samples/sec) / (44100/512 tokens/sec)
-            target_length_tokens = self.config.data.audio_length
-            target_length_samples = int(target_length_tokens * 512)
-            total_samples = waveform.shape[1]
-            
-            if total_samples > target_length_samples:
-                # Random start position for files longer than target length
-                max_start = total_samples - target_length_samples
-                start_sample = random.randint(0, max_start)
-                waveform = waveform[:, start_sample:start_sample + target_length_samples]
-        # If using sliding window, keep the full waveform - cropping happens in collate_fn
+        # ALWAYS crop waveform before encoding to ensure:
+        # 1. DAC encoder edge effects create slight token variations (regularization)
+        # 2. Efficient encoding (only encode what we need, not full file)
+        # 3. Consistent behavior regardless of use_sliding_window flag
+        # Note: use_sliding_window flag is ignored for MusicDataset since on-the-fly
+        # encoding benefits from waveform-level cropping. The flag only affects
+        # PreEncodedDACDataset where tokens are already fixed.
+        target_length_tokens = self.config.data.audio_length
+        target_length_samples = int(target_length_tokens * 512)  # DAC hop_length = 512
+        total_samples = waveform.shape[1]
+        
+        if total_samples > target_length_samples:
+            # Random crop for training variety + DAC edge regularization
+            max_start = total_samples - target_length_samples
+            start_sample = random.randint(0, max_start)
+            waveform = waveform[:, start_sample:start_sample + target_length_samples]
         
         # Encode with DAC: process mono per channel and build stereo codes (9->18)
         with torch.no_grad():

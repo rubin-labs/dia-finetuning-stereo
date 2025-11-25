@@ -1,12 +1,40 @@
 #!/usr/bin/env python3
-import argparse
+import sys
 import os
+
+# Ensure we import from the local dia/ folder, not an installed package
+# This makes the script work the same way as training does
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir) if os.path.basename(script_dir) == 'scripts' else script_dir
+sys.path.insert(0, project_root)
+
+import argparse
 import json
+import subprocess
 import torch
 import soundfile as sf
 import numpy as np
 from dia.model import Dia
 from dia.config import DiaConfig
+
+
+def convert_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k"):
+    """Convert WAV to MP3 using ffmpeg."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-b:a", bitrate, mp3_path],
+            check=True,
+            capture_output=True
+        )
+        # Remove the original WAV file after successful conversion
+        os.remove(wav_path)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"    Warning: ffmpeg conversion failed: {e.stderr.decode() if e.stderr else e}")
+        return False
+    except FileNotFoundError:
+        print("    Warning: ffmpeg not found, keeping WAV format")
+        return False
 
 # Prompts provided by the user
 PROMPTS = {
@@ -296,11 +324,19 @@ def main():
     print(f"Using device: {args.device}")
     print(f"Loading model from {args.checkpoint} with config {args.config}")
     
-    # Load model
+    device = torch.device(args.device)
+    
+    # Load model - matching training eval setup
     try:
-        model = Dia.from_local(args.config, args.checkpoint, device=torch.device(args.device))
+        model = Dia.from_local(args.config, args.checkpoint, device=device)
+        # Ensure model is in float32 for inference (matching training eval)
+        model.model = model.model.float()
+        model.model.eval()
+        print(f"Model loaded successfully. Model dtype: {next(model.model.parameters()).dtype}")
     except Exception as e:
         print(f"Failed to load model: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -317,23 +353,19 @@ def main():
             print(f"  Params: CFG={cfg}, Temp={temp}, TopP={top_p}")
             
             try:
-                # Generate audio
-                # Note: model.generate returns numpy array (channels, samples) or (samples, channels) depending on implementation
-                # Inspecting model.py, it returns (channels, samples) for dac decoding but let's verify return of generate()
-                # Dia.generate returns: audio.squeeze().cpu().numpy()
-                # codebook_to_audio returns [B, C, T] ?
-                # Let's just handle the output carefully.
-                
-                output_audio = model.generate(
-                    text=text_prompt,
-                    cfg_scale=cfg,
-                    temperature=temp,
-                    top_p=top_p,
-                )
+                # Generate audio with autocast disabled (matching training eval)
+                with torch.inference_mode(), torch.cuda.amp.autocast(enabled=False):
+                    output_audio = model.generate(
+                        text=text_prompt,
+                        cfg_scale=cfg,
+                        temperature=temp,
+                        top_p=top_p,
+                    )
                 
                 # Construct filename
-                filename = f"{base_name}_cfg{cfg}_temp{temp}_topP{top_p}.wav"
-                filepath = os.path.join(args.output_dir, filename)
+                base_filename = f"{base_name}_cfg{cfg}_temp{temp}_topP{top_p}"
+                wav_filepath = os.path.join(args.output_dir, f"{base_filename}.wav")
+                mp3_filepath = os.path.join(args.output_dir, f"{base_filename}.mp3")
                 
                 # Save audio
                 # Ensure correct shape for soundfile: (frames, channels)
@@ -345,11 +377,17 @@ def main():
                         if arr.shape[0] < arr.shape[1] and arr.shape[0] <= 128: # 18 channels is common here
                              arr = arr.T
                 
-                sf.write(filepath, arr, 44100)
-                print(f"    Saved to {filepath}")
+                # Write WAV first, then convert to MP3
+                sf.write(wav_filepath, arr, 44100)
+                if convert_to_mp3(wav_filepath, mp3_filepath):
+                    print(f"    Saved to {mp3_filepath}")
+                else:
+                    print(f"    Saved to {wav_filepath}")
                 
             except Exception as e:
                 print(f"    Error generating/saving: {e}")
+                import traceback
+                traceback.print_exc()
 
 if __name__ == "__main__":
     main()

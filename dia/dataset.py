@@ -109,21 +109,21 @@ class MusicDataset(Dataset):
         if sr != 44100:
             waveform = torchaudio.functional.resample(waveform, sr, 44100)
         
-        # ALWAYS crop waveform before encoding to ensure:
-        # 1. DAC encoder edge effects create slight token variations (regularization)
-        # 2. Efficient encoding (only encode what we need, not full file)
-        # 3. Consistent behavior regardless of use_sliding_window flag
-        # Note: use_sliding_window flag is ignored for MusicDataset since on-the-fly
-        # encoding benefits from waveform-level cropping. The flag only affects
-        # PreEncodedDACDataset where tokens are already fixed.
+        # Crop waveform before encoding for efficiency and to get target length
+        # - use_sliding_window=True: random crop (data augmentation + DAC jitter regularization)
+        # - use_sliding_window=False: fixed crop from start (deterministic for debugging/overfitting)
         target_length_tokens = self.config.data.audio_length
         target_length_samples = int(target_length_tokens * 512)  # DAC hop_length = 512
         total_samples = waveform.shape[1]
         
         if total_samples > target_length_samples:
-            # Random crop for training variety + DAC edge regularization
-            max_start = total_samples - target_length_samples
-            start_sample = random.randint(0, max_start)
+            if self.use_sliding_window:
+                # Random crop for data augmentation + DAC edge regularization
+                max_start = total_samples - target_length_samples
+                start_sample = random.randint(0, max_start)
+            else:
+                # Fixed crop from start for deterministic training
+                start_sample = 0
             waveform = waveform[:, start_sample:start_sample + target_length_samples]
         
         # Encode with DAC: process mono per channel and build stereo codes (9->18)
@@ -201,21 +201,21 @@ class PreEncodedDACDataset(Dataset):
         # Load pre-encoded DAC tensor
         encoded = torch.load(encoded_file, map_location='cpu')  # Shape: (T, 18) for stereo or (T, 9) for mono
         
+        # Cropping behavior:
+        # - use_sliding_window=True: return full sequence, let collate_fn do random cropping
+        # - use_sliding_window=False: fixed crop from start here (deterministic)
+        # Note: Do NOT pad here — let collate_fn handle padding so it can track
+        # the true sequence length for proper loss masking
+        target_length = self.config.data.audio_length
         if not self.use_sliding_window:
-            # Original behavior: crop to target length here
-            target_length = self.config.data.audio_length
+            # Fixed crop from start for deterministic training
             if encoded.shape[0] > target_length:
-                # Random crop for training variety
-                max_start = encoded.shape[0] - target_length
-                start_idx = random.randint(0, max_start)
-                encoded = encoded[start_idx:start_idx + target_length]
-            elif encoded.shape[0] < target_length:
-                # Pad if too short
-                pad_length = target_length - encoded.shape[0]
-                pad_value = self.config.data.audio_pad_value
-                padding = torch.full((pad_length, encoded.shape[1]), pad_value, dtype=encoded.dtype)
-                encoded = torch.cat([encoded, padding], dim=0)
-        # If using sliding window, keep the full sequence - cropping happens in collate_fn
+                encoded = encoded[:target_length]
+            # If shorter than target_length, return as-is. collate_fn will:
+            # 1. Record the true length in seq_lens
+            # 2. Pad to batch_max
+            # 3. Use seq_lens to mask out PAD tokens from loss
+        # If using sliding window, keep the full sequence - collate_fn does random cropping
         
         # Use filename as prompt (full filename, not just first few words)
         filename = encoded_file.stem

@@ -189,11 +189,11 @@ def run_ddp_worker_lora(rank: int, world_size: int, args):
         finetune_acc.TAG_DROPOUT = float(getattr(args, 'tag_dropout', 0.0))
         finetune_acc.TAG_LIMIT = getattr(args, 'tag_limit', None)
 
-        # DAC model (on device)
-        dac_model = dac.DAC.load(dac.utils.download()).to(device)
+        # DAC model (on device, must be in eval mode for deterministic encoding)
+        dac_model = dac.DAC.load(dac.utils.download()).eval().to(device)
 
         # Dataset
-        use_sliding_window = not args.disable_sliding_window
+        use_sliding_window = args.use_sliding_window
         if args.preencoded_dir:
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
         elif args.audio_folder:
@@ -355,10 +355,10 @@ def main():
         finetune_acc.TAG_LIMIT = getattr(args, 'tag_limit', None)
 
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        dac_model = dac.DAC.load(dac.utils.download()).to(device)
+        dac_model = dac.DAC.load(dac.utils.download()).eval().to(device)
 
         # Dataset
-        use_sliding_window = not args.disable_sliding_window
+        use_sliding_window = args.use_sliding_window
         if args.preencoded_dir:
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
         elif args.audio_folder:

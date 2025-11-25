@@ -61,6 +61,48 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
 
 
+# =============================================================================
+# EVALUATION & DEMO GENERATION CONFIGURATION
+# =============================================================================
+# Modify these parameters to control how evaluation and demo generation behave.
+# These are the main knobs you'll want to tweak for testing your finetuned model.
+
+# -- Test Prompts for Demo Generation --
+# These prompts are used to generate audio samples during evaluation.
+# Add/modify prompts to test different aspects of your model.
+# Format: {"name": "comma, separated, tags"}
+TEST_PROMPTS = {
+    "piano_ambient": "piano, pads, ambient, cinematic, melancholic, peaceful, reflective, instrumental"
+}
+
+# -- Audio Generation Parameters (for conditional generation) --
+EVAL_CFG_SCALE = 4.0           # Classifier-free guidance scale (higher = more prompt adherence)
+EVAL_TEMPERATURE = 1.0         # Sampling temperature (higher = more random)
+EVAL_TOP_P = 0.95              # Top-p (nucleus) sampling threshold
+
+# -- Audio Generation Parameters (for unconditional generation) --
+EVAL_CFG_SCALE_UNCOND = 0.0    # CFG scale for unconditional generation (usually 0.0)
+EVAL_TEMPERATURE_UNCOND = 1.0  # Temperature for unconditional generation
+
+# -- Multi-Temperature Demo Configuration --
+# Generate demos at multiple temperatures to track embedding learning progress
+# temp=0.0: deterministic (shows what model actually learned)
+# temp=0.5: moderate sampling (tests confidence)
+# temp=1.0: full sampling (tests robustness)
+EVAL_TEMPERATURES = [0.0, 0.5, 1.0]
+
+# -- Codebook Weighting (used in loss calculation) --
+# Weights for each of the 9 DAC codebooks. First codebooks capture coarse features,
+# later codebooks capture fine details. Adjust to emphasize different aspects.
+CODEBOOK_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+# -- Output Settings --
+EVAL_SAMPLE_RATE = 44100       # Sample rate for saved audio files
+EVAL_AUDIO_DIR = "./audio_demos"  # Directory to save demo audio files
+
+# =============================================================================
+
+
 # Tag augmentation controls (set from CLI in main/DDP worker)
 TAG_SHUFFLE = True
 TAG_DROPOUT = 0.0
@@ -106,10 +148,72 @@ def _worker_init_fn(worker_id):
 
 
 # Music-specific processing can be added here if needed
-test_prompts = {
-    "synthesizer": "synthesizer",
-    "mix": "synthesizer, rap"
-}
+# NOTE: Test prompts moved to top of file (see TEST_PROMPTS in config section)
+
+
+def compute_vocabulary_coverage(dataset, max_valid_token=1023):
+    """
+    Compute vocabulary coverage statistics for a dataset.
+    
+    Returns dict with:
+        - unique_tokens: set of unique token IDs found
+        - coverage_pct: percentage of vocabulary covered (out of 1024 DAC codes)
+        - token_counts: Counter of token frequencies
+    """
+    from collections import Counter
+    
+    all_tokens = set()
+    token_counts = Counter()
+    
+    logger.info(f"Computing vocabulary coverage for {len(dataset)} samples...")
+    
+    for i in range(len(dataset)):
+        try:
+            _, encoded, _ = dataset[i]
+            # encoded is (T, C) tensor of audio codes
+            tokens = encoded.flatten().tolist()
+            # Filter to valid audio tokens (0-1023), exclude special tokens
+            valid_tokens = [t for t in tokens if 0 <= t <= max_valid_token]
+            all_tokens.update(valid_tokens)
+            token_counts.update(valid_tokens)
+        except Exception as e:
+            logger.warning(f"Error processing sample {i} for vocab coverage: {e}")
+            continue
+    
+    coverage_pct = len(all_tokens) / (max_valid_token + 1) * 100
+    
+    return {
+        'unique_tokens': all_tokens,
+        'num_unique': len(all_tokens),
+        'coverage_pct': coverage_pct,
+        'token_counts': token_counts,
+        'total_tokens': sum(token_counts.values()),
+    }
+
+
+def compute_output_entropy(logits):
+    """
+    Compute entropy of output probability distribution.
+    
+    Args:
+        logits: (B, T, C, V) tensor of logits
+        
+    Returns:
+        Mean entropy across all positions (scalar)
+    
+    Higher entropy = more uncertain (flatter distribution)
+    Lower entropy = more confident (peaked distribution)
+    """
+    # Softmax to get probabilities
+    probs = F.softmax(logits.float(), dim=-1)  # (B, T, C, V)
+    
+    # Compute entropy: -sum(p * log(p))
+    # Add small epsilon to avoid log(0)
+    log_probs = torch.log(probs + 1e-10)
+    entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, T, C)
+    
+    # Mean entropy across all positions
+    return entropy.mean().item()
 
 
 def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):
@@ -276,9 +380,9 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--stop_on_overfit", action="store_true",
                         help="Stop training and generate demo when eval loss > train loss")
     
-    # Sliding window augmentation (default: enabled)
-    parser.add_argument("--disable_sliding_window", action="store_true",
-                        help="Disable sliding window: use original fixed-length loading instead of random cropping")
+    # Sliding window augmentation (default: disabled for deterministic training)
+    parser.add_argument("--use_sliding_window", action="store_true", default=False,
+                        help="Enable sliding window: random cropping for data augmentation (default: off for deterministic training)")
     # Optimizer param-group controls
     parser.add_argument("--no_decay_embed", action="store_true",
                         help="Exclude nn.Embedding parameters from weight decay")
@@ -295,17 +399,26 @@ def get_args() -> argparse.Namespace:
 
 
 
-def collate_fn(batch, config: DiaConfig, device: torch.device):
+def collate_fn(batch, config: DiaConfig, device: torch.device, use_sliding_window: bool = True):
     texts, encodings, waveforms = zip(*batch)
 
-    # -- Audio random sliding window --
-    # Use configured audio length (in tokens)
+        # -- Enforce max length and optional random cropping --
+    # ALWAYS enforce max length (safety net, even if dataset should have cropped)
+    # use_sliding_window=True: random crop position (data augmentation)
+    # use_sliding_window=False: fixed crop from start (deterministic)
     window_size = config.data.audio_length
-    
     cropped_encodings = []
     for e in encodings:
         if e.size(0) > window_size:
-            start = random.randint(0, e.size(0) - window_size)
+            if use_sliding_window:
+                # Random crop for data augmentation
+                # Only use randomness if we have plenty of extra duration (> 5 seconds extra)
+                # This prevents "jittering" around the same small clip which might confuse the model on exact timing
+                # For overfitting 1 sample, we really want DETERMINISTIC behavior to memorize it.
+                start = random.randint(0, e.size(0) - window_size)
+            else:
+                # Fixed crop from start for deterministic training
+                start = 0
             cropped_encodings.append(e[start : start + window_size])
         else:
             cropped_encodings.append(e)
@@ -328,7 +441,7 @@ def collate_fn(batch, config: DiaConfig, device: torch.device):
     src_pad = src.ne(pad_tok)
     enc_self_attn_mask = (src_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
 
-    # -- Audio codes with batch-based padding (no windowing) ------------------
+    # -- Audio codes: pad to batch max and track original lengths --------------
 
     # Find the maximum length in this batch
     batch_max = max(e.size(0) for e in encodings)
@@ -396,13 +509,22 @@ def collate_fn(batch, config: DiaConfig, device: torch.device):
         'tgt_lens': torch.tensor(tgt_lens, dtype=torch.long, device=device),
     }
 
-def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, rank=0, world_size=1, use_ddp=False):
-    collate = lambda b: collate_fn(b, dia_cfg, device)
+def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, rank=0, world_size=1, use_ddp=False, use_sliding_window=True):
+    collate = lambda b: collate_fn(b, dia_cfg, device, use_sliding_window)
     
     ds_len = len(dataset)
     n_train = int(train_cfg.split_ratio * ds_len)
-    g = torch.Generator().manual_seed(train_cfg.seed)
-    train_ds, val_ds = random_split(dataset, [n_train, ds_len - n_train], generator=g)
+    n_val = ds_len - n_train
+    
+    # If dataset has only 1 sample (or split would result in 0 val samples), skip validation
+    if ds_len <= 1 or n_val == 0:
+        if rank == 0:
+            logger.info(f"Dataset has {ds_len} sample(s) - skipping validation split, using all data for training")
+        train_ds = dataset
+        val_ds = None
+    else:
+        g = torch.Generator().manual_seed(train_cfg.seed)
+        train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=g)
     
     # Create sampler for DDP
     if use_ddp:
@@ -432,14 +554,18 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, r
         worker_init_fn=None
     )
     
-    val_loader = DataLoader(
-        val_ds, 
-        batch_size=1, 
-        shuffle=False, 
-        collate_fn=collate,
-        num_workers=0,  # Disable workers for DDP
-        pin_memory=False  # Disabled since collate_fn puts data on GPU
-    )
+    # Only create val_loader if we have validation data
+    if val_ds is not None:
+        val_loader = DataLoader(
+            val_ds, 
+            batch_size=1, 
+            shuffle=False, 
+            collate_fn=collate,
+            num_workers=0,  # Disable workers for DDP
+            pin_memory=False  # Disabled since collate_fn puts data on GPU
+        )
+    else:
+        val_loader = None
     
     # Set steps_per_epoch attribute for tqdm
     # DataLoader already handles batch_size division, so just use its length
@@ -521,48 +647,49 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
     """
     eval_losses = []
     last_batch = None
-    with torch.inference_mode():
-        for eb in tqdm(val_loader, desc="eval"):
-            last_batch = eb
+    
+    if val_loader is not None:
+        with torch.inference_mode():
+            for eb in tqdm(val_loader, desc="eval"):
+                last_batch = eb
 
-            # 1) do your forward in mixed precision
-            with torch.amp.autocast('cuda'):
-                logits16 = model(
-                    src_BxS=eb['src_tokens'],
-                    tgt_BxTxC=eb['tgt_tokens'],
-                    src_positions=eb['src_positions'],
-                    tgt_positions=eb['tgt_positions'],
-                    enc_self_attn_mask=eb['enc_self_attn_mask'],
-                    dec_self_attn_mask=eb['dec_self_attn_mask'],
-                    dec_cross_attn_mask=eb['dec_cross_attn_mask'],
-                    enable_dropout=False,
-                )[:, :-1]
+                # 1) do your forward in mixed precision
+                with torch.amp.autocast('cuda'):
+                    logits16 = model(
+                        src_BxS=eb['src_tokens'],
+                        tgt_BxTxC=eb['tgt_tokens'],
+                        src_positions=eb['src_positions'],
+                        tgt_positions=eb['tgt_positions'],
+                        enc_self_attn_mask=eb['enc_self_attn_mask'],
+                        dec_self_attn_mask=eb['dec_self_attn_mask'],
+                        dec_cross_attn_mask=eb['dec_cross_attn_mask'],
+                        enable_dropout=False,
+                    )[:, :-1]
 
-            logits = logits16.float()
-            target = eb['tgt_tokens'][:, 1:]
-            B_e, T_e, C_e = target.shape
-            V_e = logits.size(-1)
+                logits = logits16.float()
+                target = eb['tgt_tokens'][:, 1:]
+                B_e, T_e, C_e = target.shape
+                V_e = logits.size(-1)
 
-            loss_e = 0.0
-            # Custom weighting for eval as well to match training objective
-            codebook_pattern = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-            weights_e = []
-            num_groups = C_e // 9
-            if num_groups > 0:
-                for _ in range(num_groups):
-                    weights_e.extend(codebook_pattern)
-            else:
-                weights_e = [1.0] * C_e
-            
-            for c, w in enumerate(weights_e):
-                lc = logits[:, :, c, :].reshape(-1, V_e)
-                tc = target[:, :, c].reshape(-1)
-                loss_e += w * F.cross_entropy(
-                    lc, tc, ignore_index=dia_cfg.data.audio_pad_value
-                )
-            loss_e = loss_e / sum(weights_e)
+                loss_e = 0.0
+                # Custom weighting for eval as well to match training objective
+                weights_e = []
+                num_groups = C_e // 9
+                if num_groups > 0:
+                    for _ in range(num_groups):
+                        weights_e.extend(CODEBOOK_WEIGHTS)
+                else:
+                    weights_e = [1.0] * C_e
+                
+                for c, w in enumerate(weights_e):
+                    lc = logits[:, :, c, :].reshape(-1, V_e)
+                    tc = target[:, :, c].reshape(-1)
+                    loss_e += w * F.cross_entropy(
+                        lc, tc, ignore_index=dia_cfg.data.audio_pad_value
+                    )
+                loss_e = loss_e / sum(weights_e)
 
-            eval_losses.append(loss_e)
+                eval_losses.append(loss_e)
 
     should_stop = False
     if len(eval_losses) > 0:
@@ -576,7 +703,7 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                     should_stop = True
                     do_demo = True
     else:
-        if rank == 0:
+        if rank == 0 and val_loader is not None:
             logger.warning("No validation samples available for evaluation - check split_ratio")
 
     # Only generate demos if requested
@@ -600,41 +727,53 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                 
                 # Check if we're doing unconditional generation
                 if train_cfg.unconditional_frac >= 1.0:
-                    # Fully unconditional training - generate two samples with different seeds
+                    # Fully unconditional training - generate samples at multiple temperatures
+                    # This helps track how embeddings are learning over time:
+                    # - temp=0.0: deterministic, shows what model actually learned
+                    # - temp=0.5: moderate sampling, tests confidence  
+                    # - temp=1.0: full sampling, tests robustness
                     seeds = [int(train_cfg.seed), int(train_cfg.seed) + 1]
-                    logger.info(f"Generating {len(seeds)} unconditional demo samples with seeds: {seeds}")
+                    temperatures = EVAL_TEMPERATURES  # [0.0, 0.5, 1.0]
+                    total_demos = len(seeds) * len(temperatures)
+                    logger.info(f"Generating {total_demos} unconditional demos ({len(seeds)} seeds × {len(temperatures)} temperatures)")
+                    
                     # Save current RNG states to avoid impacting subsequent training randomness
                     prev_py_state = random.getstate()
                     prev_np_state = np.random.get_state()
                     prev_torch_state = torch.get_rng_state()
                     prev_cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
                     try:
-                        for s in seeds:
-                            try:
-                                seed_everything(s)
-                                logger.info(f"Generating unconditional audio (seed={s})")
-                                audio = dia_gen.generate(
-                                    text="",
-                                    cfg_scale=0.0,
-                                    temperature=1.0
-                                )
-                                
-                                # Save audio file to mono_demos directory
-                                audio_filename = f"step_{global_step}_unconditional_seed{s}.wav"
-                                audio_path = Path("./audio_demos") / audio_filename
-                                arr = audio
-                                if isinstance(arr, torch.Tensor):
-                                    arr = arr.detach().cpu().numpy()
-                                if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
-                                    arr = arr.T
-                                sf.write(audio_path, arr, 44100)
-                                logger.info(f"Saved demo audio: {audio_path}")
-                                
-                                # Convert to wandb Audio format
-                                audio_samples[f"eval_audio/unconditional_seed{s}"] = wandb.Audio(arr, sample_rate=44100, caption=f"unconditional seed={s}")
-                                logger.info(f"Added unconditional sample (seed={s}) to wandb log queue")
-                            except Exception as e:
-                                logger.exception(f"Error generating unconditional sample (seed={s}): {e}")
+                        for temp in temperatures:
+                            for s in seeds:
+                                try:
+                                    seed_everything(s)
+                                    logger.info(f"Generating unconditional audio (seed={s}, temp={temp})")
+                                    audio = dia_gen.generate(
+                                        text="",
+                                        cfg_scale=EVAL_CFG_SCALE_UNCOND,
+                                        temperature=temp
+                                    )
+                                    
+                                    # Save audio file to demo directory
+                                    temp_str = f"{temp:.1f}".replace(".", "p")  # 0.5 -> "0p5"
+                                    audio_filename = f"step_{global_step}_temp{temp_str}_seed{s}.wav"
+                                    audio_path = Path(EVAL_AUDIO_DIR) / audio_filename
+                                    arr = audio
+                                    if isinstance(arr, torch.Tensor):
+                                        arr = arr.detach().cpu().numpy()
+                                    if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
+                                        arr = arr.T
+                                    sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
+                                    logger.info(f"Saved demo audio: {audio_path}")
+                                    
+                                    # Convert to wandb Audio format - organize by temperature
+                                    audio_samples[f"eval_audio/temp{temp_str}/seed{s}"] = wandb.Audio(
+                                        arr, sample_rate=EVAL_SAMPLE_RATE, 
+                                        caption=f"temp={temp}, seed={s}"
+                                    )
+                                    logger.info(f"Added sample (temp={temp}, seed={s}) to wandb log queue")
+                                except Exception as e:
+                                    logger.exception(f"Error generating sample (seed={s}, temp={temp}): {e}")
                     finally:
                         try:
                             torch.set_rng_state(prev_torch_state)
@@ -649,30 +788,30 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                             pass
                 else:
                     # Conditional training - use test prompts
-                    logger.info(f"Generating {len(test_prompts)} demo samples...")
-                    for test_name, prompt in test_prompts.items():
+                    logger.info(f"Generating {len(TEST_PROMPTS)} demo samples...")
+                    for test_name, prompt in TEST_PROMPTS.items():
                         try:
                             logger.info(f"Generating audio for '{test_name}' with prompt: '{prompt}'")
                             audio = dia_gen.generate(
                                 text=prompt,
-                                cfg_scale=4.0,
-                                temperature=1.0,
-                                top_p=0.95
+                                cfg_scale=EVAL_CFG_SCALE,
+                                temperature=EVAL_TEMPERATURE,
+                                top_p=EVAL_TOP_P
                             )
                             
-                            # Save audio file to mono_demos directory
+                            # Save audio file to demo directory
                             audio_filename = f"step_{global_step}_{test_name}.wav"
-                            audio_path = Path("./audio_demos") / audio_filename
+                            audio_path = Path(EVAL_AUDIO_DIR) / audio_filename
                             arr = audio
                             if isinstance(arr, torch.Tensor):
                                 arr = arr.detach().cpu().numpy()
                             if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
                                 arr = arr.T
-                            sf.write(audio_path, arr, 44100)
+                            sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
                             logger.info(f"Saved demo audio: {audio_path}")
                             
                             # Convert to wandb Audio format
-                            audio_samples[f"eval_audio/{test_name}"] = wandb.Audio(arr, sample_rate=44100, caption=prompt)
+                            audio_samples[f"eval_audio/{test_name}"] = wandb.Audio(arr, sample_rate=EVAL_SAMPLE_RATE, caption=prompt)
                             logger.info(f"Added '{test_name}' to wandb log queue")
                         except Exception as e:
                              logger.exception(f"Error synthesizing test prompt for {test_name}: {e}")
@@ -718,8 +857,13 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     if rank == 0:
         train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
         (train_cfg.runs_dir / train_cfg.run_name).mkdir(parents=True, exist_ok=True)
-        # Create audio_demos directory for audio samples (supports mono/stereo)
-        Path("./audio_demos").mkdir(exist_ok=True)
+        # Create audio demos directory for audio samples (supports mono/stereo)
+        Path(EVAL_AUDIO_DIR).mkdir(exist_ok=True)
+        
+        # Compute vocabulary coverage before training starts
+        vocab_stats = compute_vocabulary_coverage(dataset)
+        logger.info(f"Vocabulary coverage: {vocab_stats['num_unique']}/1024 tokens ({vocab_stats['coverage_pct']:.1f}%)")
+        logger.info(f"Total tokens in dataset: {vocab_stats['total_tokens']:,}")
         
         # Initialize wandb
         wandb.init(
@@ -737,8 +881,16 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 "unconditional_frac": train_cfg.unconditional_frac,
                 "seed": train_cfg.seed,
                 "world_size": world_size,
+                # Vocabulary coverage stats
+                "vocab_unique_tokens": vocab_stats['num_unique'],
+                "vocab_coverage_pct": vocab_stats['coverage_pct'],
+                "vocab_total_tokens": vocab_stats['total_tokens'],
             }
         )
+        
+        # Log vocabulary coverage as a summary metric
+        wandb.run.summary["vocab_coverage_pct"] = vocab_stats['coverage_pct']
+        wandb.run.summary["vocab_unique_tokens"] = vocab_stats['num_unique']
     
     # Synchronize all processes
     if use_ddp:
@@ -751,8 +903,12 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     if use_ddp:
         model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
     
-    train_loader, val_loader = setup_loaders(dataset, dia_cfg, train_cfg, device, rank, world_size, use_ddp)
+    use_sliding_window = args.use_sliding_window
+    train_loader, val_loader = setup_loaders(dataset, dia_cfg, train_cfg, device, rank, world_size, use_ddp, use_sliding_window)
     opt, sched = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
+
+    # --- Sanity Check REMOVED (was causing crashes due to BOS/EOS tokens) ---
+    # Use scripts/check_preencoded.py instead.
 
     model.train()
 
@@ -813,10 +969,12 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 past_demo_threshold = (epoch + 1) > args.demo_after_epoch
                 do_demo = (global_step % demo_interval == 0) and past_demo_threshold
                 
-                with torch.no_grad():
-                    should_stop = eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_cfg, rank, use_ddp, do_demo=do_demo, current_train_loss=loss, stop_on_overfit=args.stop_on_overfit)
+                # Run eval step if we have val_loader OR if we need to generate demos
+                if val_loader is not None or do_demo:
+                    with torch.no_grad():
+                        should_stop = eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_cfg, rank, use_ddp, do_demo=do_demo, current_train_loss=loss, stop_on_overfit=args.stop_on_overfit)
                 
-                if args.stop_on_overfit:
+                if args.stop_on_overfit and val_loader is not None:
                     if use_ddp:
                         flag = torch.tensor(1 if (rank == 0 and should_stop) else 0, device=device)
                         dist.broadcast(flag, src=0)
@@ -887,7 +1045,15 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             break
 
         # Epoch-end evaluation if requested
+        # We check for eval_every_epochs (for loss) OR demo_every_epochs (for demos)
+        # If val_loader is None, we can't compute loss, but we can still do demos
+        should_check_epoch = False
         if args.eval_every_epochs is not None and (epoch + 1) % args.eval_every_epochs == 0:
+             should_check_epoch = True
+        if args.demo_every_epochs is not None and (epoch + 1) % args.demo_every_epochs == 0:
+             should_check_epoch = True
+             
+        if should_check_epoch:
             model.eval()
             with torch.no_grad():
                 gsp = ((epoch + 1) * (steps_per_epoch or 0)) - 1
@@ -901,21 +1067,23 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 else:
                     do_demo = (gsp > 0 and gsp % args.demo_every == 0) and past_demo_threshold
                 
-                should_stop = eval_step(model, val_loader, dia_cfg, dac_model, gsp if gsp >= 0 else 0, device, train_cfg, rank, use_ddp, do_demo=do_demo, current_train_loss=loss, stop_on_overfit=args.stop_on_overfit)
+                # Only run if we have validation data OR we want to demo
+                if val_loader is not None or do_demo:
+                    should_stop = eval_step(model, val_loader, dia_cfg, dac_model, gsp if gsp >= 0 else 0, device, train_cfg, rank, use_ddp, do_demo=do_demo, current_train_loss=loss, stop_on_overfit=args.stop_on_overfit)
                 
-                if args.stop_on_overfit:
-                    if use_ddp:
-                        flag = torch.tensor(1 if (rank == 0 and should_stop) else 0, device=device)
-                        dist.broadcast(flag, src=0)
-                        should_stop = bool(flag.item())
-                    
-                    if should_stop:
-                        stop_training = True
-                        if rank == 0:
-                            ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{gsp}.pth"
-                            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-                            torch.save(state_dict, ckpt_path)
-                            logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
+                    if args.stop_on_overfit and val_loader is not None:
+                        if use_ddp:
+                            flag = torch.tensor(1 if (rank == 0 and should_stop) else 0, device=device)
+                            dist.broadcast(flag, src=0)
+                            should_stop = bool(flag.item())
+                        
+                        if should_stop:
+                            stop_training = True
+                            if rank == 0:
+                                ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{gsp}.pth"
+                                state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                                torch.save(state_dict, ckpt_path)
+                                logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
 
             model.train()
 
@@ -992,13 +1160,12 @@ def train_step_ddp(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
         valid_time = time_idx < (lens.unsqueeze(1) - 1)
         mask = valid_time.unsqueeze(-1).expand(-1, -1, C)
         
-        # Custom weighting: emphasize later codebooks
-        codebook_pattern = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        # Custom weighting: weights defined in CODEBOOK_WEIGHTS config at top of file
         channel_weights = []
         num_groups = C // 9
         if num_groups > 0:
             for _ in range(num_groups):
-                channel_weights.extend(codebook_pattern)
+                channel_weights.extend(CODEBOOK_WEIGHTS)
         else:
             channel_weights = [1.0] * C
 
@@ -1015,6 +1182,13 @@ def train_step_ddp(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
                 ignore_index=pad_val
             )
         loss = loss_c / sum(channel_weights)
+        
+        # Compute output entropy every 50 steps (measures model confidence)
+        # Lower entropy = more confident predictions = embeddings are learning
+        if global_step % 50 == 0:
+            entropy = compute_output_entropy(logits.detach())
+            if rank == 0:
+                wandb.log({'output_entropy': entropy}, step=global_step)
 
     loss = loss / train_cfg.grad_accum_steps
     loss.backward()
@@ -1072,13 +1246,13 @@ def run_ddp_worker(rank: int, world_size: int, args):
         if rank == 0:
             print(f"Loaded config from: {args.config}")
         
-        # Load DAC model
+        # Load DAC model (must be in eval mode for deterministic encoding)
         if rank == 0:
             print("Loading DAC model...")
-        dac_model = dac.DAC.load(dac.utils.download()).to(device)
+        dac_model = dac.DAC.load(dac.utils.download()).eval().to(device)
 
         # Choose dataset
-        use_sliding_window = not args.disable_sliding_window
+        use_sliding_window = args.use_sliding_window
         if args.preencoded_dir:
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
         elif args.audio_folder:
@@ -1237,10 +1411,10 @@ def main():
         TAG_DROPOUT = float(getattr(args, 'tag_dropout', 0.0))
         TAG_LIMIT = getattr(args, 'tag_limit', None)
         device = torch.device("cuda:0")
-        dac_model = dac.DAC.load(dac.utils.download()).to(device)
+        dac_model = dac.DAC.load(dac.utils.download()).eval().to(device)
         
         # Choose dataset
-        use_sliding_window = not args.disable_sliding_window
+        use_sliding_window = args.use_sliding_window
         if args.preencoded_dir:
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
         elif args.audio_folder:

@@ -393,7 +393,7 @@ class Dia:
             uncond_logits_CxV = logits_last_BxCxV[0, :, :]
             cond_logits_CxV = logits_last_BxCxV[1, :, :]
 
-            cfg_logits_CxV = cond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
+            cfg_logits_CxV = uncond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
 
             logits_CxV = cfg_logits_CxV.reshape((-1, V))  # C, V
             logits_CxV[:, 1025:] = -torch.inf

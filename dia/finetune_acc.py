@@ -72,7 +72,8 @@ torch.backends.cudnn.benchmark = True
 # Add/modify prompts to test different aspects of your model.
 # Format: {"name": "comma, separated, tags"}
 TEST_PROMPTS = {
-    "piano_ambient": "piano, pads, ambient, cinematic, melancholic, peaceful, reflective, instrumental"
+    "piano_ambient": "piano, pads, ambient, cinematic, melancholic, peaceful, reflective, instrumental",
+    "dark": "cinematic, suspenseful, dark, energetic, mysterious, strings, bells, bass"
 }
 
 # -- Audio Generation Parameters (for conditional generation) --
@@ -787,35 +788,47 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                         except Exception:
                             pass
                 else:
-                    # Conditional training - use test prompts
-                    logger.info(f"Generating {len(TEST_PROMPTS)} demo samples...")
-                    for test_name, prompt in TEST_PROMPTS.items():
-                        try:
-                            logger.info(f"Generating audio for '{test_name}' with prompt: '{prompt}'")
-                            audio = dia_gen.generate(
-                                text=prompt,
-                                cfg_scale=EVAL_CFG_SCALE,
-                                temperature=EVAL_TEMPERATURE,
-                                top_p=EVAL_TOP_P
-                            )
-                            
-                            # Save audio file to demo directory
-                            audio_filename = f"step_{global_step}_{test_name}.wav"
-                            audio_path = Path(EVAL_AUDIO_DIR) / audio_filename
-                            arr = audio
-                            if isinstance(arr, torch.Tensor):
-                                arr = arr.detach().cpu().numpy()
-                            if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
-                                arr = arr.T
-                            sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
-                            logger.info(f"Saved demo audio: {audio_path}")
-                            
-                            # Convert to wandb Audio format
-                            audio_samples[f"eval_audio/{test_name}"] = wandb.Audio(arr, sample_rate=EVAL_SAMPLE_RATE, caption=prompt)
-                            logger.info(f"Added '{test_name}' to wandb log queue")
-                        except Exception as e:
-                             logger.exception(f"Error synthesizing test prompt for {test_name}: {e}")
-                             continue
+                    # Conditional training - use test prompts at multiple temperatures
+                    # This helps track how embeddings are learning with conditioning:
+                    # - temp=0.0: deterministic, shows what model learned for this prompt
+                    # - temp=0.5: moderate sampling, tests confidence
+                    # - temp=1.0: full sampling, tests robustness
+                    temperatures = EVAL_TEMPERATURES  # [0.0, 0.5, 1.0]
+                    total_demos = len(TEST_PROMPTS) * len(temperatures)
+                    logger.info(f"Generating {total_demos} conditional demos ({len(TEST_PROMPTS)} prompts × {len(temperatures)} temperatures)")
+                    
+                    for temp in temperatures:
+                        for test_name, prompt in TEST_PROMPTS.items():
+                            try:
+                                logger.info(f"Generating audio for '{test_name}' (temp={temp}) with prompt: '{prompt}'")
+                                audio = dia_gen.generate(
+                                    text=prompt,
+                                    cfg_scale=EVAL_CFG_SCALE,
+                                    temperature=temp,
+                                    top_p=EVAL_TOP_P
+                                )
+                                
+                                # Save audio file to demo directory
+                                temp_str = f"{temp:.1f}".replace(".", "p")  # 0.5 -> "0p5"
+                                audio_filename = f"step_{global_step}_{test_name}_temp{temp_str}.wav"
+                                audio_path = Path(EVAL_AUDIO_DIR) / audio_filename
+                                arr = audio
+                                if isinstance(arr, torch.Tensor):
+                                    arr = arr.detach().cpu().numpy()
+                                if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
+                                    arr = arr.T
+                                sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
+                                logger.info(f"Saved demo audio: {audio_path}")
+                                
+                                # Convert to wandb Audio format - organize by temperature
+                                audio_samples[f"eval_audio/temp{temp_str}/{test_name}"] = wandb.Audio(
+                                    arr, sample_rate=EVAL_SAMPLE_RATE, 
+                                    caption=f"{prompt} (temp={temp})"
+                                )
+                                logger.info(f"Added '{test_name}' (temp={temp}) to wandb log queue")
+                            except Exception as e:
+                                 logger.exception(f"Error synthesizing '{test_name}' at temp={temp}: {e}")
+                                 continue
                 
                 # Log all audio samples at once
                 if audio_samples:

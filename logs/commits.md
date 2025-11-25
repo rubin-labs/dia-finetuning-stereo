@@ -15,3 +15,4 @@
 - `2025-11-25 11:41` [`4c6f347`] **main**: 20251124_dia_003_reverted somewhat back to old implementation of dataset/collate
 - `2025-11-25 16:34` [`3007875`] **main**: Eval script
 - `2025-11-25 16:35` [`587e719`] **main**: Eval script
+- `2025-11-25 16:35` [`382b663`] **main**: Eval script

@@ -2,22 +2,22 @@
     "version": "0.1",
     "model": {
         "encoder": {
-            "n_layer": 12,
-            "n_embd": 1024,
-            "n_hidden": 4096,
-            "n_head": 16,
-            "head_dim": 128
+            "n_layer": 4,
+            "n_embd": 512,
+            "n_hidden": 2048,
+            "n_head": 8,
+            "head_dim": 64
         },
         "decoder": {
-            "n_layer": 18,
-            "n_embd": 2048,
-            "n_hidden": 8192,
-            "gqa_query_heads": 16,
-            "cross_query_heads": 16,
-            "kv_heads": 4,
-            "gqa_head_dim": 128,
-            "cross_head_dim": 128,
-            "d_model" : 256
+            "n_layer": 6,
+            "n_embd": 1024,
+            "n_hidden": 4096,
+            "gqa_query_heads": 8,
+            "cross_query_heads": 8,
+            "kv_heads": 2,
+            "gqa_head_dim": 64,
+            "cross_head_dim": 64,
+            "d_model" : 128
         },
         "src_vocab_size": 256,
         "tgt_vocab_size": 1028,
@@ -40,3 +40,4 @@
         ]
     }
 }
+

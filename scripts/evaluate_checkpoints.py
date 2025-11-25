@@ -329,7 +329,7 @@ def main():
     # Mode 1: Checkpoint Evaluation (Generation + Metrics)
     parser_ckpt = subparsers.add_parser("checkpoint-eval", help="Evaluate multiple checkpoints")
     parser_ckpt.add_argument("--checkpoint_dir", type=str, required=True, help="Folder with .pt checkpoints")
-    parser_ckpt.add_argument("--config", type=str, default="./dia/config_overfit_inference.json")
+    parser_ckpt.add_argument("--config", type=str, default="./configs/architecture/experiments/20251124_dia_003_model_inference.json")
     parser_ckpt.add_argument("--output_dir", type=str, default="evaluation_results")
     parser_ckpt.add_argument("--reference_dir", type=str, help="Path to real audio for FAD")
     parser_ckpt.add_argument("--every_n", type=int, default=1, help="Process every Nth checkpoint")

@@ -365,7 +365,7 @@ def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Dia audio model")
     parser.add_argument("--train_config", type=Path, default=Path("configs/train_config.json"),
                         help="Path to training config JSON (defaults loaded from here, CLI overrides)")
-    parser.add_argument("--config",    type=Path, default=Path(cfg_defaults.get('config', 'dia/config.json')))
+    parser.add_argument("--config",    type=Path, default=Path(cfg_defaults.get('config', 'configs/architecture/model.json')))
     parser.add_argument("--hub_model", type=str,  default="nari-labs/Dia-1.6B")
     parser.add_argument("--local_ckpt", type=str,  default=None)
     parser.add_argument("--audio_folder", type=Path, default=cfg_defaults.get('audio_folder'),

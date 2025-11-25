@@ -313,7 +313,7 @@ def set_seed(seed: int):
 def main():
     parser = argparse.ArgumentParser(description="Test inference with various parameters.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to the model checkpoint.")
-    parser.add_argument("--config", type=str, default="./dia/config_overfit_inference.json", help="Path to the model config.")
+    parser.add_argument("--config", type=str, default="./configs/architecture/experiments/20251124_dia_003_model_inference.json", help="Path to the model config.")
     parser.add_argument("--output_dir", type=str, default="inference_tests", help="Directory to save outputs.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")

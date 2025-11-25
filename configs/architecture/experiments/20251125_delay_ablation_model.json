@@ -1,5 +1,6 @@
 {
     "version": "0.1",
+    "description": "Overfit architecture with OLD delay pattern for ablation study",
     "model": {
         "encoder": {
             "n_layer": 4,
@@ -24,7 +25,7 @@
         "dropout": 0.0
     },
     "training": {
-        "dtype": "float32"
+        "dtype": "bfloat16"
     },
     "data": {
         "text_length": 512,
@@ -35,8 +36,9 @@
         "audio_pad_value": 1025,
         "audio_bos_value": 1026,
         "delay_pattern": [
-            0, 1, 2, 3, 4, 5, 6, 7, 8,
-            0, 1, 2, 3, 4, 5, 6, 7, 8
+            0, 8, 9, 10, 11, 12, 13, 14, 15,
+            0, 8, 9, 10, 11, 12, 13, 14, 15
         ]
     }
 }
+

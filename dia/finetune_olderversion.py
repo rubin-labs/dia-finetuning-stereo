@@ -75,7 +75,7 @@ class TrainConfig:
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Dia audio model")
-    parser.add_argument("--config",    type=Path, default=Path("dia/config.json"))
+    parser.add_argument("--config",    type=Path, default=Path("configs/architecture/model.json"))
     parser.add_argument("--dataset",   type=str,  default=None,
                         help="HuggingFace dataset name (if not using --csv_path). Default removed - use music datasets.")
     parser.add_argument("--dataset2",  type=str,  default=None,

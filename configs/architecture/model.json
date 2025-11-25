@@ -24,11 +24,11 @@
         "dropout": 0.0
     },
     "training": {
-        "dtype": "float32"
+        "dtype": "bfloat16"
     },
     "data": {
         "text_length": 512,
-        "audio_length": 1536,
+        "audio_length": 600,
         "channels": 18,
         "text_pad_value": 0,
         "audio_eos_value": 1024,
@@ -40,3 +40,4 @@
         ]
     }
 }
+

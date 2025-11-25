@@ -1,0 +1,36 @@
+{
+    "experiment_id": "20251124_dia_003_reverted_sliding_window",
+    "description": "Successful overfit run after fixing sliding window random crop",
+    
+    "data": {
+      "audio_folder": "./1sampledata/test1/audio",
+      "config": "./configs/architecture/experiments/20251124_dia_003_model.json"
+    },
+    
+    "training": {
+      "batch_size": 4,
+      "grad_accum_steps": 4,
+      "epochs": 10000,
+      "learning_rate": 1e-4,
+      "warmup_steps": 0,
+      "unconditional_frac": 0.5
+    },
+    
+    "output": {
+      "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/DONT_DELETE/new_delay_overfit",
+      "run_name": "new_delay_overfit",
+      "save_every": 300
+    },
+    
+    "eval": {
+      "eval_every_epochs": 10,
+      "demo_every_epochs": 100
+    },
+    
+    "flags": {
+      "scratch": true,
+      "tag_no_shuffle": false,
+      "use_sliding_window": true
+    }
+  }
+

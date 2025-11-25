@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="dia/config_inference.json",
+        default="configs/architecture/model_inference.json",
         type=Path,
         help="Path to inference config JSON.",
     )

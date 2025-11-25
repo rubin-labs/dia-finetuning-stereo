@@ -1,23 +1,24 @@
 {
-    "experiment_id": "20251124_dia_003_reverted somewhat back to old implementation of dataset/collate",
+    "experiment_id": "20251125_delay_ablation_old",
+    "description": "Ablation study: OLD delay pattern (0,8,9,10...) vs new MusicGen pattern",
     
     "data": {
       "audio_folder": "./1sampledata/test1/audio",
-      "config": "./dia/config_overfit.json"
+      "config": "./configs/architecture/experiments/20251125_delay_ablation_model.json"
     },
     
     "training": {
       "batch_size": 4,
       "grad_accum_steps": 4,
-      "epochs": 10000,
+      "epochs": 2000,
       "learning_rate": 1e-4,
       "warmup_steps": 0,
       "unconditional_frac": 0.5
     },
     
     "output": {
-      "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/DONT_DELETE/new_delay_overfit",
-      "run_name": "new_delay_overfit",
+      "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/DONT_DELETE/delay_ablation_old",
+      "run_name": "delay_ablation_old_pattern",
       "save_every": 300
     },
     
@@ -32,4 +33,4 @@
       "use_sliding_window": true
     }
   }
-  
+

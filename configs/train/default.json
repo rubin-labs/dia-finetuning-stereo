@@ -1,9 +1,9 @@
 {
-  "experiment_id": "new_delay_overfit",
+  "experiment_id": "default",
   
   "data": {
-    "audio_folder": "./1sampledata/test1/audio",
-    "config": "./dia/config_overfit.json"
+    "audio_folder": "./data/audio",
+    "config": "./configs/architecture/model.json"
   },
   
   "training": {
@@ -16,9 +16,9 @@
   },
   
   "output": {
-    "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/DONT_DELETE/new_delay_overfit",
-    "run_name": "new_delay_overfit",
-    "save_every": 200
+    "output_dir": "./outputs",
+    "run_name": "default_run",
+    "save_every": 300
   },
   
   "eval": {
@@ -32,3 +32,4 @@
     "use_sliding_window": true
   }
 }
+

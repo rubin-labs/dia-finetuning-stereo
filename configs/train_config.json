@@ -18,7 +18,7 @@
   "output": {
     "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/DONT_DELETE/new_delay_overfit",
     "run_name": "new_delay_overfit",
-    "save_every": 100000
+    "save_every": 200
   },
   
   "eval": {

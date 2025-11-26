@@ -696,6 +696,7 @@ def _mp_fn(rank, args):
                 tqdm.write("Step 0: Starting training step (this will trigger XLA compilation and take ~1-2 mins)...")
             
             loss_tensor = train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device)
+            xm.mark_step()  # Ensure graph execution completes before any host sync (logging, wandb, etc.)
             
             if xm.is_master_ordinal():
                 # TPU Optimization: reduce CPU syncs by logging less frequently

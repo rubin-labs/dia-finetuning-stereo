@@ -5,8 +5,6 @@ build/
 dist/
 wheels/
 
-!requirements.txt
-
 *.egg-info
 
 # Virtual environments
@@ -29,3 +27,5 @@ dia_finetune_mml/
 
 dia-finetuning-stereo/
 data/
+
+!requirements.txt

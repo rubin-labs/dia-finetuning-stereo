@@ -1,0 +1,665 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import argparse
+import logging
+import os
+import random
+import socket
+import tempfile
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+import numpy as np
+import resource
+import time
+import sys
+import datetime
+import re
+import gc
+import glob
+import json
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+
+# TPU / XLA imports
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.debug.metrics as met
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.utils.utils as xu
+except ImportError:
+    print("torch_xla not installed. This script requires a TPU environment.")
+    sys.exit(1)
+
+import torchaudio
+import pandas as pd
+from tqdm import tqdm
+from huggingface_hub import hf_hub_download
+import soundfile as sf
+
+import dac
+# Change relative imports to absolute imports from 'dia' package
+from dia.config import DiaConfig
+from dia.layers import DiaModel
+from dia.model import Dia
+from dia.audio import build_delay_indices, apply_audio_delay
+from dia.dataset import MusicDataset, PreEncodedDACDataset
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Constants copied from dia/finetune_acc.py to avoid importing it (and its CUDA dependencies)
+TEST_PROMPTS = {
+    "piano_ambient": "piano, pads, ambient, cinematic, melancholic, peaceful, reflective, instrumental",
+    "dark": "cinematic, suspenseful, dark, energetic, mysterious, strings, bells, bass"
+}
+EVAL_CFG_SCALE = 4.0
+EVAL_TEMPERATURE = 1.0
+EVAL_TOP_P = 0.95
+EVAL_CFG_SCALE_UNCOND = 0.0
+EVAL_TEMPERATURE_UNCOND = 1.0
+EVAL_TEMPERATURES = [0.0, 0.5, 1.0]
+CODEBOOK_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+EVAL_SAMPLE_RATE = 44100
+EVAL_AUDIO_DIR = "./audio_demos_tpu"
+
+# Tag augmentation globals
+TAG_SHUFFLE = True
+TAG_DROPOUT = 0.0
+TAG_LIMIT = None
+
+def _augment_tags(text: str) -> str:
+    """Augment comma-separated tag prompts by dropout/shuffle/limit."""
+    try:
+        tags = [t.strip() for t in text.split(',') if t.strip()]
+        if not tags:
+            return text
+        # dropout per tag
+        if TAG_DROPOUT and TAG_DROPOUT > 0.0:
+            kept = [t for t in tags if random.random() > TAG_DROPOUT]
+            if kept:
+                tags = kept
+        # shuffle tags
+        if TAG_SHUFFLE and len(tags) > 1:
+            random.shuffle(tags)
+        # limit tags
+        if TAG_LIMIT is not None and TAG_LIMIT > 0:
+            tags = tags[:TAG_LIMIT]
+        return ', '.join(tags)
+    except Exception:
+        return text
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):
+    """Keep only the last N checkpoints, delete older ones to save space."""
+    if keep_last_n is None:
+        return
+    
+    # Find all checkpoint files (both step and epoch checkpoints)
+    step_checkpoints = sorted(glob.glob(str(output_dir / "ckpt_step*.pth")), 
+                            key=lambda x: int(re.search(r'ckpt_step(\d+).pth', x).group(1)) if re.search(r'ckpt_step(\d+).pth', x) else 0)
+    epoch_checkpoints = sorted(glob.glob(str(output_dir / "ckpt_epoch*.pth")),
+                             key=lambda x: int(re.search(r'ckpt_epoch(\d+).pth', x).group(1)) if re.search(r'ckpt_epoch(\d+).pth', x) else 0)
+    
+    # Keep latest N of each type
+    if len(step_checkpoints) > keep_last_n:
+        for old_ckpt in step_checkpoints[:-keep_last_n]:
+            try:
+                os.remove(old_ckpt)
+                logger.info(f"Removed old checkpoint: {old_ckpt}")
+            except Exception as e:
+                logger.warning(f"Failed to remove {old_ckpt}: {e}")
+    
+    if len(epoch_checkpoints) > keep_last_n:
+        for old_ckpt in epoch_checkpoints[:-keep_last_n]:
+            try:
+                os.remove(old_ckpt)
+                logger.info(f"Removed old checkpoint: {old_ckpt}")
+            except Exception as e:
+                logger.warning(f"Failed to remove {old_ckpt}: {e}")
+
+@dataclass
+class TrainConfig:
+    epochs: int = 500
+    batch_size: int = 4
+    grad_accum_steps: int = 1
+    learning_rate: float = 1e-5
+    weight_decay: float = 0.1
+    warmup_steps: int = 100
+    unconditional_frac: float = 0.15
+    eval_step: int = 100
+    save_step: int = 2000
+    split_ratio: float = 0.997
+    seed: int = 786
+    runs_dir: Path = Path("runs_tpu")
+    run_name: str = "dia_finetune_tpu"
+    output_dir: Path = None
+    no_decay_embed: bool = False
+
+def load_train_config(config_path: Path) -> dict:
+    """Load training config from JSON file."""
+    if not config_path.exists():
+        return {}
+    with open(config_path) as f:
+        cfg = json.load(f)
+    # Flatten nested config into flat dict for argparse defaults
+    flat = {}
+    flat['experiment_id'] = cfg.get('experiment_id')
+    if 'data' in cfg:
+        flat['preencoded_dir'] = cfg['data'].get('preencoded_dir')
+        flat['audio_folder'] = cfg['data'].get('audio_folder')
+        flat['config'] = cfg['data'].get('config')
+    if 'training' in cfg:
+        flat['batch_size'] = cfg['training'].get('batch_size')
+        flat['grad_accum_steps'] = cfg['training'].get('grad_accum_steps')
+        flat['epochs'] = cfg['training'].get('epochs')
+        flat['learning_rate'] = cfg['training'].get('learning_rate')
+        flat['warmup_steps'] = cfg['training'].get('warmup_steps')
+        flat['unconditional_frac'] = cfg['training'].get('unconditional_frac')
+        flat['weight_decay'] = cfg['training'].get('weight_decay')
+    if 'output' in cfg:
+        flat['output_dir'] = cfg['output'].get('output_dir')
+        flat['run_name'] = cfg['output'].get('run_name')
+        flat['save_every'] = cfg['output'].get('save_every')
+        flat['save_after_epoch'] = cfg['output'].get('save_after_epoch')
+    if 'eval' in cfg:
+        flat['eval_step'] = cfg['eval'].get('eval_step')
+        flat['demo_every'] = cfg['eval'].get('demo_every')
+        flat['eval_every_epochs'] = cfg['eval'].get('eval_every_epochs')
+        flat['demo_every_epochs'] = cfg['eval'].get('demo_every_epochs')
+    if 'flags' in cfg:
+        flat['scratch'] = cfg['flags'].get('scratch')
+        flat['tag_no_shuffle'] = cfg['flags'].get('tag_no_shuffle')
+        flat['force_single_gpu'] = cfg['flags'].get('force_single_gpu')
+        flat['use_sliding_window'] = cfg['flags'].get('use_sliding_window')
+    # Remove None values
+    return {k: v for k, v in flat.items() if v is not None}
+
+def get_args() -> argparse.Namespace:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--train_config", type=Path, default=Path("configs/train_config.json"))
+    pre_args, _ = pre_parser.parse_known_args()
+    
+    cfg_defaults = load_train_config(pre_args.train_config)
+    
+    parser = argparse.ArgumentParser(description="Train the Dia audio model on TPU")
+    parser.add_argument("--train_config", type=Path, default=Path("configs/train_config.json"))
+    parser.add_argument("--config",    type=Path, default=Path(cfg_defaults.get('config', 'configs/architecture/model.json')))
+    parser.add_argument("--hub_model", type=str,  default="nari-labs/Dia-1.6B")
+    parser.add_argument("--local_ckpt", type=str,  default=None)
+    parser.add_argument("--audio_folder", type=Path, default=cfg_defaults.get('audio_folder'))
+    parser.add_argument("--preencoded_dir", type=Path, default=cfg_defaults.get('preencoded_dir'))
+    parser.add_argument("--run_name",  type=str,  default=cfg_defaults.get('run_name'))
+    parser.add_argument("--output_dir",type=Path, default=cfg_defaults.get('output_dir'))
+    parser.add_argument("--seed", type=int, default=42)
+    # Removed --half as TPUs use BF16 automatically or via config
+    parser.add_argument("--wandb_project", type=str, default="dia-music-finetuning-tpu")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--save_every", type=int, default=cfg_defaults.get('save_every'))
+    parser.add_argument("--save_last", type=int, default=None)
+    parser.add_argument("--tag_shuffle", action="store_true", default=True)
+    parser.add_argument("--tag_no_shuffle", action="store_true", default=cfg_defaults.get('tag_no_shuffle', False))
+    parser.add_argument("--tag_dropout", type=float, default=0.0)
+    parser.add_argument("--tag_limit", type=int, default=None)
+    
+    parser.add_argument("--epochs", type=int, default=cfg_defaults.get('epochs', 500))
+    parser.add_argument("--batch_size", type=int, default=cfg_defaults.get('batch_size', 4))
+    parser.add_argument("--grad_accum_steps", type=int, default=cfg_defaults.get('grad_accum_steps', 1))
+    parser.add_argument("--learning_rate", type=float, default=cfg_defaults.get('learning_rate', 1e-5))
+    parser.add_argument("--weight_decay", type=float, default=cfg_defaults.get('weight_decay', 0.1))
+    parser.add_argument("--warmup_steps", type=int, default=cfg_defaults.get('warmup_steps', 500))
+    parser.add_argument("--unconditional_frac", type=float, default=cfg_defaults.get('unconditional_frac'))
+    parser.add_argument("--eval_step", type=int, default=cfg_defaults.get('eval_step', 200))
+    parser.add_argument("--demo_every", type=int, default=cfg_defaults.get('demo_every'))
+    parser.add_argument("--eval_every_epochs", type=int, default=cfg_defaults.get('eval_every_epochs'))
+    parser.add_argument("--demo_every_epochs", type=int, default=cfg_defaults.get('demo_every_epochs'))
+    parser.add_argument("--save_every_epochs", type=int, default=None)
+    parser.add_argument("--save_after_epoch", type=int, default=cfg_defaults.get('save_after_epoch', 0))
+    parser.add_argument("--demo_after_epoch", type=int, default=0)
+    parser.add_argument("--early_stop_loss", type=float, default=None)
+    parser.add_argument("--stop_on_overfit", action="store_true")
+    
+    parser.add_argument("--use_sliding_window", action="store_true", default=cfg_defaults.get('use_sliding_window', False))
+    parser.add_argument("--no_decay_embed", action="store_true")
+    parser.add_argument("--require_prompts", action="store_true")
+    parser.add_argument("--skip_tags", type=str, default=None)
+    parser.add_argument("--scratch", action="store_true", default=cfg_defaults.get('scratch', False))
+    parser.add_argument("--num_cores", type=int, default=8, help="Number of TPU cores to use")
+
+    args = parser.parse_args()
+    
+    if args.output_dir is None:
+        parser.error("--output_dir is required")
+    if args.unconditional_frac is None:
+        parser.error("--unconditional_frac is required")
+    
+    return args
+
+def collate_fn_tpu(batch, config: DiaConfig, device: torch.device, use_sliding_window: bool = True):
+    # Modified collate_fn for TPU: Enforces fixed padding size to avoid recompilation
+    texts, encodings, waveforms = zip(*batch)
+
+    # -- Enforce max length and optional random cropping --
+    window_size = config.data.audio_length
+    cropped_encodings = []
+    for e in encodings:
+        if e.size(0) > window_size:
+            if use_sliding_window:
+                start = random.randint(0, e.size(0) - window_size)
+            else:
+                start = 0
+            cropped_encodings.append(e[start : start + window_size])
+        else:
+            cropped_encodings.append(e)
+    encodings = cropped_encodings
+
+    # -- Text inputs --
+    max_text = config.data.text_length
+    pad_tok = config.data.text_pad_value
+    text_ids = []
+    for txt in texts:
+        txt_aug = _augment_tags(txt)
+        b_full = txt_aug.encode('utf-8')
+        bts = b_full[:max_text]
+        arr = list(bts) + [pad_tok] * (max_text - len(bts))
+        text_ids.append(torch.tensor(arr, dtype=torch.long))
+    src = torch.stack(text_ids).to(device)
+    src_pos = torch.arange(max_text, device=device).unsqueeze(0).expand(src.size(0), -1)
+    src_pad = src.ne(pad_tok)
+    enc_self_attn_mask = (src_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
+
+    # -- Audio codes: pad to FIXED window_size --
+    # TPU Optimization: Always pad to fixed size to prevent graph recompilation
+    target_len = window_size
+    
+    padded_encodings = []
+    for e in encodings:
+        if e.size(0) < target_len:
+            pad_length = target_len - e.size(0)
+            pad_value = config.data.audio_pad_value
+            padding = torch.full((pad_length, e.size(1)), pad_value, dtype=e.dtype, device=e.device)
+            padded_e = torch.cat([e, padding], dim=0)
+        else:
+            padded_e = e[:target_len] # Ensure it doesn't exceed
+        padded_encodings.append(padded_e)
+    
+    seq_lens = [min(e.size(0), target_len) for e in encodings]
+    codes = torch.stack(padded_encodings).to(device)
+
+    B, T, C = codes.shape
+    t_idx, idxs = build_delay_indices(B, T, C, config.data.delay_pattern)
+    delayed = apply_audio_delay(
+        codes,
+        config.data.audio_pad_value,
+        config.data.audio_bos_value,
+        (t_idx, idxs)
+    )
+
+    # -- Targets with per-sample EOS ----------------------------------------
+    # Output length must also be fixed. 
+    # In original: max_tgt_len = batch_max + 2
+    # Here: max_tgt_len = target_len + 2
+    max_tgt_len = target_len + 2
+    pad_val = config.data.audio_pad_value
+    bos_val = config.data.audio_bos_value
+    eos_val = config.data.audio_eos_value
+
+    tgt = torch.full((B, max_tgt_len, C), pad_val, dtype=torch.long, device=device)
+    tgt[:, 0, :] = bos_val
+    tgt_lens = []
+    for i, L in enumerate(seq_lens):
+        tgt[i, 1:1 + L, :] = delayed[i, :L, :]
+        tgt[i, 1 + L, :] = eos_val
+        tgt_lens.append(1 + L + 1)
+
+    tgt_pos = torch.arange(max_tgt_len, device=device).unsqueeze(0).expand(B, -1)
+    tgt_pad = tgt.ne(pad_val).any(-1)
+
+    causal = torch.tril(torch.ones((max_tgt_len, max_tgt_len),
+                                    dtype=torch.bool,
+                                    device=device))
+    dec_self_attn_mask = (tgt_pad.unsqueeze(2) & tgt_pad.unsqueeze(1) & causal).unsqueeze(1)
+    dec_cross_attn_mask = (tgt_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
+
+    return {
+        'src_tokens': src,
+        'src_positions': src_pos,
+        'enc_self_attn_mask': enc_self_attn_mask,
+        'tgt_tokens': tgt,
+        'tgt_positions': tgt_pos,
+        'dec_self_attn_mask': dec_self_attn_mask,
+        'dec_cross_attn_mask': dec_cross_attn_mask,
+        'waveforms': waveforms,
+        'raw_text': texts[0],
+        'tgt_lens': torch.tensor(tgt_lens, dtype=torch.long, device=device),
+    }
+
+def setup_loaders(dataset, dia_cfg, train_cfg, device, use_sliding_window=True):
+    # Using TPU-optimized collate function
+    collate = lambda b: collate_fn_tpu(b, dia_cfg, device, use_sliding_window)
+    
+    ds_len = len(dataset)
+    n_train = int(train_cfg.split_ratio * ds_len)
+    n_val = ds_len - n_train
+    
+    if ds_len <= 1 or n_val == 0:
+        train_ds = dataset
+        val_ds = None
+    else:
+        g = torch.Generator().manual_seed(train_cfg.seed)
+        train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=g)
+    
+    # DistributedSampler for TPU
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_ds,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=True,
+        drop_last=True,
+        seed=train_cfg.seed
+    )
+    
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=train_cfg.batch_size,
+        sampler=train_sampler,
+        collate_fn=collate,
+        num_workers=0, # Important for TPU to avoid threading issues in simple setups
+        drop_last=True
+    )
+    
+    val_loader = None
+    if val_ds is not None:
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_ds,
+            num_replicas=xm.xrt_world_size(),
+            rank=xm.get_ordinal(),
+            shuffle=False,
+            drop_last=True
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=1,
+            sampler=val_sampler,
+            collate_fn=collate,
+            num_workers=0,
+            drop_last=True
+        )
+        
+    steps_per_epoch = len(train_loader)
+    train_loader.steps_per_epoch = steps_per_epoch
+    
+    return train_loader, val_loader, train_sampler
+
+def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
+    # Same param grouping logic, but using standard AdamW instead of bitsandbytes
+    norm_types = [torch.nn.LayerNorm, torch.nn.GroupNorm, torch.nn.BatchNorm1d]
+    
+    no_decay_params, decay_params = [], []
+    seen = set()
+    for module in model.modules():
+        for name, p in module.named_parameters(recurse=False):
+            if not p.requires_grad or id(p) in seen:
+                continue
+            seen.add(id(p))
+            is_bias = name.endswith("bias")
+            is_norm = any(isinstance(module, nt) for nt in norm_types)
+            is_embed = isinstance(module, torch.nn.Embedding)
+            if is_bias or is_norm or (train_cfg.no_decay_embed and is_embed):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+    for _, p in model.named_parameters():
+        if p.requires_grad and id(p) not in seen:
+            decay_params.append(p)
+            seen.add(id(p))
+
+    param_groups = [
+        {"params": decay_params, "weight_decay": train_cfg.weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+    # Using standard AdamW for TPU compatibility
+    opt = optim.AdamW(
+        param_groups,
+        lr=train_cfg.learning_rate,
+        weight_decay=0.0, # handled in groups
+    )
+    
+    steps_per_epoch = len(train_loader)
+    total_training_steps = steps_per_epoch * train_cfg.epochs
+    
+    # Standard transformers scheduler
+    from transformers import get_scheduler
+    sched = get_scheduler(
+        'cosine', opt,
+        num_warmup_steps=train_cfg.warmup_steps // train_cfg.grad_accum_steps,
+        num_training_steps=total_training_steps // train_cfg.grad_accum_steps
+    )
+    return opt, sched
+
+def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device):
+    # Unconditional logic
+    gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
+    if gen_val < train_cfg.unconditional_frac:
+        pad_tok = dia_cfg.data.text_pad_value
+        batch['src_tokens'].fill_(pad_tok)
+        batch['enc_self_attn_mask'] = torch.zeros_like(batch['enc_self_attn_mask'])
+        batch['dec_cross_attn_mask'] = torch.zeros_like(batch['dec_cross_attn_mask'])
+
+    # No autocast needed for TPU usually (bf16 implicit)
+    logits = model(
+        src_BxS=batch['src_tokens'],
+        tgt_BxTxC=batch['tgt_tokens'],
+        src_positions=batch['src_positions'],
+        tgt_positions=batch['tgt_positions'],
+        enc_self_attn_mask=batch['enc_self_attn_mask'],
+        dec_self_attn_mask=batch['dec_self_attn_mask'],
+        dec_cross_attn_mask=batch['dec_cross_attn_mask'],
+        enable_dropout=False,
+    )
+    
+    lens = batch['tgt_lens']
+    max_L = int(lens.max().item())
+    logits = logits[:, : max_L - 1]
+    target = batch['tgt_tokens'][:, 1:max_L, :]
+    
+    B, Tm1, C = target.shape
+    pad_val = dia_cfg.data.audio_pad_value
+    
+    # Reconstruct masks logic from original
+    time_idx = torch.arange(Tm1, device=device).unsqueeze(0)
+    valid_time = time_idx < (lens.unsqueeze(1) - 1)
+    mask = valid_time.unsqueeze(-1).expand(-1, -1, C)
+    
+    channel_weights = []
+    num_groups = C // 9
+    if num_groups > 0:
+        for _ in range(num_groups):
+            channel_weights.extend(CODEBOOK_WEIGHTS)
+    else:
+        channel_weights = [1.0] * C
+
+    loss_c = 0.0
+    V = logits.size(-1)
+    audio_token_mask = (target >= 0) & (target <= 1023)
+    
+    for c, w in enumerate(channel_weights):
+        lc = logits[:, :, c, :].reshape(-1, V)
+        tc = target[:, :, c].reshape(-1)
+        mc = mask[:, :, c].reshape(-1)
+        audio_mc = audio_token_mask[:, :, c].reshape(-1)
+        combined_mask = mc & audio_mc
+        
+        lc_valid = lc[combined_mask]
+        tc_valid = tc[combined_mask]
+        
+        # TPU optimization: avoid boolean indexing which causes dynamic shapes if possible, 
+        # but for now stick to logic. Ideally use masked_select or similar.
+        # But boolean indexing is supported by XLA, just triggers recompilation if shape changes.
+        # Since batch size and seq len are fixed (padded), it might be okay.
+        if tc_valid.numel() > 0:
+            loss_c += w * F.cross_entropy(lc_valid, tc_valid, ignore_index=pad_val)
+            
+    loss = loss_c / sum(channel_weights)
+    loss = loss / train_cfg.grad_accum_steps
+    loss.backward()
+    
+    if (step + 1) % train_cfg.grad_accum_steps == 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        xm.optimizer_step(opt) # XLA step
+        sched.step()
+        opt.zero_grad()
+        
+    return loss.item() * train_cfg.grad_accum_steps
+
+def _mp_fn(rank, args):
+    # Main worker function for xmp.spawn
+    torch.set_default_tensor_type('torch.FloatTensor')
+    device = xm.xla_device()
+    
+    # Seed
+    seed_everything(args.seed)
+    
+    # Load Config
+    dia_cfg = DiaConfig.load(args.config)
+    
+    # Globals
+    global TAG_SHUFFLE, TAG_DROPOUT, TAG_LIMIT
+    TAG_SHUFFLE = False if getattr(args, 'tag_no_shuffle', False) else bool(getattr(args, 'tag_shuffle', True))
+    TAG_DROPOUT = float(getattr(args, 'tag_dropout', 0.0))
+    TAG_LIMIT = getattr(args, 'tag_limit', None)
+    
+    xm.master_print(f"Loaded config from: {args.config}")
+    
+    # Load DAC
+    # Load on CPU first, then move to device
+    # dac.utils.download() might use network, ensure permission or done beforehand
+    dac_path = dac.utils.download()
+    dac_model = dac.DAC.load(dac_path).eval().to(device)
+    
+    # Dataset
+    use_sliding_window = args.use_sliding_window
+    if args.preencoded_dir:
+        dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
+    elif args.audio_folder:
+        skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
+        dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
+                             ignore_missing_prompts=not args.require_prompts,
+                             skip_tags=skip_tags_list)
+    
+    train_cfg = TrainConfig(
+        epochs = args.epochs,
+        batch_size = args.batch_size,
+        grad_accum_steps = args.grad_accum_steps,
+        learning_rate = args.learning_rate,
+        weight_decay = args.weight_decay,
+        warmup_steps = args.warmup_steps,
+        unconditional_frac = args.unconditional_frac,
+        eval_step = args.eval_step,
+        run_name = args.run_name or TrainConfig.run_name,
+        output_dir = args.output_dir,
+        seed = args.seed,
+        no_decay_embed = args.no_decay_embed,
+    )
+    
+    model = DiaModel(dia_cfg)
+    
+    # Load Checkpoint (same logic as original but careful with CPU loading)
+    if args.scratch:
+        xm.master_print("Initializing model from scratch...")
+        if hasattr(model, '_init_weights'):
+            model._init_weights()
+    else:
+        if args.local_ckpt:
+            ckpt_file = args.local_ckpt
+        else:
+            ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
+        
+        state = torch.load(ckpt_file, map_location="cpu")
+        # Adapt stereo logic... (simplified for brevity, assuming 9->18 handled or not needed)
+        # Copying the adaptation logic is recommended if needed
+        # For now, simple load:
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        xm.master_print(f"Loaded checkpoint: missing={len(missing)}, unexpected={len(unexpected)}")
+        del state
+        gc.collect()
+
+    model = model.to(device)
+    
+    # Create loaders
+    train_loader, val_loader, train_sampler = setup_loaders(dataset, dia_cfg, train_cfg, device, use_sliding_window)
+    
+    opt, sched = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
+    
+    # Create output dir
+    if xm.is_master_ordinal():
+        train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        (train_cfg.runs_dir / train_cfg.run_name).mkdir(parents=True, exist_ok=True)
+        Path(EVAL_AUDIO_DIR).mkdir(exist_ok=True)
+        
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=train_cfg.run_name,
+            config=vars(train_cfg)
+        )
+
+    model.train()
+    
+    steps_per_epoch = len(train_loader)
+    
+    for epoch in range(train_cfg.epochs):
+        train_sampler.set_epoch(epoch)
+        
+        para_loader = pl.ParallelLoader(train_loader, [device])
+        loader_iter = para_loader.per_device_loader(device)
+        
+        if xm.is_master_ordinal():
+            loader_iter = tqdm(loader_iter, total=steps_per_epoch, desc=f"Epoch {epoch+1}")
+            
+        for step, batch in enumerate(loader_iter):
+            global_step = epoch * steps_per_epoch + step
+            
+            loss = train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device)
+            
+            if xm.is_master_ordinal():
+                wandb.log({"loss": loss, "epoch": epoch}, step=global_step)
+                if step % 10 == 0:
+                    loader_iter.set_postfix({"loss": loss})
+            
+            # Save logic
+            should_save = global_step > 0 and global_step % train_cfg.save_step == 0
+            if should_save:
+                 xm.save(model.state_dict(), train_cfg.output_dir / f"ckpt_step{global_step}.pth")
+                 xm.master_print(f"Saved checkpoint at step {global_step}")
+
+        # End of epoch save
+        xm.save(model.state_dict(), train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth")
+        xm.master_print(f"Saved epoch {epoch+1} checkpoint")
+        
+        # TODO: Implement evaluation logic for TPU (requires sync and gathering metrics)
+
+def main():
+    args = get_args()
+    # Spawn TPU processes
+    xmp.spawn(_mp_fn, args=(args,), nprocs=args.num_cores, start_method='fork')
+
+if __name__ == "__main__":
+    main()

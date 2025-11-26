@@ -278,8 +278,9 @@ def collate_fn_tpu(batch, config: DiaConfig, device: torch.device, use_sliding_w
         bts = b_full[:max_text]
         arr = list(bts) + [pad_tok] * (max_text - len(bts))
         text_ids.append(torch.tensor(arr, dtype=torch.long))
-    src = torch.stack(text_ids).to(device)
-    src_pos = torch.arange(max_text, device=device).unsqueeze(0).expand(src.size(0), -1)
+    # Return CPU tensor
+    src = torch.stack(text_ids)
+    src_pos = torch.arange(max_text).unsqueeze(0).expand(src.size(0), -1)
     src_pad = src.ne(pad_tok)
     enc_self_attn_mask = (src_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
 
@@ -292,14 +293,15 @@ def collate_fn_tpu(batch, config: DiaConfig, device: torch.device, use_sliding_w
         if e.size(0) < target_len:
             pad_length = target_len - e.size(0)
             pad_value = config.data.audio_pad_value
-            padding = torch.full((pad_length, e.size(1)), pad_value, dtype=e.dtype, device=e.device)
+            padding = torch.full((pad_length, e.size(1)), pad_value, dtype=e.dtype)
             padded_e = torch.cat([e, padding], dim=0)
         else:
             padded_e = e[:target_len] # Ensure it doesn't exceed
         padded_encodings.append(padded_e)
     
     seq_lens = [min(e.size(0), target_len) for e in encodings]
-    codes = torch.stack(padded_encodings).to(device)
+    # Return CPU tensor
+    codes = torch.stack(padded_encodings)
 
     B, T, C = codes.shape
     t_idx, idxs = build_delay_indices(B, T, C, config.data.delay_pattern)
@@ -319,7 +321,7 @@ def collate_fn_tpu(batch, config: DiaConfig, device: torch.device, use_sliding_w
     bos_val = config.data.audio_bos_value
     eos_val = config.data.audio_eos_value
 
-    tgt = torch.full((B, max_tgt_len, C), pad_val, dtype=torch.long, device=device)
+    tgt = torch.full((B, max_tgt_len, C), pad_val, dtype=torch.long)
     tgt[:, 0, :] = bos_val
     tgt_lens = []
     for i, L in enumerate(seq_lens):
@@ -327,12 +329,10 @@ def collate_fn_tpu(batch, config: DiaConfig, device: torch.device, use_sliding_w
         tgt[i, 1 + L, :] = eos_val
         tgt_lens.append(1 + L + 1)
 
-    tgt_pos = torch.arange(max_tgt_len, device=device).unsqueeze(0).expand(B, -1)
+    tgt_pos = torch.arange(max_tgt_len).unsqueeze(0).expand(B, -1)
     tgt_pad = tgt.ne(pad_val).any(-1)
 
-    causal = torch.tril(torch.ones((max_tgt_len, max_tgt_len),
-                                    dtype=torch.bool,
-                                    device=device))
+    causal = torch.tril(torch.ones((max_tgt_len, max_tgt_len), dtype=torch.bool))
     dec_self_attn_mask = (tgt_pad.unsqueeze(2) & tgt_pad.unsqueeze(1) & causal).unsqueeze(1)
     dec_cross_attn_mask = (tgt_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
 
@@ -346,7 +346,7 @@ def collate_fn_tpu(batch, config: DiaConfig, device: torch.device, use_sliding_w
         'dec_cross_attn_mask': dec_cross_attn_mask,
         'waveforms': waveforms,
         'raw_text': texts[0],
-        'tgt_lens': torch.tensor(tgt_lens, dtype=torch.long, device=device),
+        'tgt_lens': torch.tensor(tgt_lens, dtype=torch.long),
     }
 
 def setup_loaders(dataset, dia_cfg, train_cfg, device, use_sliding_window=True):

@@ -179,14 +179,17 @@ class PreEncodedDACDataset(Dataset):
         else:
             self.metadata = {}
         
-        # Find all .pt files in encoded_audio directory
+        # Find all .pt files in encoded_audio directory or root
         encoded_dir = self.preprocessed_dir / "encoded_audio"
-        if not encoded_dir.exists():
-            raise FileNotFoundError(f"encoded_audio directory not found: {encoded_dir}")
-        
-        self.encoded_files = list(encoded_dir.glob("*.pt"))
+        if encoded_dir.exists():
+             self.encoded_files = list(encoded_dir.glob("*.pt"))
+        else:
+             # Fallback: look in the root directory
+             self.encoded_files = list(self.preprocessed_dir.glob("*.pt"))
+             encoded_dir = self.preprocessed_dir # specific for error msg below
+             
         if not self.encoded_files:
-            raise FileNotFoundError(f"No .pt files found in {encoded_dir}")
+            raise FileNotFoundError(f"No .pt files found in {self.preprocessed_dir} or {self.preprocessed_dir}/encoded_audio")
         
         # For now, assume prompts are stored in metadata or use filename as prompt
         print(f"Found {len(self.encoded_files)} pre-encoded DAC files")

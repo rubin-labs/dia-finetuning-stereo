@@ -176,7 +176,7 @@ networkx==3.5
 
 numba==0.62.0
 
-numpy>=2.2.4
+numpy
 
 nvidia-cublas-cu12==12.4.5.8
 

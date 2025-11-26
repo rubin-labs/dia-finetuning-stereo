@@ -942,10 +942,10 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
         # Create audio demos directory for audio samples (supports mono/stereo)
         Path(EVAL_AUDIO_DIR).mkdir(exist_ok=True)
         
-        # Compute vocabulary coverage before training starts
-        vocab_stats = compute_vocabulary_coverage(dataset)
-        logger.info(f"Vocabulary coverage: {vocab_stats['num_unique']}/1024 tokens ({vocab_stats['coverage_pct']:.1f}%)")
-        logger.info(f"Total tokens in dataset: {vocab_stats['total_tokens']:,}")
+        # Skip vocabulary coverage computation for large datasets (assume 100%)
+        # vocab_stats = compute_vocabulary_coverage(dataset)
+        # logger.info(f"Vocabulary coverage: {vocab_stats['num_unique']}/1024 tokens ({vocab_stats['coverage_pct']:.1f}%)")
+        # logger.info(f"Total tokens in dataset: {vocab_stats['total_tokens']:,}")
         
         # Initialize wandb
         wandb.init(
@@ -963,16 +963,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 "unconditional_frac": train_cfg.unconditional_frac,
                 "seed": train_cfg.seed,
                 "world_size": world_size,
-                # Vocabulary coverage stats
-                "vocab_unique_tokens": vocab_stats['num_unique'],
-                "vocab_coverage_pct": vocab_stats['coverage_pct'],
-                "vocab_total_tokens": vocab_stats['total_tokens'],
             }
         )
-        
-        # Log vocabulary coverage as a summary metric
-        wandb.run.summary["vocab_coverage_pct"] = vocab_stats['coverage_pct']
-        wandb.run.summary["vocab_unique_tokens"] = vocab_stats['num_unique']
     
     # Synchronize all processes
     if use_ddp:

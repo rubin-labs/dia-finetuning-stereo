@@ -18,3 +18,4 @@
 - `2025-11-25 16:35` [`382b663`] **main**: Eval script
 - `2025-11-25 16:55` [`a70dcb0`] **main**: Updated logging
 - `2025-11-25 17:01` [`6b4f2c9`] **main**: 20251125_dia_004_delay_ablation
+- `2025-11-25 23:29` [`3608c94`] **main**: 20251125_dia_005_delay_compressed_model

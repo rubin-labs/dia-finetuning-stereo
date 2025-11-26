@@ -466,11 +466,13 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
                 tqdm.write(f"  {k}: {v.shape}")
 
     # Unconditional logic - TPU Optimized (avoid control flow)
-    gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
+    # Use random tensor on device to determine unconditional masking
+    # This keeps the graph static regardless of the decision
+    rand_val = torch.rand(1, device=device)
+    do_uncond = rand_val < train_cfg.unconditional_frac
+    # do_uncond is now a boolean tensor on device
     
-    # Create condition tensor to keep graph static
-    do_uncond = gen_val < train_cfg.unconditional_frac
-    cond = torch.tensor(do_uncond, device=device)
+    cond = do_uncond
     pad_tok = torch.tensor(dia_cfg.data.text_pad_value, device=device, dtype=batch['src_tokens'].dtype)
     
     # Apply masking using torch.where (static graph)
@@ -484,6 +486,9 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     # Expand condition to broadcast
     # masks are (B, 1, T, T) or similar
     # cond is (1,) or scalar. implicit broadcasting should work or we view it.
+    
+    # Cast cond to mask dtype for torch.where compatibility if needed
+    # But boolean mask for where is fine.
     
     batch['enc_self_attn_mask'] = torch.where(cond, zeros_enc, batch['enc_self_attn_mask'])
     batch['dec_cross_attn_mask'] = torch.where(cond, zeros_dec, batch['dec_cross_attn_mask'])

@@ -26,3 +26,4 @@ ckpts/
 dia_finetune_mml/
 
 dia-finetuning-stereo/
+data/

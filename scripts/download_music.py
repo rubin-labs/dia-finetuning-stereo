@@ -13,6 +13,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 try:
     from yt_dlp import YoutubeDL  # type: ignore
@@ -96,9 +97,8 @@ def download_mp3s(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ydl_opts = {
+    base_opts = {
         "format": "bestaudio/best",
-        "outtmpl": "%(title)s.%(ext)s",
         "paths": {"home": str(output_dir)},
         "noplaylist": True,
         "overwrites": overwrite,
@@ -114,10 +114,30 @@ def download_mp3s(
         ],
     }
 
+    def infer_output_template(url: str) -> str:
+        """Derive a unique, sanitized filename template per URL to avoid collisions."""
+        parsed = urlparse(url)
+        parts = [segment for segment in parsed.path.split("/") if segment]
+        track_id = None
+        for idx, segment in enumerate(parts):
+            if segment == "track" and idx + 1 < len(parts):
+                track_id = parts[idx + 1]
+                break
+        if track_id is None and parts:
+            track_id = parts[-1]
+        if track_id:
+            safe_id = "".join(ch for ch in track_id if ch.isalnum() or ch in ("-", "_"))
+            if safe_id:
+                return f"{safe_id}.%(ext)s"
+        # Fallback to default yt-dlp naming.
+        return "%(title)s.%(ext)s"
+
     def download_single(url: str) -> None:
         LOGGER.info("Processing URL: %s", url)
         try:
-            with YoutubeDL(ydl_opts) as ydl:
+            opts = base_opts.copy()
+            opts["outtmpl"] = infer_output_template(url)
+            with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 entries = info.get("entries")
                 if entries:

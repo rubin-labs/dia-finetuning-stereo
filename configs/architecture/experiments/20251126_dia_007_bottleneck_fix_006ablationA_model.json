@@ -15,8 +15,8 @@
             "gqa_query_heads": 8,
             "cross_query_heads": 8,
             "kv_heads": 2,
-            "gqa_head_dim": 64,
-            "cross_head_dim": 64,
+            "gqa_head_dim": 128,
+            "cross_head_dim": 128,
             "d_model" : 128
         },
         "src_vocab_size": 256,
@@ -24,7 +24,7 @@
         "dropout": 0.0
     },
     "training": {
-        "dtype": "float32"
+        "dtype": "bfloat16"
     },
     "data": {
         "text_length": 512,
@@ -40,3 +40,4 @@
         ]
     }
 }
+

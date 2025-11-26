@@ -458,13 +458,8 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
     return opt, sched
 
 def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device):
-    # DEBUG: Verify shapes are constant
-    if step < 3 and xm.is_master_ordinal():
-        tqdm.write(f"Step {step} input shapes:")
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                tqdm.write(f"  {k}: {v.shape}")
-
+    # NOTE: Shape printing removed - accessing .shape on TPU tensors can cause sync
+    
     # Unconditional logic - TPU Optimized (avoid control flow)
     # Use random tensor on device to determine unconditional masking
     # This keeps the graph static regardless of the decision
@@ -698,15 +693,22 @@ def _mp_fn(rank, args):
             loss_tensor = train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device)
             xm.mark_step()  # Ensure graph execution completes before any host sync (logging, wandb, etc.)
             
+            # TPU Optimization: Use xm.add_step_closure to defer CPU syncs
+            # This logs asynchronously without blocking the TPU
             if xm.is_master_ordinal():
-                # TPU Optimization: reduce CPU syncs by logging less frequently
-                # But log first 5 steps to show progress
-                if step < 5 or step % 10 == 0:
-                    loss_val = loss_tensor.item() # Triggers sync
-                    wandb.log({"loss": loss_val, "epoch": epoch}, step=global_step)
-                    loader_iter.set_postfix({"loss": loss_val})
-                    if step < 5:
-                        tqdm.write(f"Step {step}: loss={loss_val:.4f}")
+                def _log_loss(loss_tensor, step_num, epoch_num, global_step_num, is_early):
+                    import wandb
+                    loss_val = loss_tensor.item()  # Safe inside closure - runs after mark_step
+                    wandb.log({"loss": loss_val, "epoch": epoch_num}, step=global_step_num)
+                    if is_early:
+                        tqdm.write(f"Step {step_num}: loss={loss_val:.4f}")
+                
+                # Only log every 50 steps (or first 5) to reduce sync overhead
+                if step < 5 or step % 50 == 0:
+                    xm.add_step_closure(
+                        _log_loss, 
+                        args=(loss_tensor, step, epoch, global_step, step < 5)
+                    )
             
             # Save logic
             should_save = global_step > 0 and global_step % train_cfg.save_step == 0

@@ -5,6 +5,8 @@ build/
 dist/
 wheels/
 
+!requirements.txt
+
 *.egg-info
 
 # Virtual environments

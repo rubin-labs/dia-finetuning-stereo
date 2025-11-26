@@ -516,15 +516,24 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
         audio_mc = audio_token_mask[:, :, c].reshape(-1)
         combined_mask = mc & audio_mc
         
-        lc_valid = lc[combined_mask]
-        tc_valid = tc[combined_mask]
+        # TPU Optimization: Use reduction='none' and mask instead of boolean indexing
+        # Boolean indexing (lc[combined_mask]) creates dynamic shapes which triggers XLA recompilation
         
-        # TPU optimization: avoid boolean indexing which causes dynamic shapes if possible, 
-        # but for now stick to logic. Ideally use masked_select or similar.
-        # But boolean indexing is supported by XLA, just triggers recompilation if shape changes.
-        # Since batch size and seq len are fixed (padded), it might be okay.
-        if tc_valid.numel() > 0:
-            loss_c += w * F.cross_entropy(lc_valid, tc_valid, ignore_index=pad_val)
+        # Calculate loss for all tokens
+        # We use ignore_index for pad_val, but combined_mask handles everything else
+        loss_all = F.cross_entropy(lc, tc, ignore_index=pad_val, reduction='none')
+        
+        # Mask out invalid tokens (padding, special tokens, etc.)
+        mask_float = combined_mask.float()
+        loss_masked = loss_all * mask_float
+        
+        # Compute mean over valid tokens
+        num_valid = mask_float.sum()
+        
+        # Avoid division by zero
+        term_loss = loss_masked.sum() / (num_valid + 1e-6)
+        
+        loss_c += w * term_loss
             
     loss = loss_c / sum(channel_weights)
     loss = loss / train_cfg.grad_accum_steps
@@ -536,7 +545,8 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
         sched.step()
         opt.zero_grad()
         
-    return loss.item() * train_cfg.grad_accum_steps
+    # Return tensor to avoid CPU sync on every step
+    return loss.detach() * train_cfg.grad_accum_steps
 
 def _mp_fn(rank, args):
     # Main worker function for xmp.spawn
@@ -647,12 +657,14 @@ def _mp_fn(rank, args):
         for step, batch in enumerate(loader_iter):
             global_step = epoch * steps_per_epoch + step
             
-            loss = train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device)
+            loss_tensor = train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device)
             
             if xm.is_master_ordinal():
-                wandb.log({"loss": loss, "epoch": epoch}, step=global_step)
+                # TPU Optimization: reduce CPU syncs by logging less frequently
                 if step % 10 == 0:
-                    loader_iter.set_postfix({"loss": loss})
+                    loss_val = loss_tensor.item() # Triggers sync
+                    wandb.log({"loss": loss_val, "epoch": epoch}, step=global_step)
+                    loader_iter.set_postfix({"loss": loss_val})
             
             # Save logic
             should_save = global_step > 0 and global_step % train_cfg.save_step == 0

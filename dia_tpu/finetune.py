@@ -680,8 +680,13 @@ def _mp_fn(rank, args):
 
 def main():
     args = get_args()
+    
+    # For PJRT on TPU, nprocs should be None to use all available devices (or 1 for single core)
+    # Passing an explicit int > 1 throws an error in newer torch_xla versions
+    nprocs = None if args.num_cores > 1 else 1
+    
     # Spawn TPU processes
-    xmp.spawn(_mp_fn, args=(args,), nprocs=args.num_cores, start_method='fork')
+    xmp.spawn(_mp_fn, args=(args,), nprocs=nprocs, start_method='fork')
 
 if __name__ == "__main__":
     main()

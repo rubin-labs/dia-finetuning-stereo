@@ -33,6 +33,7 @@ try:
     import torch_xla.debug.metrics as met
     import torch_xla.distributed.parallel_loader as pl
     import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.runtime as xr
     import torch_xla.utils.utils as xu
 except ImportError:
     print("torch_xla not installed. This script requires a TPU environment.")
@@ -367,8 +368,8 @@ def setup_loaders(dataset, dia_cfg, train_cfg, device, use_sliding_window=True):
     # DistributedSampler for TPU
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_ds,
-        num_replicas=xm.xrt_world_size(),
-        rank=xm.get_ordinal(),
+        num_replicas=xr.world_size(),
+        rank=xr.global_ordinal(),
         shuffle=True,
         drop_last=True,
         seed=train_cfg.seed
@@ -389,8 +390,8 @@ def setup_loaders(dataset, dia_cfg, train_cfg, device, use_sliding_window=True):
     if val_ds is not None:
         val_sampler = torch.utils.data.distributed.DistributedSampler(
             val_ds,
-            num_replicas=xm.xrt_world_size(),
-            rank=xm.get_ordinal(),
+            num_replicas=xr.world_size(),
+            rank=xr.global_ordinal(),
             shuffle=False,
             drop_last=True
         )
@@ -464,13 +465,28 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
             if isinstance(v, torch.Tensor):
                 tqdm.write(f"  {k}: {v.shape}")
 
-    # Unconditional logic
+    # Unconditional logic - TPU Optimized (avoid control flow)
     gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
-    if gen_val < train_cfg.unconditional_frac:
-        pad_tok = dia_cfg.data.text_pad_value
-        batch['src_tokens'].fill_(pad_tok)
-        batch['enc_self_attn_mask'] = torch.zeros_like(batch['enc_self_attn_mask'])
-        batch['dec_cross_attn_mask'] = torch.zeros_like(batch['dec_cross_attn_mask'])
+    
+    # Create condition tensor to keep graph static
+    do_uncond = gen_val < train_cfg.unconditional_frac
+    cond = torch.tensor(do_uncond, device=device)
+    pad_tok = torch.tensor(dia_cfg.data.text_pad_value, device=device, dtype=batch['src_tokens'].dtype)
+    
+    # Apply masking using torch.where (static graph)
+    batch['src_tokens'] = torch.where(cond, pad_tok, batch['src_tokens'])
+    
+    # Masks (handle boolean or float masks appropriately)
+    # We assume masks are same type as initialized in collate (likely boolean or float)
+    zeros_enc = torch.zeros_like(batch['enc_self_attn_mask'])
+    zeros_dec = torch.zeros_like(batch['dec_cross_attn_mask'])
+    
+    # Expand condition to broadcast
+    # masks are (B, 1, T, T) or similar
+    # cond is (1,) or scalar. implicit broadcasting should work or we view it.
+    
+    batch['enc_self_attn_mask'] = torch.where(cond, zeros_enc, batch['enc_self_attn_mask'])
+    batch['dec_cross_attn_mask'] = torch.where(cond, zeros_dec, batch['dec_cross_attn_mask'])
 
     # No autocast needed for TPU usually (bf16 implicit)
     logits = model(

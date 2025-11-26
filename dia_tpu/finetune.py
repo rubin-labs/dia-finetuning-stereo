@@ -657,14 +657,20 @@ def _mp_fn(rank, args):
         for step, batch in enumerate(loader_iter):
             global_step = epoch * steps_per_epoch + step
             
+            if step == 0 and epoch == 0 and xm.is_master_ordinal():
+                tqdm.write("Step 0: Starting training step (this will trigger XLA compilation and take ~1-2 mins)...")
+            
             loss_tensor = train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device)
             
             if xm.is_master_ordinal():
                 # TPU Optimization: reduce CPU syncs by logging less frequently
-                if step % 10 == 0:
+                # But log first 5 steps to show progress
+                if step < 5 or step % 10 == 0:
                     loss_val = loss_tensor.item() # Triggers sync
                     wandb.log({"loss": loss_val, "epoch": epoch}, step=global_step)
                     loader_iter.set_postfix({"loss": loss_val})
+                    if step < 5:
+                        tqdm.write(f"Step {step}: loss={loss_val:.4f}")
             
             # Save logic
             should_save = global_step > 0 and global_step % train_cfg.save_step == 0

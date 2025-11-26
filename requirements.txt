@@ -70,7 +70,7 @@ flatten-dict==0.4.2
 
 fonttools==4.60.0
 
-frechet_audio_distance==0.3.2
+
 
 frozenlist==1.7.0
 

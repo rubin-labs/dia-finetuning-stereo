@@ -379,8 +379,10 @@ def setup_loaders(dataset, dia_cfg, train_cfg, device, use_sliding_window=True):
         batch_size=train_cfg.batch_size,
         sampler=train_sampler,
         collate_fn=collate,
-        num_workers=0, # Important for TPU to avoid threading issues in simple setups
-        drop_last=True
+        num_workers=8, # Increased for GCS latency
+        prefetch_factor=4, # Prefetch more batches
+        drop_last=True,
+        persistent_workers=True # Keep workers alive
     )
     
     val_loader = None
@@ -397,8 +399,9 @@ def setup_loaders(dataset, dia_cfg, train_cfg, device, use_sliding_window=True):
             batch_size=1,
             sampler=val_sampler,
             collate_fn=collate,
-            num_workers=0,
-            drop_last=True
+            num_workers=4,
+            drop_last=True,
+            persistent_workers=True
         )
         
     steps_per_epoch = len(train_loader)
@@ -475,15 +478,22 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     )
     
     lens = batch['tgt_lens']
-    max_L = int(lens.max().item())
-    logits = logits[:, : max_L - 1]
-    target = batch['tgt_tokens'][:, 1:max_L, :]
+    # TPU Optimization: Avoid dynamic slicing on the graph.
+    # We use the full padded sequence length, which is constant if collate_fn is correct.
+    # lens.max() causes a dynamic shape if used for slicing.
+    # Instead, we rely on the padding mask to ignore invalid tokens in loss.
+    
+    max_L = logits.size(1) # This is constant (T-1)
+    logits_slice = logits
+    target = batch['tgt_tokens'][:, 1:, :] # Constant slice
     
     B, Tm1, C = target.shape
     pad_val = dia_cfg.data.audio_pad_value
     
     # Reconstruct masks logic from original
     time_idx = torch.arange(Tm1, device=device).unsqueeze(0)
+    # valid_time mask is still dynamic based on 'lens', but this is a boolean mask, 
+    # which XLA can handle better than changing tensor dimensions.
     valid_time = time_idx < (lens.unsqueeze(1) - 1)
     mask = valid_time.unsqueeze(-1).expand(-1, -1, C)
     

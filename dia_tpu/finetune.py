@@ -507,7 +507,7 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     # Instead, we rely on the padding mask to ignore invalid tokens in loss.
     
     max_L = logits.size(1) # This is constant (T)
-    logits_slice = logits[:, :-1, :] # Slice to shape (B, T-1, V)
+    logits_slice = logits[:, :-1, :].float() # Slice to shape (B, T-1, V) and cast to float32 for stability
     target = batch['tgt_tokens'][:, 1:, :] # Slice to shape (B, T-1, C)
     
     B, Tm1, C = target.shape
@@ -549,9 +549,14 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
         # TPU Optimization: Use reduction='none' and mask instead of boolean indexing
         # Boolean indexing (lc[combined_mask]) creates dynamic shapes which triggers XLA recompilation
         
+        # CRITICAL STABILITY FIX: Set targets to ignore_index where mask is False
+        # This prevents cross_entropy from computing loss on irrelevant or out-of-bound tokens (like EOS 1024)
+        # even though we zero out the loss later. This avoids NaNs from out-of-bound logits.
+        tc_masked = torch.where(combined_mask, tc, pad_val)
+        
         # Calculate loss for all tokens
         # We use ignore_index for pad_val, but combined_mask handles everything else
-        loss_all = F.cross_entropy(lc, tc, ignore_index=pad_val, reduction='none')
+        loss_all = F.cross_entropy(lc, tc_masked, ignore_index=pad_val, reduction='none')
         
         # Mask out invalid tokens (padding, special tokens, etc.)
         mask_float = combined_mask.float()

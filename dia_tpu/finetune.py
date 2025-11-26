@@ -457,6 +457,13 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
     return opt, sched
 
 def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, device):
+    # DEBUG: Verify shapes are constant
+    if step < 3 and xm.is_master_ordinal():
+        tqdm.write(f"Step {step} input shapes:")
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                tqdm.write(f"  {k}: {v.shape}")
+
     # Unconditional logic
     gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
     if gen_val < train_cfg.unconditional_frac:
@@ -492,6 +499,13 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     
     # Reconstruct masks logic from original
     time_idx = torch.arange(Tm1, device=device).unsqueeze(0)
+    
+    # DEBUG: Force lens to be constant to rule out data-dependent recompilation
+    # In a real run, we need the actual lengths, but if this fixes speed, we know the issue is here.
+    # We'll use the full length (assuming padding mask handles the rest or we accept slight error for speed test)
+    # lens = batch['tgt_lens']
+    lens = torch.full((B,), Tm1 + 1, device=device, dtype=torch.long) 
+    
     # valid_time mask is still dynamic based on 'lens', but this is a boolean mask, 
     # which XLA can handle better than changing tensor dimensions.
     valid_time = time_idx < (lens.unsqueeze(1) - 1)

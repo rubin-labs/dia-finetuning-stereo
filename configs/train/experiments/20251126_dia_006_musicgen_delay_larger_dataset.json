@@ -24,7 +24,7 @@
     
     "eval": {
       "eval_step": 200,
-      "demo_every": 500
+      "demo_every": 400
     },
     
     "flags": {

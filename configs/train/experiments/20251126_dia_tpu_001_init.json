@@ -14,9 +14,9 @@
     "unconditional_frac": 1.0
   },
   
-  "output": {
-    "output_dir": "./outputs/20251126_dia_tpu_001_init",
-    "run_name": "20251126_dia_tpu_001_init",
+    "output": {
+      "output_dir": "/home/olivercamp/dia_data_mount/checkpoints/20251126_dia_tpu_001_init",
+      "run_name": "20251126_dia_tpu_001_init",
     "save_every": 500
   },
   

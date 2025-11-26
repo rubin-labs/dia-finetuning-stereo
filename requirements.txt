@@ -1,6 +1,6 @@
 absl-py==2.3.1
 
-accelerate==1.10.1
+accelerate
 
 aiofiles==24.1.0
 
@@ -228,9 +228,9 @@ prompt_toolkit==3.0.52
 
 propcache==0.3.2
 
-proto-plus==1.26.1
+proto-plus
 
-protobuf==5.29.5
+protobuf
 
 psutil==7.1.0
 

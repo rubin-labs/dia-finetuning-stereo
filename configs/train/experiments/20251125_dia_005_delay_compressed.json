@@ -1,10 +1,10 @@
 {
-    "experiment_id": "20251125_dia_004_delay_ablation",
-    "description": "Ablation study: OLD delay pattern (0,8,9,10...) vs new MusicGen pattern",
+    "experiment_id": "20251125_dia_005_delay_compressed",
+    "description": "Compressed delay pattern: max delay 4 [0,0,1,1,2,2,3,3,4] - tests if smaller max delay improves quality",
     
     "data": {
       "audio_folder": "./1sampledata/test1/audio",
-      "config": "./configs/architecture/experiments/20251125_dia_004_delay_ablation.json"
+      "config": "./configs/architecture/experiments/20251125_dia_005_delay_compressed_model.json"
     },
     
     "training": {
@@ -17,8 +17,8 @@
     },
     
     "output": {
-      "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/DONT_DELETE/20251125_dia_004_delay_ablation",
-      "run_name": "delay_ablation_old_pattern",
+      "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/DONT_DELETE/20251125_dia_005_delay_compressed",
+      "run_name": "delay_compressed",
       "save_every": 300
     },
     

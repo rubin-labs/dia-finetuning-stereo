@@ -483,9 +483,9 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     # lens.max() causes a dynamic shape if used for slicing.
     # Instead, we rely on the padding mask to ignore invalid tokens in loss.
     
-    max_L = logits.size(1) # This is constant (T-1)
-    logits_slice = logits
-    target = batch['tgt_tokens'][:, 1:, :] # Constant slice
+    max_L = logits.size(1) # This is constant (T)
+    logits_slice = logits[:, :-1, :] # Slice to shape (B, T-1, V)
+    target = batch['tgt_tokens'][:, 1:, :] # Slice to shape (B, T-1, C)
     
     B, Tm1, C = target.shape
     pad_val = dia_cfg.data.audio_pad_value
@@ -510,7 +510,7 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     audio_token_mask = (target >= 0) & (target <= 1023)
     
     for c, w in enumerate(channel_weights):
-        lc = logits[:, :, c, :].reshape(-1, V)
+        lc = logits_slice[:, :, c, :].reshape(-1, V)
         tc = target[:, :, c].reshape(-1)
         mc = mask[:, :, c].reshape(-1)
         audio_mc = audio_token_mask[:, :, c].reshape(-1)

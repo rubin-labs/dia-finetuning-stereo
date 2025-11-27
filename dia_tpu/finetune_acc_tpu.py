@@ -5,9 +5,6 @@ import argparse
 import logging
 import os
 import random
-import socket
-import tempfile
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
@@ -16,7 +13,7 @@ import resource
 import torch
 import torchaudio
 # DDP imports removed
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 # autocast removed - handled by Accelerate
 # clip_grad_norm_ removed - handled by Accelerate
 from transformers import get_scheduler
@@ -29,12 +26,8 @@ from huggingface_hub import hf_hub_download
 import gc
 import wandb
 import time
-import signal
-import sys
-import datetime
 import re
 import glob
-import soundfile as sf
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -52,7 +45,6 @@ from dia.layers import DiaModel
 from dia.model import Dia
 from dia.audio import build_delay_indices, apply_audio_delay
 from dia.dataset import MusicDataset, PreEncodedDACDataset
-from torch.nn.functional import pad
 
 
 logging.basicConfig(
@@ -69,44 +61,6 @@ CODEBOOK_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 NONFINITE_HIT_LIMIT = 3
 _nonfinite_hits = 0
-
-
-# =============================================================================
-# EVALUATION & DEMO GENERATION CONFIGURATION
-# =============================================================================
-# Modify these parameters to control how evaluation and demo generation behave.
-# These are the main knobs you'll want to tweak for testing your finetuned model.
-
-# -- Test Prompts for Demo Generation --
-# These prompts are used to generate audio samples during evaluation.
-# Add/modify prompts to test different aspects of your model.
-# Format: {"name": "comma, separated, tags"}
-TEST_PROMPTS = {
-    "piano_ambient": "piano, pads, ambient, cinematic, melancholic, peaceful, reflective, instrumental",
-    "dark": "cinematic, suspenseful, dark, energetic, mysterious, strings, bells, bass"
-}
-
-# -- Audio Generation Parameters (for conditional generation) --
-EVAL_CFG_SCALE = 4.0           # Classifier-free guidance scale (higher = more prompt adherence)
-EVAL_TEMPERATURE = 1.0         # Sampling temperature (higher = more random)
-EVAL_TOP_P = 0.95              # Top-p (nucleus) sampling threshold
-
-# -- Audio Generation Parameters (for unconditional generation) --
-EVAL_CFG_SCALE_UNCOND = 0.0    # CFG scale for unconditional generation (usually 0.0)
-EVAL_TEMPERATURE_UNCOND = 1.0  # Temperature for unconditional generation
-
-# -- Multi-Temperature Demo Configuration --
-# Generate demos at multiple temperatures to track embedding learning progress
-# temp=0.0: deterministic (shows what model actually learned)
-# temp=0.5: moderate sampling (tests confidence)
-# temp=1.0: full sampling (tests robustness)
-EVAL_TEMPERATURES = [0.0, 0.5, 1.0]
-
-# -- Output Settings --
-EVAL_SAMPLE_RATE = 44100       # Sample rate for saved audio files
-EVAL_AUDIO_DIR = "./audio_demos"  # Directory to save demo audio files
-
-# =============================================================================
 
 
 TAG_SHUFFLE = True
@@ -181,31 +135,6 @@ def compute_vocabulary_coverage(dataset, max_valid_token=1023):
         'token_counts': token_counts,
         'total_tokens': sum(token_counts.values()),
     }
-
-
-def compute_output_entropy(logits):
-    """
-    Compute entropy of output probability distribution.
-    
-    Args:
-        logits: (B, T, C, V) tensor of logits
-        
-    Returns:
-        Mean entropy across all positions (scalar)
-    
-    Higher entropy = more uncertain (flatter distribution)
-    Lower entropy = more confident (peaked distribution)
-    """
-    # Softmax to get probabilities
-    probs = F.softmax(logits.float(), dim=-1)  # (B, T, C, V)
-    
-    # Compute entropy: -sum(p * log(p))
-    # Add small epsilon to avoid log(0)
-    log_probs = torch.log(probs + 1e-10)
-    entropy = -torch.sum(probs * log_probs, dim=-1)  # (B, T, C)
-    
-    # Mean entropy across all positions
-    return entropy.mean().item()
 
 
 def strip_weight_norms(module: torch.nn.Module) -> int:
@@ -323,8 +252,6 @@ class TrainConfig:
     run_name: str = "dia_finetune_cv"
     output_dir: Path = None
     no_decay_embed: bool = False
-    split_ratio: float = 0.997
-    eval_step: int | None = None
 
 
 def load_train_config(config_path: Path) -> dict:
@@ -347,7 +274,6 @@ def load_train_config(config_path: Path) -> dict:
         flat['warmup_steps'] = cfg['training'].get('warmup_steps')
         flat['unconditional_frac'] = cfg['training'].get('unconditional_frac')
         flat['weight_decay'] = cfg['training'].get('weight_decay')
-        flat['split_ratio'] = cfg['training'].get('split_ratio')
     if 'output' in cfg:
         flat['output_dir'] = cfg['output'].get('output_dir')
         flat['run_name'] = cfg['output'].get('run_name')
@@ -361,14 +287,6 @@ def load_train_config(config_path: Path) -> dict:
         flat['use_sliding_window'] = cfg['flags'].get('use_sliding_window')
         flat['require_prompts'] = cfg['flags'].get('require_prompts')
         flat['no_decay_embed'] = cfg['flags'].get('no_decay_embed')
-        flat['stop_on_overfit'] = cfg['flags'].get('stop_on_overfit')
-    
-    if 'eval' in cfg:
-        flat['eval_step'] = cfg['eval'].get('eval_step')
-        flat['demo_every'] = cfg['eval'].get('demo_every')
-        flat['eval_every_epochs'] = cfg['eval'].get('eval_every_epochs')
-        flat['demo_every_epochs'] = cfg['eval'].get('demo_every_epochs')
-        flat['demo_after_epoch'] = cfg['eval'].get('demo_after_epoch')
     
     # Root level or training level seed
     if 'seed' in cfg:
@@ -437,26 +355,12 @@ def get_args() -> argparse.Namespace:
                         help="Number of warmup steps.")
     parser.add_argument("--unconditional_frac", type=float, default=cfg_defaults.get('unconditional_frac'),
                         help="Fraction of unconditional training steps.")
-    parser.add_argument("--split_ratio", type=float, default=cfg_defaults.get('split_ratio', 0.997),
-                        help="Train/val split ratio (default: 0.997)")
-    parser.add_argument("--eval_step", type=int, default=cfg_defaults.get('eval_step', 0),
-                        help="Run evaluation every N steps (set <=0 to disable).")
-    parser.add_argument("--demo_every", type=int, default=cfg_defaults.get('demo_every', 2000),
-                        help="Generate demo audio every N steps (default: 2000).")
-    parser.add_argument("--eval_every_epochs", type=int, default=cfg_defaults.get('eval_every_epochs'),
-                        help="Run evaluation every N epochs (overrides eval_step).")
-    parser.add_argument("--demo_every_epochs", type=int, default=cfg_defaults.get('demo_every_epochs'),
-                        help="Generate demo audio every N epochs (overrides demo_every).")
     parser.add_argument("--save_every_epochs", type=int, default=None,
                         help="Save checkpoint at the end of every N epochs (overrides step-based save).")
     parser.add_argument("--save_after_epoch", type=int, default=cfg_defaults.get('save_after_epoch', 0),
                         help="Only start saving checkpoints after this epoch (default: 0, save from start).")
-    parser.add_argument("--demo_after_epoch", type=int, default=cfg_defaults.get('demo_after_epoch', 0),
-                        help="Only start generating demos after this epoch (default: 0, demo from start).")
     parser.add_argument("--early_stop_loss", type=float, default=None,
                         help="Early stop when training loss <= this value; saves final checkpoint then exits.")
-    parser.add_argument("--stop_on_overfit", action="store_true", default=cfg_defaults.get('stop_on_overfit', False),
-                        help="Stop training and generate demo when eval loss > train loss")
     parser.add_argument("--skip_dac_verify", action="store_true", default=False,
                         help="Skip one-off DAC encoding verification when using --audio_folder.")
     
@@ -480,14 +384,6 @@ def get_args() -> argparse.Namespace:
         parser.error("--output_dir is required (set in train_config.json or via CLI)")
     if args.unconditional_frac is None:
         parser.error("--unconditional_frac is required (set in train_config.json or via CLI)")
-
-    # Treat non-positive epoch-based intervals as disabled to avoid modulo-by-zero
-    if args.eval_every_epochs is not None and args.eval_every_epochs <= 0:
-        args.eval_every_epochs = None
-    if args.demo_every_epochs is not None and args.demo_every_epochs <= 0:
-        args.demo_every_epochs = None
-    if args.eval_step is not None and args.eval_step <= 0:
-        args.eval_step = None
     
     return args
 
@@ -594,16 +490,7 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
     if ds_len == 0:
         raise ValueError("Dataset is empty. Check your --audio_folder/--preencoded_dir paths and filtering settings.")
 
-    n_train = int(train_cfg.split_ratio * ds_len)
-    n_val = ds_len - n_train
-    
-    # If dataset has only 1 sample (or split would result in 0 train samples), skip validation entirely
-    if ds_len <= 1 or n_train == 0:
-        train_ds = dataset
-        val_ds = None
-    else:
-        g = torch.Generator().manual_seed(train_cfg.seed)
-        train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=g)
+    train_ds = dataset
 
     # Accelerator handles distribution, we just provide standard loaders
     # If the dataset is smaller than the requested batch size, drop_last=True would yield 0 steps.
@@ -636,20 +523,7 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
         )
     train_loader.steps_per_epoch = steps_per_epoch
     
-    if val_ds is not None:
-        val_loader = DataLoader(
-            val_ds, 
-            batch_size=1, 
-            shuffle=False, 
-            collate_fn=collate,
-            num_workers=0, # Eval usually fine with 0, or 1
-            pin_memory=False,
-            persistent_workers=False,
-        )
-    else:
-        val_loader = None
-    
-    return train_loader, val_loader
+    return train_loader
 
 
 
@@ -712,235 +586,6 @@ def setup_scheduler(opt, train_cfg, steps_per_epoch: int):
 
 
 
-def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: Accelerator, train_cfg, do_demo=True, current_train_loss=None, stop_on_overfit=False):
-    """
-    Run evaluation: calculate loss and optionally generate audio demos
-    """
-    eval_losses = []
-    last_batch = None
-    
-    # Ensure model is in eval mode
-    model.eval()
-    
-    if val_loader is not None:
-        # Accelerator handles device placement
-        # Use torch.no_grad() instead of inference_mode to keep weight_norm happy (it bumps version counters)
-        with torch.no_grad():
-            # Only show progress bar on main process
-            disable_tqdm = not accelerator.is_local_main_process
-            for eb in tqdm(val_loader, desc="eval", disable=disable_tqdm):
-                last_batch = eb
-
-                # No explicit autocast; Accelerate handles it via context if configured, 
-                # but eval might run in full precision. 
-                # For consistency with training, we can use accelerator.autocast() if needed,
-                # but typically eval is fine in fp32 or same dtype as model.
-                # Assuming model is already on device and correct dtype.
-                
-                with accelerator.autocast():
-                    logits = model(
-                        src_BxS=eb['src_tokens'],
-                        tgt_BxTxC=eb['tgt_tokens'],
-                        src_positions=eb['src_positions'],
-                        tgt_positions=eb['tgt_positions'],
-                        enc_self_attn_mask=eb['enc_self_attn_mask'],
-                        dec_self_attn_mask=eb['dec_self_attn_mask'],
-                        dec_cross_attn_mask=eb['dec_cross_attn_mask'],
-                        enable_dropout=False,
-                    )
-                    
-                    # Truncate logits if needed (usually model output matches target length, but let's check)
-                    # Dia model usually outputs (B, T, C, V).
-                    # On TPU, we must avoid dynamic slicing. We use the full fixed length and rely on masking.
-                    
-                    logits = logits[:, :-1]
-                    target = eb['tgt_tokens'][:, 1:, :]
-                    
-                    B_e, T_e, C_e = target.shape
-                    V_e = logits.size(-1)
-
-                    loss_e = 0.0
-                    # Custom weighting for eval as well to match training objective
-                    weights_e = []
-                    num_groups = C_e // 9
-                    if num_groups > 0:
-                        for _ in range(num_groups):
-                            weights_e.extend(CODEBOOK_WEIGHTS)
-                    else:
-                        weights_e = [1.0] * C_e
-                    
-                    # For TPU: Only use audio_token_mask, don't use tgt_lens for masking
-                    audio_token_mask_e = (target >= 0) & (target <= 1023)
-                    pad_val_e = dia_cfg.data.audio_pad_value
-                    target_masked = torch.where(audio_token_mask_e, target, torch.full_like(target, pad_val_e))
-                    
-                    for c, w in enumerate(weights_e):
-                        lc = logits[:, :, c, :].reshape(-1, V_e)
-                        tc = target_masked[:, :, c].reshape(-1)
-                        loss_e += w * F.cross_entropy(
-                            lc, tc, ignore_index=pad_val_e
-                        )
-                    loss_e = loss_e / sum(weights_e)
-
-                eval_losses.append(loss_e.item()) # Append float
-
-    # Synchronize to get all losses if we want exact global eval loss,
-    # but for monitoring, local or gathered average is fine.
-    # Let's gather losses to report accurate metric.
-    # (Simplified: just report local mean on main process for now to avoid heavy sync)
-    
-    should_stop = False
-    if len(eval_losses) > 0:
-        avg_eval_loss = sum(eval_losses) / len(eval_losses)
-        if accelerator.is_main_process:
-            wandb.log({'eval_loss': avg_eval_loss}, step=global_step)
-            
-            if stop_on_overfit and current_train_loss is not None:
-                if avg_eval_loss > current_train_loss:
-                    logger.info(f"Stop trigger: Eval loss {avg_eval_loss:.4f} > Train loss {current_train_loss:.4f}. Generating demo and stopping.")
-                    should_stop = True
-                    do_demo = True
-    else:
-        if accelerator.is_main_process and val_loader is not None:
-            logger.warning("No validation samples available for evaluation - check split_ratio")
-
-    # Only generate demos if requested
-    if not do_demo:
-        # If we need to stop, broadcast that decision
-        if stop_on_overfit:
-             # Broadcast should_stop from main process
-             pass # (Implemented in training loop via simple flag check or rely on main process killing loop)
-        return should_stop
-
-    # Only main process does audio generation to avoid conflicts
-    if accelerator.is_main_process:
-        Path(EVAL_AUDIO_DIR).mkdir(parents=True, exist_ok=True)
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        logger.info(f"Starting eval demo generation at step {global_step}")
-        # Unwrap model for generation (removes DDP wrapper)
-        unwrapped_model = accelerator.unwrap_model(model)
-        orig_dtype = next(unwrapped_model.parameters()).dtype
-
-        try:
-            # Switch to float for generation stability if needed, or keep as is.
-            # Often generation works better in full precision.
-            unwrapped_model = unwrapped_model.float()
-            dia_gen = Dia(dia_cfg, accelerator.device)
-            dia_gen.model, dia_gen.dac_model = unwrapped_model, dac_model
-
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
-                audio_samples = {}
-                
-                # Check if we're doing unconditional generation
-                if train_cfg.unconditional_frac >= 1.0:
-                    seeds = [int(train_cfg.seed), int(train_cfg.seed) + 1]
-                    temperatures = EVAL_TEMPERATURES
-                    total_demos = len(seeds) * len(temperatures)
-                    logger.info(f"Generating {total_demos} unconditional demos")
-                    
-                    # Save current RNG states
-                    prev_py_state = random.getstate()
-                    prev_np_state = np.random.get_state()
-                    prev_torch_state = torch.get_rng_state()
-                    prev_cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-                    
-                    try:
-                        for temp in temperatures:
-                            for s in seeds:
-                                try:
-                                    seed_everything(s)
-                                    logger.info(f"Generating unconditional audio (seed={s}, temp={temp})")
-                                    audio = dia_gen.generate(
-                                        text="",
-                                        cfg_scale=EVAL_CFG_SCALE_UNCOND,
-                                        temperature=temp
-                                    )
-                                    
-                                    temp_str = f"{temp:.1f}".replace(".", "p")
-                                    audio_filename = f"step_{global_step}_temp{temp_str}_seed{s}.wav"
-                                    audio_path = Path(EVAL_AUDIO_DIR) / audio_filename
-                                    arr = audio
-                                    if isinstance(arr, torch.Tensor):
-                                        arr = arr.detach().cpu().numpy()
-                                    if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
-                                        arr = arr.T
-                                    sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
-                                    
-                                    audio_samples[f"eval_audio/temp{temp_str}/seed{s}"] = wandb.Audio(
-                                        arr, sample_rate=EVAL_SAMPLE_RATE, 
-                                        caption=f"temp={temp}, seed={s}"
-                                    )
-                                except Exception as e:
-                                    logger.exception(f"Error generating sample (seed={s}, temp={temp}): {e}")
-                    finally:
-                        try:
-                            torch.set_rng_state(prev_torch_state)
-                            if torch.cuda.is_available() and prev_cuda_states is not None:
-                                torch.cuda.set_rng_state_all(prev_cuda_states)
-                        except Exception:
-                            pass
-                        try:
-                            np.random.set_state(prev_np_state)
-                            random.setstate(prev_py_state)
-                        except Exception:
-                            pass
-                else:
-                    # Conditional generation
-                    temperatures = EVAL_TEMPERATURES
-                    total_demos = len(TEST_PROMPTS) * len(temperatures)
-                    logger.info(f"Generating {total_demos} conditional demos")
-                    
-                    cfg_scale = EVAL_CFG_SCALE if train_cfg.unconditional_frac > 0 else None
-                    for temp in temperatures:
-                        for test_name, prompt in TEST_PROMPTS.items():
-                            try:
-                                logger.info(f"Generating audio for '{test_name}' (temp={temp})")
-                                audio = dia_gen.generate(
-                                    text=prompt,
-                                    cfg_scale=cfg_scale,
-                                    temperature=temp,
-                                    top_p=EVAL_TOP_P
-                                )
-                                
-                                temp_str = f"{temp:.1f}".replace(".", "p")
-                                audio_filename = f"step_{global_step}_{test_name}_temp{temp_str}.wav"
-                                audio_path = Path(EVAL_AUDIO_DIR) / audio_filename
-                                arr = audio
-                                if isinstance(arr, torch.Tensor):
-                                    arr = arr.detach().cpu().numpy()
-                                if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
-                                    arr = arr.T
-                                sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
-                                
-                                audio_samples[f"eval_audio/temp{temp_str}/{test_name}"] = wandb.Audio(
-                                    arr, sample_rate=EVAL_SAMPLE_RATE, 
-                                    caption=f"{prompt} (temp={temp})"
-                                )
-                            except Exception as e:
-                                 logger.exception(f"Error synthesizing '{test_name}' at temp={temp}: {e}")
-                
-                if audio_samples:
-                    wandb.log(audio_samples, step=global_step)
-                    logger.info("Logged demo audio samples to wandb")
-                
-        except Exception as e:
-            logger.exception(f"Eval demo generation failed: {e}")
-        finally:
-            # Restore training dtype
-            if orig_dtype == torch.float16:
-                unwrapped_model.half()
-            elif orig_dtype == torch.bfloat16:
-                unwrapped_model.bfloat16()
-            
-            # Ensure model on device (Accelerator should handle this, but unwrapped might need check)
-            # Actually unwrapped model shares storage so it stays on device.
-            pass
-    
-    accelerator.wait_for_everyone()
-    return should_stop
-
-
 def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: TrainConfig, args, accelerator: Accelerator):
     
     if accelerator.is_main_process:
@@ -970,7 +615,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     
     use_sliding_window = args.use_sliding_window
     # Note: setup_loaders now returns a standard DataLoader; Accelerator wraps it later
-    train_loader, val_loader = setup_loaders(dataset, dia_cfg, train_cfg, use_sliding_window)
+    train_loader = setup_loaders(dataset, dia_cfg, train_cfg, use_sliding_window)
     opt = setup_optimizer(model, train_cfg)
 
     # Cache lengths before Accelerator potentially shards loaders
@@ -1002,16 +647,10 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             )
 
     # PREPARE EVERYTHING WITH ACCELERATOR
-    # Prepare validation loader as well if it exists
     if shard_dataloaders:
-        if val_loader:
-            model, opt, train_loader, val_loader = accelerator.prepare(
-                model, opt, train_loader, val_loader
-            )
-        else:
-            model, opt, train_loader = accelerator.prepare(
-                model, opt, train_loader
-            )
+        model, opt, train_loader = accelerator.prepare(
+            model, opt, train_loader
+        )
         use_xla_native = False
     else:
         # No sharding: keep original loaders; run native XLA stepping
@@ -1124,36 +763,6 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                     'learning_rate': current_lr,
                 }, step=global_step)
 
-            # evaluation during epoch (only if epoch-based eval is not requested)
-            if args.eval_every_epochs is None and train_cfg.eval_step and global_step > 0 and global_step % train_cfg.eval_step == 0:
-                # Determine if we should generate demos (respecting demo_after_epoch)
-                demo_interval = args.demo_every if args.demo_every is not None else train_cfg.eval_step
-                past_demo_threshold = (epoch + 1) > args.demo_after_epoch
-                do_demo = (global_step % demo_interval == 0) and past_demo_threshold
-                
-                # Run eval step if we have val_loader OR if we need to generate demos
-                # Note: calling eval_step triggers sync/eval logic
-                should_stop = eval_step(
-                    model, val_loader, dia_cfg, dac_model, global_step, 
-                    accelerator, train_cfg, do_demo=do_demo, 
-                    current_train_loss=loss, stop_on_overfit=args.stop_on_overfit
-                )
-                
-                if args.stop_on_overfit:
-                    # Broadcast stop decision to all processes to avoid deadlock
-                    flag = torch.tensor(1.0 if should_stop else 0.0, device=accelerator.device)
-                    flag = accelerator.reduce(flag, reduction="max")
-                    
-                    if flag.item() > 0.5:
-                        stop_training = True
-                        if accelerator.is_main_process:
-                            ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{global_step}.pth"
-                            unwrapped_model = accelerator.unwrap_model(model)
-                            torch.save(unwrapped_model.state_dict(), ckpt_path)
-                            logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
-                
-                model.train()
-
             should_save = False
             past_save_threshold = (epoch + 1) > args.save_after_epoch
             if args.save_every_epochs is None and past_save_threshold:
@@ -1196,45 +805,6 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
 
         if stop_training:
             break
-
-        # Epoch-end evaluation if requested
-        should_check_epoch = False
-        if args.eval_every_epochs is not None and (epoch + 1) % args.eval_every_epochs == 0:
-             should_check_epoch = True
-        if args.demo_every_epochs is not None and (epoch + 1) % args.demo_every_epochs == 0:
-             should_check_epoch = True
-             
-        if should_check_epoch:
-            gsp = ((epoch + 1) * (steps_per_epoch or 0)) - 1
-            # For epoch-based eval, check demo_every_epochs first, then fallback to demo_every (steps)
-            past_demo_threshold = (epoch + 1) > args.demo_after_epoch
-            if args.demo_every_epochs is not None:
-                do_demo = ((epoch + 1) % args.demo_every_epochs == 0) and past_demo_threshold
-            elif args.demo_every is None:
-                do_demo = past_demo_threshold
-            else:
-                do_demo = (gsp > 0 and gsp % args.demo_every == 0) and past_demo_threshold
-            
-            should_stop = eval_step(
-                model, val_loader, dia_cfg, dac_model, gsp if gsp >= 0 else 0, 
-                accelerator, train_cfg, do_demo=do_demo, 
-                current_train_loss=loss, stop_on_overfit=args.stop_on_overfit
-            )
-            
-            if args.stop_on_overfit:
-                # Broadcast stop decision to all processes to avoid deadlock
-                flag = torch.tensor(1.0 if should_stop else 0.0, device=accelerator.device)
-                # Use reduce with max to ensure if any process (e.g. main) wants to stop, all stop
-                flag = accelerator.reduce(flag, reduction="max")
-                if flag.item() > 0.5:
-                    stop_training = True
-                    if accelerator.is_main_process:
-                        ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{gsp}.pth"
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        torch.save(unwrapped_model.state_dict(), ckpt_path)
-                        logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
-
-            model.train()
 
         if accelerator.is_main_process:
             is_last_epoch = (epoch + 1) == train_cfg.epochs
@@ -1439,7 +1009,6 @@ def run_training(args):
         output_dir = args.output_dir,
         seed = args.seed,
         no_decay_embed = args.no_decay_embed,
-        eval_step = args.eval_step,
     )
 
     model = DiaModel(dia_cfg)
@@ -1533,7 +1102,11 @@ def run_training(args):
         pass
 
     if args.compile:
-        model = torch.compile(model, backend="inductor")
+        if torch.cuda.is_available() and not HAS_XLA:
+            model = torch.compile(model, backend="inductor")
+        else:
+            if accelerator.is_main_process:
+                logger.warning("Skipping --compile: torch.compile(inductor) is only supported on CUDA (not TPU/XLA).")
     
     accelerator.wait_for_everyone()
     

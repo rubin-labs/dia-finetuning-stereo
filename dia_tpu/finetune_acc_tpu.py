@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, random_split
 from transformers import get_scheduler
 import torch.nn.functional as F
 import torch.optim as optim
-import bitsandbytes as bnb
+# import bitsandbytes as bnb # Removed for TPU compatibility
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 import gc
@@ -567,10 +567,12 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    opt = bnb.optim.AdamW8bit(
+    # Use standard AdamW for TPU compatibility instead of bnb 8-bit
+    opt = optim.AdamW(
         param_groups,
         lr=train_cfg.learning_rate,
-        weight_decay=0.0,
+        weight_decay=0.0, # Weight decay handled in param_groups
+        betas=(0.9, 0.999)
     )
     try:
         steps_per_epoch = len(train_loader)

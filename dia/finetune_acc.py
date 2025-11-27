@@ -27,7 +27,6 @@ from torch.nn.utils import clip_grad_norm_
 from transformers import get_scheduler
 import torch.nn.functional as F
 import torch.optim as optim
-import bitsandbytes as bnb
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 import math
@@ -679,7 +678,7 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    opt = bnb.optim.AdamW8bit(
+    opt = optim.AdamW(
         param_groups,
         lr=train_cfg.learning_rate,
         weight_decay=0.0,

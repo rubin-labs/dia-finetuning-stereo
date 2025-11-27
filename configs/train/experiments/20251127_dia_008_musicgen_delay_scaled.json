@@ -8,12 +8,12 @@
     },
     
     "training": {
-      "batch_size": 2,
-      "grad_accum_steps": 16,
-      "epochs": 100,
-      "learning_rate": 2e-4,
-      "warmup_steps": 500,
-      "unconditional_frac": 0.2
+      "batch_size": 4,
+      "grad_accum_steps": 1,
+      "epochs": 15,
+      "learning_rate": 1e-4,
+      "warmup_steps": 2000,
+      "unconditional_frac": 0.4
     },
     
     "output": {
@@ -33,4 +33,3 @@
       "use_sliding_window": true
     }
   }
-

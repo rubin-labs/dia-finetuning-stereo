@@ -2,15 +2,17 @@ import warnings
 warnings.filterwarnings("ignore", message="`torch.nn.utils.weight_norm` is deprecated")
 
 import argparse
+import json
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import numpy as np
 
 import torch
+import torch.nn as nn
 # DDP imports removed
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 # autocast removed - handled by Accelerate
 # clip_grad_norm_ removed - handled by Accelerate
 from transformers import get_scheduler
@@ -19,10 +21,9 @@ import torch.optim as optim
 from torch.nn.utils import parametrize
 # import bitsandbytes as bnb # Removed for TPU compatibility
 from tqdm import tqdm
-from huggingface_hub import hf_hub_download
-import gc
 import wandb
 import time
+import torchaudio
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -35,11 +36,6 @@ except ImportError:
     HAS_XLA = False
 
 import dac
-from dia.config import DiaConfig
-from dia.layers import DiaModel
-from dia.model import Dia
-from dia.audio import build_delay_indices, apply_audio_delay
-from dia.dataset import MusicDataset, PreEncodedDACDataset
 
 
 logging.basicConfig(
@@ -99,114 +95,460 @@ class TrainConfig:
     grad_accum_steps: int = 1
     learning_rate: float = 1e-5
     weight_decay: float = 0.1
-    warmup_steps: int = 100
+    warmup_steps: int = 500
     unconditional_frac: float = 0.15
     save_step: int = 2000
     seed: int = 786
     runs_dir: Path = Path("runs")
-    run_name: str = "dia_finetune_cv"
+    run_name: str = "audio_finetune_scratch"
     output_dir: Path = None
     no_decay_embed: bool = False
 
 
-def load_train_config(config_path: Path) -> dict:
-    import json
-    if not config_path.exists():
-        return {}
-    with open(config_path) as f:
-        cfg = json.load(f)
-    flat = {}
-    if 'data' in cfg:
-        flat['preencoded_dir'] = cfg['data'].get('preencoded_dir')
-        flat['audio_folder'] = cfg['data'].get('audio_folder')
-        flat['config'] = cfg['data'].get('config')
-    if 'training' in cfg:
-        flat['batch_size'] = cfg['training'].get('batch_size')
-        flat['grad_accum_steps'] = cfg['training'].get('grad_accum_steps')
-        flat['epochs'] = cfg['training'].get('epochs')
-        flat['learning_rate'] = cfg['training'].get('learning_rate')
-        flat['warmup_steps'] = cfg['training'].get('warmup_steps')
-        flat['unconditional_frac'] = cfg['training'].get('unconditional_frac')
-        flat['weight_decay'] = cfg['training'].get('weight_decay')
-    if 'output' in cfg:
-        flat['output_dir'] = cfg['output'].get('output_dir')
-        flat['run_name'] = cfg['output'].get('run_name')
-    if 'flags' in cfg:
-        flat['scratch'] = cfg['flags'].get('scratch')
-        flat['no_decay_embed'] = cfg['flags'].get('no_decay_embed')
-    
-    # Root level or training level seed
-    if 'seed' in cfg:
-        flat['seed'] = cfg['seed']
-    elif 'training' in cfg and 'seed' in cfg['training']:
-        flat['seed'] = cfg['training']['seed']
-        
-    return {k: v for k, v in flat.items() if v is not None}
+@dataclass
+class DataSettings:
+    text_length: int = 512
+    audio_length: int = 600
+    channels: int = 18
+    text_pad_value: int = 0
+    audio_eos_value: int = 1024
+    audio_pad_value: int = 1025
+    audio_bos_value: int = 1026
+    delay_pattern: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7, 8] * 2)
+
+
+@dataclass
+class ModelSettings:
+    src_vocab_size: int = 256
+    tgt_vocab_size: int = 1028
+    model_dim: int = 512
+    dropout: float = 0.1
+
+
+class MLPBlock(nn.Module):
+    """Small residual MLP block to keep the scratch model lightweight."""
+    def __init__(self, dim: int, dropout: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, dim * 4)
+        self.fc2 = nn.Linear(dim * 4, dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        h = F.gelu(self.fc1(h))
+        h = self.drop(self.fc2(h))
+        return x + self.drop(h)
+
+
+class SimpleAudioModel(nn.Module):
+    """
+    Lightweight audio model trained from scratch.
+    Predicts per-channel audio codes conditioned on text prompts.
+    """
+    def __init__(self, model_cfg: ModelSettings, data_cfg: DataSettings, num_layers: int = 4):
+        super().__init__()
+        self.model_dim = model_cfg.model_dim
+        self.data_cfg = data_cfg
+        self.text_pad_value = data_cfg.text_pad_value
+
+        self.text_embed = nn.Embedding(
+            model_cfg.src_vocab_size,
+            model_cfg.model_dim,
+            padding_idx=data_cfg.text_pad_value if data_cfg.text_pad_value < model_cfg.src_vocab_size else None,
+        )
+        self.text_pos_embed = nn.Embedding(data_cfg.text_length, model_cfg.model_dim)
+
+        self.audio_embed = nn.Embedding(
+            model_cfg.tgt_vocab_size,
+            model_cfg.model_dim,
+            padding_idx=data_cfg.audio_pad_value if data_cfg.audio_pad_value < model_cfg.tgt_vocab_size else None,
+        )
+        self.audio_pos_embed = nn.Embedding(data_cfg.audio_length + 2, model_cfg.model_dim)
+        self.channel_embed = nn.Embedding(data_cfg.channels, model_cfg.model_dim)
+
+        self.blocks = nn.ModuleList([MLPBlock(model_cfg.model_dim, model_cfg.dropout) for _ in range(num_layers)])
+        self.out_norm = nn.LayerNorm(model_cfg.model_dim)
+        self.out_proj = nn.Linear(model_cfg.model_dim, model_cfg.tgt_vocab_size)
+        self.dropout = nn.Dropout(model_cfg.dropout)
+
+    def forward(
+        self,
+        src_BxS: torch.Tensor,
+        tgt_BxTxC: torch.Tensor,
+        src_positions: torch.Tensor | None = None,
+        tgt_positions: torch.Tensor | None = None,
+        enc_self_attn_mask: torch.Tensor | None = None,
+        dec_self_attn_mask: torch.Tensor | None = None,
+        dec_cross_attn_mask: torch.Tensor | None = None,
+        enable_dropout: bool = True,
+    ) -> torch.Tensor:
+        B, T, C = tgt_BxTxC.shape
+        device = tgt_BxTxC.device
+
+        # Text encoding (mean pooling over non-pad tokens)
+        if src_positions is None:
+            src_positions = torch.arange(src_BxS.size(1), device=device).unsqueeze(0).expand_as(src_BxS)
+        src_pos_emb = self.text_pos_embed(torch.clamp(src_positions, max=self.text_pos_embed.num_embeddings - 1))
+        src_emb = self.text_embed(torch.clamp(src_BxS, max=self.text_embed.num_embeddings - 1)) + src_pos_emb
+
+        if enc_self_attn_mask is not None:
+            # Mask is (B, 1, S, S); derive pad mask from diagonal
+            pad_mask = enc_self_attn_mask[:, 0].any(-1)  # (B, S)
+        else:
+            pad_mask = src_BxS.ne(self.text_pad_value)
+
+        denom = pad_mask.sum(dim=1, keepdim=True).clamp(min=1).unsqueeze(-1)
+        text_ctx = (src_emb * pad_mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom  # (B, 1, D)
+
+        # Audio token embeddings
+        if tgt_positions is None:
+            tgt_positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        tgt_pos_emb = self.audio_pos_embed(torch.clamp(tgt_positions, max=self.audio_pos_embed.num_embeddings - 1))
+        tgt_pos_emb = tgt_pos_emb.unsqueeze(2)  # (B, T, 1, D)
+
+        channel_ids = torch.arange(C, device=device)
+        channel_emb = self.channel_embed(channel_ids).view(1, 1, C, -1)
+
+        audio_emb = self.audio_embed(torch.clamp(tgt_BxTxC, max=self.audio_embed.num_embeddings - 1))
+        x = audio_emb + tgt_pos_emb + channel_emb + text_ctx.unsqueeze(2)
+        x = self.dropout(x) if enable_dropout else x
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.out_norm(x)
+        logits = self.out_proj(x)
+        return logits
+
+
+class AudioPromptDataset(Dataset):
+    """
+    Loads raw audio + prompt pairs and encodes audio with DAC on the fly.
+    """
+    def __init__(
+        self,
+        audio_folder: Path,
+        config: DataSettings,
+        dac_model: dac.DAC,
+        use_sliding_window: bool = True,
+        ignore_missing_prompts: bool = True,
+        allow_empty_prompts: bool = True,
+    ):
+        self.audio_folder = Path(audio_folder)
+        self.prompts_folder = self.audio_folder.parent / "audio_prompts"
+        self.config = config
+        self.dac_model = dac_model
+        self.use_sliding_window = use_sliding_window
+        self.allow_empty_prompts = allow_empty_prompts
+
+        audio_extensions = ['.mp3', '.wav', '.flac', '.m4a', '.ogg']
+        self.audio_files = []
+        for ext in audio_extensions:
+            self.audio_files.extend(list(self.audio_folder.glob(f"*{ext}")))
+
+        self.valid_files = []
+        skipped_missing = 0
+        for audio_file in self.audio_files:
+            prompt_file = self.prompts_folder / f"{audio_file.stem}_prompt.txt"
+            if not prompt_file.exists():
+                if allow_empty_prompts:
+                    self.valid_files.append(audio_file)
+                    continue
+                if ignore_missing_prompts:
+                    skipped_missing += 1
+                    continue
+                raise FileNotFoundError(f"Missing prompt file: {prompt_file}")
+            self.valid_files.append(audio_file)
+
+        if not self.valid_files:
+            raise ValueError(f"No valid audio files found in {self.audio_folder}. Skipped {skipped_missing} missing prompts.")
+
+    def __len__(self) -> int:
+        return len(self.valid_files)
+
+    def _encode_mono_channel(self, wav_1xS: torch.Tensor) -> torch.Tensor:
+        device = next(self.dac_model.parameters()).device
+        audio_tensor = self.dac_model.preprocess(wav_1xS.unsqueeze(0), 44100).to(device)
+        _, enc, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)
+        enc = enc.squeeze(0).transpose(0, 1).to(torch.long)  # (T, 9)
+        return enc
+
+    def __getitem__(self, idx: int):
+        audio_file = self.valid_files[idx]
+        prompt_file = self.prompts_folder / f"{audio_file.stem}_prompt.txt"
+
+        if prompt_file.exists():
+            with open(prompt_file, 'r', encoding='utf-8') as f:
+                text = f.read().strip()
+        else:
+            text = ""
+
+        waveform, sr = torchaudio.load(audio_file)
+        if sr != 44100:
+            waveform = torchaudio.functional.resample(waveform, sr, 44100)
+
+        target_length_samples = int(self.config.audio_length * 512)
+        total_samples = waveform.shape[1]
+        if total_samples > target_length_samples:
+            if self.use_sliding_window:
+                start_sample = random.randint(0, total_samples - target_length_samples)
+            else:
+                start_sample = 0
+            waveform = waveform[:, start_sample:start_sample + target_length_samples]
+
+        with torch.no_grad():
+            num_channels = waveform.shape[0]
+            if num_channels > 2:
+                raise ValueError(f"Audio file {audio_file} has {num_channels} channels. Only mono/stereo supported.")
+            elif num_channels == 2:
+                enc_L = self._encode_mono_channel(waveform[0:1, :])
+                enc_R = self._encode_mono_channel(waveform[1:2, :])
+            else:
+                mono = waveform[0:1, :]
+                enc_L = self._encode_mono_channel(mono)
+                enc_R = enc_L.clone()
+
+            encoded = torch.cat([enc_L, enc_R], dim=1)  # (T, 18) for stereo
+
+        encoded = encoded.to(torch.long).cpu()
+
+        if encoded.size(1) < self.config.channels:
+            pad_cols = self.config.channels - encoded.size(1)
+            pad_tensor = torch.full((encoded.size(0), pad_cols), self.config.audio_pad_value, dtype=encoded.dtype, device=encoded.device)
+            encoded = torch.cat([encoded, pad_tensor], dim=1)
+        elif encoded.size(1) > self.config.channels:
+            encoded = encoded[:, : self.config.channels]
+
+        waveform = waveform.unsqueeze(0)
+        return text, encoded, waveform
+
+
+class PreEncodedDACDataset(Dataset):
+    """
+    Dataset for pre-encoded DAC files (.pt) with optional prompts.
+    """
+    def __init__(self, preprocessed_dir: Path, config: DataSettings, use_sliding_window: bool = True):
+        self.preprocessed_dir = Path(preprocessed_dir)
+        self.config = config
+        self.use_sliding_window = use_sliding_window
+
+        metadata_file = self.preprocessed_dir / "metadata.json"
+        if metadata_file.exists():
+            with open(metadata_file, 'r') as f:
+                self.metadata = json.load(f)
+        else:
+            self.metadata = {}
+
+        encoded_dir = self.preprocessed_dir / "encoded_audio"
+        if encoded_dir.exists():
+            self.encoded_files = list(encoded_dir.glob("*.pt"))
+        else:
+            self.encoded_files = list(self.preprocessed_dir.glob("*.pt"))
+            encoded_dir = self.preprocessed_dir
+
+        if not self.encoded_files:
+            raise FileNotFoundError(f"No .pt files found in {self.preprocessed_dir} or {encoded_dir}")
+
+    def __len__(self) -> int:
+        return len(self.encoded_files)
+
+    def __getitem__(self, idx: int):
+        encoded_file = self.encoded_files[idx]
+        encoded = torch.load(encoded_file, map_location='cpu')
+
+        target_length = self.config.audio_length
+        if encoded.shape[0] > target_length:
+            if self.use_sliding_window:
+                start = random.randint(0, encoded.shape[0] - target_length)
+                encoded = encoded[start : start + target_length]
+            else:
+                encoded = encoded[:target_length]
+
+        if encoded.size(1) < self.config.channels:
+            pad_cols = self.config.channels - encoded.size(1)
+            pad_tensor = torch.full((encoded.size(0), pad_cols), self.config.audio_pad_value, dtype=encoded.dtype, device=encoded.device)
+            encoded = torch.cat([encoded, pad_tensor], dim=1)
+        elif encoded.size(1) > self.config.channels:
+            encoded = encoded[:, : self.config.channels]
+
+        if encoded_file.name in self.metadata and 'text' in self.metadata[encoded_file.name]:
+            text_prompt = self.metadata[encoded_file.name]['text']
+        else:
+            prompt_path = encoded_file.with_suffix('.txt')
+            prompt_path_alt = self.preprocessed_dir / "prompts" / f"{encoded_file.stem}.txt"
+            prompt_path_alt2 = self.preprocessed_dir / "prompts" / f"{encoded_file.stem}_prompt.txt"
+
+            if prompt_path.exists():
+                with open(prompt_path, 'r', encoding='utf-8') as f:
+                    text_prompt = f.read().strip()
+            elif prompt_path_alt.exists():
+                with open(prompt_path_alt, 'r', encoding='utf-8') as f:
+                    text_prompt = f.read().strip()
+            elif prompt_path_alt2.exists():
+                with open(prompt_path_alt2, 'r', encoding='utf-8') as f:
+                    text_prompt = f.read().strip()
+            else:
+                text_prompt = ""
+
+        return text_prompt, encoded.to(torch.long), None
+
+
+def build_delay_indices(B: int, T: int, C: int, delay_pattern: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Precompute indices for shifting audio tokens by channel-specific delays.
+    Returns (t_idx_BxTxC, indices_BTCx3).
+    """
+    delay_arr = torch.tensor(delay_pattern, dtype=torch.int32)
+
+    t_idx_BxT = torch.broadcast_to(
+        torch.arange(T, dtype=torch.int32)[None, :],
+        [B, T],
+    )
+    t_idx_BxTxC = t_idx_BxT[..., None] - delay_arr.view(1, 1, C)
+
+    b_idx_BxTxC = torch.broadcast_to(
+        torch.arange(B, dtype=torch.int32).view(B, 1, 1),
+        [B, T, C],
+    )
+    c_idx_BxTxC = torch.broadcast_to(
+        torch.arange(C, dtype=torch.int32).view(1, 1, C),
+        [B, T, C],
+    )
+
+    t_clamped_BxTxC = torch.clamp(t_idx_BxTxC, 0, T - 1)
+
+    indices_BTCx3 = torch.stack(
+        [
+            b_idx_BxTxC.reshape(-1),
+            t_clamped_BxTxC.reshape(-1),
+            c_idx_BxTxC.reshape(-1),
+        ],
+        dim=1,
+    ).long()
+
+    return t_idx_BxTxC, indices_BTCx3
+
+
+def apply_audio_delay(
+    audio_BxTxC: torch.Tensor,
+    pad_value: int,
+    bos_value: int,
+    precomp: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """
+    Apply delay pattern to audio tokens using precomputed indices.
+    """
+    device = audio_BxTxC.device
+    t_idx_BxTxC, indices_BTCx3 = precomp
+    t_idx_BxTxC = t_idx_BxTxC.to(device)
+    indices_BTCx3 = indices_BTCx3.to(device)
+
+    gathered_flat = audio_BxTxC[indices_BTCx3[:, 0], indices_BTCx3[:, 1], indices_BTCx3[:, 2]]
+    gathered_BxTxC = gathered_flat.view(audio_BxTxC.shape)
+
+    mask_bos = t_idx_BxTxC < 0
+    mask_pad = t_idx_BxTxC >= audio_BxTxC.shape[1]
+
+    bos_tensor = torch.tensor(bos_value, dtype=audio_BxTxC.dtype, device=device)
+    pad_tensor = torch.tensor(pad_value, dtype=audio_BxTxC.dtype, device=device)
+
+    return torch.where(mask_bos, bos_tensor, torch.where(mask_pad, pad_tensor, gathered_BxTxC))
 
 
 def get_args() -> argparse.Namespace:
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--train_config", type=Path, default=Path("configs/train_config.json"),
-                            help="Path to training config JSON (defaults loaded from here, CLI overrides)")
-    pre_args, _ = pre_parser.parse_known_args()
-    
-    cfg_defaults = load_train_config(pre_args.train_config)
-    
-    parser = argparse.ArgumentParser(description="Train the Dia audio model")
-    parser.add_argument("--train_config", type=Path, default=Path("configs/train_config.json"),
-                        help="Path to training config JSON (defaults loaded from here, CLI overrides)")
-    parser.add_argument("--config",    type=Path, default=Path(cfg_defaults.get('config', 'configs/architecture/model.json')))
-    parser.add_argument("--hub_model", type=str,  default="nari-labs/Dia-1.6B")
-    parser.add_argument("--local_ckpt", type=str,  default=None)
-    parser.add_argument("--audio_folder", type=Path, default=cfg_defaults.get('audio_folder'),
+    train_defaults = TrainConfig()
+    data_defaults = DataSettings()
+    model_defaults = ModelSettings()
+
+    parser = argparse.ArgumentParser(
+        description="Train an audio model from scratch with Accelerate/TPU (arg-only, no config files)."
+    )
+    parser.add_argument("--audio_folder", type=Path,
                         help="Path to audio folder (expects audio_prompts folder at same level).")
-    parser.add_argument("--preencoded_dir", type=Path, default=cfg_defaults.get('preencoded_dir'),
+    parser.add_argument("--preencoded_dir", type=Path,
                         help="Directory with pre-encoded DAC codes (encoded_audio/*.pt) and optional metadata.json.")
-    parser.add_argument("--run_name",  type=str,  default=cfg_defaults.get('run_name'))
-    parser.add_argument("--output_dir",type=Path, default=cfg_defaults.get('output_dir'),
+    parser.add_argument("--output_dir", type=Path, required=True,
                         help="Output directory for checkpoints.")
-    parser.add_argument("--seed", type=int, default=cfg_defaults.get('seed', 42),
+    parser.add_argument("--run_name", type=str, default=train_defaults.run_name,
+                        help="Run name for logging/checkpoints.")
+    parser.add_argument("--seed", type=int, default=train_defaults.seed,
                         help="Random seed for reproducibility.")
     parser.add_argument("--half", action="store_true", help="enable bf16 mixed precision (TPU-safe)")
     parser.add_argument("--compile", action="store_true", help="torch compile model")
-    parser.add_argument("--wandb_project", type=str, default="dia-music-finetuning",
+    parser.add_argument("--wandb_project", type=str, default="audio-finetuning",
                         help="Weights & Biases project name.")
     parser.add_argument("--wandb_entity", type=str, default=None,
                         help="Weights & Biases entity/team name.")
-    parser.add_argument("--epochs", type=int, default=cfg_defaults.get('epochs', 500),
+    parser.add_argument("--epochs", type=int, default=train_defaults.epochs,
                         help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int, default=cfg_defaults.get('batch_size', 4),
-                        help="Batch size per GPU.")
-    parser.add_argument("--grad_accum_steps", type=int, default=cfg_defaults.get('grad_accum_steps', 1),
+    parser.add_argument("--batch_size", type=int, default=train_defaults.batch_size,
+                        help="Batch size per device.")
+    parser.add_argument("--grad_accum_steps", type=int, default=train_defaults.grad_accum_steps,
                         help="Gradient accumulation steps.")
-    parser.add_argument("--learning_rate", type=float, default=cfg_defaults.get('learning_rate', 1e-5),
+    parser.add_argument("--learning_rate", type=float, default=train_defaults.learning_rate,
                         help="Learning rate.")
-    parser.add_argument("--weight_decay", type=float, default=cfg_defaults.get('weight_decay', 0.1),
+    parser.add_argument("--weight_decay", type=float, default=train_defaults.weight_decay,
                         help="AdamW weight decay coefficient.")
-    parser.add_argument("--warmup_steps", type=int, default=cfg_defaults.get('warmup_steps', 500),
+    parser.add_argument("--warmup_steps", type=int, default=train_defaults.warmup_steps,
                         help="Number of warmup steps.")
-    parser.add_argument("--unconditional_frac", type=float, default=cfg_defaults.get('unconditional_frac'),
+    parser.add_argument("--unconditional_frac", type=float, default=train_defaults.unconditional_frac,
                         help="Fraction of unconditional training steps.")
-    parser.add_argument("--scratch", action="store_true", default=cfg_defaults.get('scratch', False),
-                        help="Train from scratch (random initialization) instead of loading a checkpoint.")
-    parser.add_argument("--no_decay_embed", action="store_true", default=cfg_defaults.get('no_decay_embed', False),
+    parser.add_argument("--no_decay_embed", action="store_true", default=train_defaults.no_decay_embed,
                         help="Exclude nn.Embedding parameters from weight decay")
+    parser.add_argument("--src_vocab_size", type=int, default=model_defaults.src_vocab_size,
+                        help="Source vocab size for text prompts.")
+    parser.add_argument("--tgt_vocab_size", type=int, default=model_defaults.tgt_vocab_size,
+                        help="Target vocab size for audio codes.")
+    parser.add_argument("--model_dim", type=int, default=model_defaults.model_dim,
+                        help="Hidden size for the lightweight audio model.")
+    parser.add_argument("--dropout", type=float, default=model_defaults.dropout,
+                        help="Dropout used inside the lightweight audio model.")
+    parser.add_argument("--text_length", type=int, default=data_defaults.text_length,
+                        help="Max text tokens (bytes).")
+    parser.add_argument("--audio_length", type=int, default=data_defaults.audio_length,
+                        help="Audio token length window.")
+    parser.add_argument("--channels", type=int, default=data_defaults.channels,
+                        help="Number of audio code channels.")
+    parser.add_argument("--text_pad_value", type=int, default=data_defaults.text_pad_value,
+                        help="Pad token for text.")
+    parser.add_argument("--audio_eos_value", type=int, default=data_defaults.audio_eos_value,
+                        help="EOS token for audio.")
+    parser.add_argument("--audio_pad_value", type=int, default=data_defaults.audio_pad_value,
+                        help="Pad token for audio.")
+    parser.add_argument("--audio_bos_value", type=int, default=data_defaults.audio_bos_value,
+                        help="BOS token for audio.")
+    parser.add_argument(
+        "--delay_pattern",
+        type=str,
+        default=",".join(str(v) for v in data_defaults.delay_pattern),
+        help="Comma-separated per-channel delays (length should match --channels).",
+    )
     
     args = parser.parse_args()
-    
-    if args.output_dir is None:
-        parser.error("--output_dir is required (set in train_config.json or via CLI)")
-    if args.unconditional_frac is None:
-        parser.error("--unconditional_frac is required (set in train_config.json or via CLI)")
+
+    if not args.audio_folder and not args.preencoded_dir:
+        parser.error("Specify either --audio_folder or --preencoded_dir.")
+    if args.audio_folder and args.preencoded_dir:
+        parser.error("Use only one of --audio_folder or --preencoded_dir.")
     
     return args
 
 
+def _parse_delay_pattern(raw: str | None, fallback: list[int]) -> list[int]:
+    if raw is None:
+        return list(fallback)
+    try:
+        pattern = [int(v.strip()) for v in raw.split(",") if v.strip() != ""]
+    except ValueError as exc:
+        raise ValueError(f"Invalid --delay_pattern '{raw}'. Use comma-separated integers.") from exc
+    return pattern if pattern else list(fallback)
 
-def collate_fn(batch, config: DiaConfig, device: torch.device):
+
+def collate_fn(batch, config: DataSettings, device: torch.device):
     texts, encodings, waveforms = zip(*batch)
 
-    window_size = config.data.audio_length
+    window_size = config.audio_length
     cropped_encodings = []
     for e in encodings:
         if e.size(0) > window_size:
@@ -216,8 +558,8 @@ def collate_fn(batch, config: DiaConfig, device: torch.device):
             cropped_encodings.append(e)
     encodings = cropped_encodings
 
-    max_text = config.data.text_length
-    pad_tok = config.data.text_pad_value
+    max_text = config.text_length
+    pad_tok = config.text_pad_value
     text_ids = []
     for txt in texts:
         b_full = txt.encode('utf-8')
@@ -237,7 +579,7 @@ def collate_fn(batch, config: DiaConfig, device: torch.device):
     for e in encodings:
         if e.size(0) < batch_max:
             pad_length = batch_max - e.size(0)
-            pad_value = config.data.audio_pad_value
+            pad_value = config.audio_pad_value
             padding = torch.full((pad_length, e.size(1)), pad_value, dtype=e.dtype, device=e.device)
             padded_e = torch.cat([e, padding], dim=0)
         else:
@@ -248,18 +590,18 @@ def collate_fn(batch, config: DiaConfig, device: torch.device):
     codes = torch.stack(padded_encodings).to(device)
 
     B, T, C = codes.shape
-    t_idx, idxs = build_delay_indices(B, T, C, config.data.delay_pattern)
+    t_idx, idxs = build_delay_indices(B, T, C, config.delay_pattern)
     delayed = apply_audio_delay(
         codes,
-        config.data.audio_pad_value,
-        config.data.audio_bos_value,
+        config.audio_pad_value,
+        config.audio_bos_value,
         (t_idx, idxs)
     )
 
     max_tgt_len = batch_max + 2
-    pad_val = config.data.audio_pad_value
-    bos_val = config.data.audio_bos_value
-    eos_val = config.data.audio_eos_value
+    pad_val = config.audio_pad_value
+    bos_val = config.audio_bos_value
+    eos_val = config.audio_eos_value
 
     tgt = torch.full((B, max_tgt_len, C), pad_val, dtype=torch.long, device=device)
     tgt[:, 0, :] = bos_val
@@ -293,8 +635,8 @@ def collate_fn(batch, config: DiaConfig, device: torch.device):
 
 from functools import partial
 
-def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig):
-    collate = partial(collate_fn, config=dia_cfg, device=torch.device("cpu"))
+def setup_loaders(dataset, data_cfg: DataSettings, train_cfg: TrainConfig):
+    collate = partial(collate_fn, config=data_cfg, device=torch.device("cpu"))
     
     ds_len = len(dataset)
     if ds_len == 0:
@@ -396,7 +738,7 @@ def setup_scheduler(opt, train_cfg, steps_per_epoch: int):
 
 
 
-def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: TrainConfig, args, accelerator: Accelerator):
+def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, accelerator: Accelerator):
     
     if accelerator.is_main_process:
         train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -407,7 +749,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             entity=args.wandb_entity,
             name=train_cfg.run_name,
             config={
-                "model": "Dia-1.6B",
+                "model": "scratch-audio",
                 "dataset_size": len(dataset) if hasattr(dataset, '__len__') else "streaming",
                 "epochs": train_cfg.epochs,
                 "batch_size": train_cfg.batch_size,
@@ -418,13 +760,16 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 "seed": train_cfg.seed,
                 "num_processes": accelerator.num_processes,
                 "mixed_precision": accelerator.mixed_precision,
+                "model_dim": getattr(model, "model_dim", None),
+                "src_vocab_size": getattr(args, "src_vocab_size", None),
+                "tgt_vocab_size": getattr(args, "tgt_vocab_size", None),
             }
         )
     
     # No need for barrier or manual DDP wrap or manual device move
     
     # Note: setup_loaders now returns a standard DataLoader; Accelerator wraps it later
-    train_loader = setup_loaders(dataset, dia_cfg, train_cfg)
+    train_loader = setup_loaders(dataset, data_cfg, train_cfg)
     opt = setup_optimizer(model, train_cfg)
 
     # Cache lengths before Accelerator potentially shards loaders
@@ -537,7 +882,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             batch_start = time.time()
             
             # Updated train step signature
-            loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator, use_xla_native)
+            loss = train_step(model, batch, data_cfg, train_cfg, opt, sched, step, global_step, accelerator, use_xla_native)
             
             total_step_time = time.time() - batch_start
 
@@ -576,12 +921,12 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     accelerator.wait_for_everyone()
 
 
-def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator: Accelerator, use_xla_native: bool):
+def train_step(model, batch, data_cfg, train_cfg, opt, sched, step, global_step, accelerator: Accelerator, use_xla_native: bool):
     global _nonfinite_hits
 
     gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
     if gen_val < train_cfg.unconditional_frac:
-        pad_tok = dia_cfg.data.text_pad_value
+        pad_tok = data_cfg.text_pad_value
         batch['src_tokens'].fill_(pad_tok)
         batch['enc_self_attn_mask'] = torch.zeros_like(batch['enc_self_attn_mask'])
         batch['dec_cross_attn_mask'] = torch.zeros_like(batch['dec_cross_attn_mask'])
@@ -605,7 +950,7 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         target = batch['tgt_tokens'][:, 1:, :]
         
         B, Tm1, C = target.shape
-        pad_val = dia_cfg.data.audio_pad_value
+        pad_val = data_cfg.audio_pad_value
         
         # For TPU: Use fixed-shape operations only.
         # Don't use tgt_lens for masking - let ignore_index handle padding.
@@ -696,28 +1041,48 @@ def run_training(args):
     if accelerator.is_main_process:
         logger.info(f"Accelerator initialized. Device: {accelerator.device}, Num processes: {accelerator.num_processes}")
 
-    dia_cfg = DiaConfig.load(args.config)
+    delay_default = DataSettings().delay_pattern
+    delay_pattern = _parse_delay_pattern(args.delay_pattern, delay_default)
+    if len(delay_pattern) != args.channels:
+        logger.warning(
+            "delay_pattern length (%d) does not match channels (%d); pattern will be broadcast/truncated as needed.",
+            len(delay_pattern),
+            args.channels,
+        )
+    data_cfg = DataSettings(
+        text_length=args.text_length,
+        audio_length=args.audio_length,
+        channels=args.channels,
+        text_pad_value=args.text_pad_value,
+        audio_eos_value=args.audio_eos_value,
+        audio_pad_value=args.audio_pad_value,
+        audio_bos_value=args.audio_bos_value,
+        delay_pattern=delay_pattern,
+    )
+    model_cfg = ModelSettings(
+        src_vocab_size=args.src_vocab_size,
+        tgt_vocab_size=args.tgt_vocab_size,
+        model_dim=args.model_dim,
+        dropout=args.dropout,
+    )
 
-    if accelerator.is_main_process:
-        print(f"Loaded config from: {args.config}")
-        print("Loading DAC model...")
-        
-    # Load DAC model
-    # We need it on the correct device
-    with accelerator.main_process_first():
-        dac_ckpt = dac.utils.download()
-    dac_model = dac.DAC.load(dac_ckpt).eval()
-    removed_dac_wn = strip_weight_norms(dac_model)
-    dac_model = dac_model.to(accelerator.device)
-    if accelerator.is_main_process and removed_dac_wn:
-        logger.info("Removed %d weight_norm wrappers from DAC model for XLA compatibility", removed_dac_wn)
-
+    dac_model = None
     if args.preencoded_dir:
-        dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window=True)
+        dataset = PreEncodedDACDataset(args.preencoded_dir, data_cfg, use_sliding_window=True)
     elif args.audio_folder:
-        dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window=True)
+        if accelerator.is_main_process:
+            print("Loading DAC model...")
+        with accelerator.main_process_first():
+            dac_ckpt = dac.utils.download()
+        dac_model = dac.DAC.load(dac_ckpt).eval()
+        removed_dac_wn = strip_weight_norms(dac_model)
+        dac_model = dac_model.to(accelerator.device)
+        if accelerator.is_main_process and removed_dac_wn:
+            logger.info("Removed %d weight_norm wrappers from DAC model for XLA compatibility", removed_dac_wn)
+        dataset = AudioPromptDataset(args.audio_folder, data_cfg, dac_model, use_sliding_window=True)
     else:
         raise ValueError("Must specify either --audio_folder or --preencoded_dir")
+
 
     train_cfg = TrainConfig(
         epochs = args.epochs,
@@ -727,45 +1092,17 @@ def run_training(args):
         weight_decay = args.weight_decay,
         warmup_steps = args.warmup_steps,
         unconditional_frac = args.unconditional_frac,
-        run_name = args.run_name or TrainConfig.run_name,
+        run_name = args.run_name,
         output_dir = args.output_dir,
         seed = args.seed,
         no_decay_embed = args.no_decay_embed,
     )
 
-    model = DiaModel(dia_cfg)
-
-    if args.scratch:
-        if accelerator.is_main_process:
-            print("Initializing model from scratch (random weights)...")
-        if hasattr(model, '_init_weights'):
-            model._init_weights()
-    else:
-        if args.local_ckpt:
-            ckpt_file = args.local_ckpt
-        else:
-            ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
-        
-        state = torch.load(ckpt_file, map_location="cpu")
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if accelerator.is_main_process:
-            logger.info(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
-        del state
-        gc.collect()
+    model = SimpleAudioModel(model_cfg, data_cfg)
 
     removed_model_wn = strip_weight_norms(model)
     if accelerator.is_main_process and removed_model_wn:
-        logger.info("Removed %d weight_norm wrappers from Dia model for XLA compatibility", removed_model_wn)
-
-    # Optionally freeze encoder
-    try:
-        if train_cfg.unconditional_frac >= 0.9:
-            for p in model.encoder.parameters():
-                p.requires_grad = False
-            if accelerator.is_main_process:
-                print("Frozen encoder parameters due to high unconditional_frac")
-    except Exception:
-        pass
+        logger.info("Removed %d weight_norm wrappers from model for XLA compatibility", removed_model_wn)
 
     if args.compile:
         if torch.cuda.is_available() and not HAS_XLA:
@@ -777,7 +1114,7 @@ def run_training(args):
     accelerator.wait_for_everyone()
     
     # Launch training
-    train(model, dia_cfg, dac_model, dataset, train_cfg, args, accelerator)
+    train(model, data_cfg, dataset, train_cfg, args, accelerator)
 
 
 def main():

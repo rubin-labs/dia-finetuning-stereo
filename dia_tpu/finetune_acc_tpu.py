@@ -508,6 +508,8 @@ def get_args() -> argparse.Namespace:
                         help="Max text tokens (bytes).")
     parser.add_argument("--audio_length", type=int, default=data_defaults.audio_length,
                         help="Audio token length window.")
+    parser.add_argument("--no_sliding_window", action="store_true",
+                        help="Disable random sliding window; always crop from the start of each clip.")
     parser.add_argument("--channels", type=int, default=data_defaults.channels,
                         help="Number of audio code channels.")
     parser.add_argument("--text_pad_value", type=int, default=data_defaults.text_pad_value,
@@ -545,14 +547,17 @@ def _parse_delay_pattern(raw: str | None, fallback: list[int]) -> list[int]:
     return pattern if pattern else list(fallback)
 
 
-def collate_fn(batch, config: DataSettings, device: torch.device):
+def collate_fn(batch, config: DataSettings, device: torch.device, use_sliding_window: bool = True):
     texts, encodings, waveforms = zip(*batch)
 
     window_size = config.audio_length
     cropped_encodings = []
     for e in encodings:
         if e.size(0) > window_size:
-            start = random.randint(0, e.size(0) - window_size)
+            if use_sliding_window:
+                start = random.randint(0, e.size(0) - window_size)
+            else:
+                start = 0
             cropped_encodings.append(e[start : start + window_size])
         else:
             cropped_encodings.append(e)
@@ -630,13 +635,13 @@ def collate_fn(batch, config: DataSettings, device: torch.device):
         'dec_cross_attn_mask': dec_cross_attn_mask,
         'waveforms': waveforms,
         'raw_text': texts[0],
-        'tgt_lens': torch.tensor(tgt_lens, dtype=torch.long, device=device),
+    'tgt_lens': torch.tensor(tgt_lens, dtype=torch.long, device=device),
     }
 
 from functools import partial
 
-def setup_loaders(dataset, data_cfg: DataSettings, train_cfg: TrainConfig):
-    collate = partial(collate_fn, config=data_cfg, device=torch.device("cpu"))
+def setup_loaders(dataset, data_cfg: DataSettings, train_cfg: TrainConfig, use_sliding_window: bool = True):
+    collate = partial(collate_fn, config=data_cfg, device=torch.device("cpu"), use_sliding_window=use_sliding_window)
     
     ds_len = len(dataset)
     if ds_len == 0:
@@ -769,7 +774,8 @@ def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, 
     # No need for barrier or manual DDP wrap or manual device move
     
     # Note: setup_loaders now returns a standard DataLoader; Accelerator wraps it later
-    train_loader = setup_loaders(dataset, data_cfg, train_cfg)
+    use_sliding_window = not getattr(args, "no_sliding_window", False)
+    train_loader = setup_loaders(dataset, data_cfg, train_cfg, use_sliding_window)
     opt = setup_optimizer(model, train_cfg)
 
     # Cache lengths before Accelerator potentially shards loaders
@@ -1066,9 +1072,11 @@ def run_training(args):
         dropout=args.dropout,
     )
 
+    use_sliding_window = not args.no_sliding_window
+
     dac_model = None
     if args.preencoded_dir:
-        dataset = PreEncodedDACDataset(args.preencoded_dir, data_cfg, use_sliding_window=True)
+        dataset = PreEncodedDACDataset(args.preencoded_dir, data_cfg, use_sliding_window=use_sliding_window)
     elif args.audio_folder:
         if accelerator.is_main_process:
             print("Loading DAC model...")
@@ -1079,7 +1087,7 @@ def run_training(args):
         dac_model = dac_model.to(accelerator.device)
         if accelerator.is_main_process and removed_dac_wn:
             logger.info("Removed %d weight_norm wrappers from DAC model for XLA compatibility", removed_dac_wn)
-        dataset = AudioPromptDataset(args.audio_folder, data_cfg, dac_model, use_sliding_window=True)
+        dataset = AudioPromptDataset(args.audio_folder, data_cfg, dac_model, use_sliding_window=use_sliding_window)
     else:
         raise ValueError("Must specify either --audio_folder or --preencoded_dir")
 

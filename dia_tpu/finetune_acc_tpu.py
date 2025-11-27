@@ -210,6 +210,7 @@ def compute_output_entropy(logits):
 def verify_dac_encoding(audio_path: Path, dac_model: dac.DAC, seconds: float = 1.0, target_sr: int = 44100):
     """
     Run a quick DAC encode on a short snippet to ensure the pipeline works.
+    Handles mono or stereo by encoding each channel separately (DAC expects 1ch).
     Raises on failure; logs the produced code shape on success.
     """
     device = next(dac_model.parameters()).device
@@ -226,18 +227,29 @@ def verify_dac_encoding(audio_path: Path, dac_model: dac.DAC, seconds: float = 1
     if waveform.shape[1] > max_samples:
         waveform = waveform[:, :max_samples]
     
-    # Keep only first two channels
-    waveform = waveform[:2, :]
+    # Encode each channel separately; DAC conv expects a single channel input
+    num_ch = waveform.shape[0]
+    if num_ch > 2:
+        raise RuntimeError(f"DAC verification only supports mono/stereo, got {num_ch} channels in {audio_path}")
     
+    channel_codes = []
     with torch.no_grad():
-        audio_tensor = dac_model.preprocess(waveform.unsqueeze(0), target_sr).to(device)
-        _, enc, *_ = dac_model.encode(audio_tensor, n_quantizers=None)
+        for ch in range(min(num_ch, 2)):
+            mono = waveform[ch:ch + 1, :]
+            audio_tensor = dac_model.preprocess(mono.unsqueeze(0), target_sr).to(device)
+            _, enc, *_ = dac_model.encode(audio_tensor, n_quantizers=None)
+            if enc is None or enc.numel() == 0:
+                raise RuntimeError("DAC verification produced empty codes.")
+            channel_codes.append(enc.squeeze(0).transpose(0, 1))  # (T, 9)
+
+    # If mono, duplicate to both sides so shape matches stereo training path
+    if len(channel_codes) == 1:
+        enc_stereo = torch.cat([channel_codes[0], channel_codes[0]], dim=1)
+    else:
+        enc_stereo = torch.cat(channel_codes, dim=1)
     
-    if enc is None or enc.numel() == 0:
-        raise RuntimeError("DAC verification produced empty codes.")
-    
-    logger.info("DAC verification succeeded on %s -> codes shape %s", audio_path, tuple(enc.shape))
-    return enc
+    logger.info("DAC verification succeeded on %s -> codes shape %s", audio_path, tuple(enc_stereo.shape))
+    return enc_stereo
 
 
 def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):

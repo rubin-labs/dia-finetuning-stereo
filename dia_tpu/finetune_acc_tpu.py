@@ -1029,9 +1029,10 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 if p.requires_grad:
                     state = opt.state[p]
                     if len(state) == 0:
-                        state['step'] = torch.tensor(0.0)
-                        state['exp_avg'] = torch.zeros_like(p)
-                        state['exp_avg_sq'] = torch.zeros_like(p)
+                        device = p.device
+                        state['step'] = torch.zeros((), device=device)
+                        state['exp_avg'] = torch.zeros_like(p, device=device)
+                        state['exp_avg_sq'] = torch.zeros_like(p, device=device)
 
     if shard_dataloaders:
         steps_per_epoch = getattr(train_loader, 'steps_per_epoch', None)

@@ -1392,13 +1392,17 @@ def run_training(args):
         logger.info("Removed %d weight_norm wrappers from DAC model for XLA compatibility", removed_dac_wn)
 
     use_sliding_window = args.use_sliding_window
+    allow_empty_prompts = args.unconditional_frac >= 1.0 and not args.require_prompts
+    if allow_empty_prompts and accelerator.is_main_process:
+        logger.warning("unconditional_frac >= 1.0; allowing missing prompts by using empty strings.")
     if args.preencoded_dir:
         dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
     elif args.audio_folder:
         skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
         dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
                              ignore_missing_prompts=not args.require_prompts,
-                             skip_tags=skip_tags_list)
+                             skip_tags=skip_tags_list,
+                             allow_empty_prompts=allow_empty_prompts)
         # Quick one-off verification that DAC encoding works on the current environment
         if accelerator.is_main_process and not args.skip_dac_verify:
             try:

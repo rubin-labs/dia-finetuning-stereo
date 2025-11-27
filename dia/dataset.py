@@ -16,13 +16,23 @@ logger = logging.getLogger(__name__)
 
 class MusicDataset(Dataset):
     """Load from audio folder and audio_prompts folder structure."""
-    def __init__(self, audio_folder: Path, config: DiaConfig, dac_model: dac.DAC, use_sliding_window: bool = True, ignore_missing_prompts: bool = True, skip_tags: list = None):
+    def __init__(
+        self,
+        audio_folder: Path,
+        config: DiaConfig,
+        dac_model: dac.DAC,
+        use_sliding_window: bool = True,
+        ignore_missing_prompts: bool = True,
+        skip_tags: list = None,
+        allow_empty_prompts: bool = False,
+    ):
         print("WARNING: MusicDataset performs on-the-fly DAC encoding which is very slow and blocks training. Consider using scripts/preencode_audio.py and --preencoded_dir for much faster training.")
         self.audio_folder = Path(audio_folder)
         self.prompts_folder = self.audio_folder.parent / "audio_prompts"
         self.config = config
         self.dac_model = dac_model
         self.use_sliding_window = use_sliding_window
+        self.allow_empty_prompts = allow_empty_prompts
         
         # Find all audio files
         audio_extensions = ['.mp3', '.wav', '.flac', '.m4a', '.ogg']
@@ -35,16 +45,20 @@ class MusicDataset(Dataset):
         self.valid_files = []
         skipped_missing = 0
         skipped_tags = 0
+        allowed_empty = 0
 
         for audio_file in self.audio_files:
             prompt_file = self.prompts_folder / f"{audio_file.stem}_prompt.txt"
             
             if not prompt_file.exists():
+                if allow_empty_prompts:
+                    allowed_empty += 1
+                    self.valid_files.append(audio_file)
+                    continue
                 if ignore_missing_prompts:
                     skipped_missing += 1
                     continue
-                else:
-                    raise FileNotFoundError(f"Missing prompt file: {prompt_file}")
+                raise FileNotFoundError(f"Missing prompt file: {prompt_file}")
             
             # Check for skip tags if provided
             if skip_tags:
@@ -71,7 +85,10 @@ class MusicDataset(Dataset):
         if not self.valid_files:
             raise ValueError(f"No valid audio-prompt pairs found in {self.audio_folder}. Skipped {skipped_missing} missing, {skipped_tags} by tags.")
         
-        print(f"Found {len(self.valid_files)} audio-prompt pairs. Skipped: {skipped_missing} missing prompts, {skipped_tags} filtered by tags.")
+        if allow_empty_prompts and allowed_empty > 0:
+            print(f"Found {len(self.valid_files)} audio files. Using empty prompts for {allowed_empty}. Skipped: {skipped_missing} missing prompts, {skipped_tags} filtered by tags.")
+        else:
+            print(f"Found {len(self.valid_files)} audio-prompt pairs. Skipped: {skipped_missing} missing prompts, {skipped_tags} filtered by tags.")
 
     def __len__(self) -> int:
         return len(self.valid_files)
@@ -99,8 +116,13 @@ class MusicDataset(Dataset):
         prompt_file = self.prompts_folder / f"{audio_file.stem}_prompt.txt"
         
         # Load text prompt
-        with open(prompt_file, 'r', encoding='utf-8') as f:
-            text = f.read().strip()
+        if prompt_file.exists():
+            with open(prompt_file, 'r', encoding='utf-8') as f:
+                text = f.read().strip()
+        else:
+            if not self.allow_empty_prompts:
+                raise FileNotFoundError(f"Missing prompt file: {prompt_file}")
+            text = ""
         
         # Load and process audio
         waveform, sr = torchaudio.load(audio_file)

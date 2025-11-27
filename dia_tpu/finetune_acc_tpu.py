@@ -1155,12 +1155,19 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
     # Scale loss for gradient accumulation
     loss = loss / train_cfg.grad_accum_steps
 
-    # Backward pass
-    accelerator.backward(loss)
+    # Backward pass - use pure PyTorch on TPU to avoid Accelerate state changes
+    if HAS_XLA:
+        loss.backward()
+    else:
+        accelerator.backward(loss)
     
     # Manual gradient accumulation: only step optimizer every grad_accum_steps
     if (step + 1) % train_cfg.grad_accum_steps == 0:
-        accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        # Use torch.nn.utils.clip_grad_norm_ directly for TPU
+        if HAS_XLA:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        else:
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
         opt.step()
         sched.step()
         opt.zero_grad()

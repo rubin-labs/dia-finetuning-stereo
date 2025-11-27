@@ -324,6 +324,7 @@ class TrainConfig:
     output_dir: Path = None
     no_decay_embed: bool = False
     split_ratio: float = 0.997
+    eval_step: int | None = None
 
 
 def load_train_config(config_path: Path) -> dict:
@@ -401,7 +402,7 @@ def get_args() -> argparse.Namespace:
                         help="Output directory for checkpoints.")
     parser.add_argument("--seed", type=int, default=cfg_defaults.get('seed', 42),
                         help="Random seed for reproducibility.")
-    parser.add_argument("--half", action="store_true", help="load model in fp16")
+    parser.add_argument("--half", action="store_true", help="enable bf16 mixed precision (TPU-safe)")
     parser.add_argument("--compile", action="store_true", help="torch compile model")
     parser.add_argument("--wandb_project", type=str, default="dia-music-finetuning",
                         help="Weights & Biases project name.")
@@ -438,8 +439,8 @@ def get_args() -> argparse.Namespace:
                         help="Fraction of unconditional training steps.")
     parser.add_argument("--split_ratio", type=float, default=cfg_defaults.get('split_ratio', 0.997),
                         help="Train/val split ratio (default: 0.997)")
-    parser.add_argument("--eval_step", type=int, default=cfg_defaults.get('eval_step', 200),
-                        help="Run evaluation every N steps (default: 200).")
+    parser.add_argument("--eval_step", type=int, default=cfg_defaults.get('eval_step', 0),
+                        help="Run evaluation every N steps (set <=0 to disable).")
     parser.add_argument("--demo_every", type=int, default=cfg_defaults.get('demo_every', 2000),
                         help="Generate demo audio every N steps (default: 2000).")
     parser.add_argument("--eval_every_epochs", type=int, default=cfg_defaults.get('eval_every_epochs'),
@@ -485,6 +486,8 @@ def get_args() -> argparse.Namespace:
         args.eval_every_epochs = None
     if args.demo_every_epochs is not None and args.demo_every_epochs <= 0:
         args.demo_every_epochs = None
+    if args.eval_step is not None and args.eval_step <= 0:
+        args.eval_step = None
     
     return args
 
@@ -650,7 +653,7 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
 
 
 
-def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
+def setup_optimizer(model, train_cfg):
     norm_types = [
         torch.nn.LayerNorm,
         torch.nn.GroupNorm,
@@ -695,20 +698,16 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
         weight_decay=0.0, # Weight decay handled in param_groups
         betas=(0.9, 0.999)
     )
-    try:
-        steps_per_epoch = len(train_loader)
-    except TypeError:
-        if hasattr(train_loader, 'steps_per_epoch'):
-            steps_per_epoch = train_loader.steps_per_epoch
-        else:
-            raise RuntimeError("Cannot determine steps_per_epoch for streaming loader")
+    return opt
+
+
+def setup_scheduler(opt, train_cfg, steps_per_epoch: int):
     total_training_steps = steps_per_epoch * train_cfg.epochs
-    sched = get_scheduler(
+    return get_scheduler(
         'cosine', opt,
         num_warmup_steps=train_cfg.warmup_steps // train_cfg.grad_accum_steps,
         num_training_steps=total_training_steps // train_cfg.grad_accum_steps
     )
-    return opt, sched
 
 
 
@@ -738,49 +737,50 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: A
                 # but typically eval is fine in fp32 or same dtype as model.
                 # Assuming model is already on device and correct dtype.
                 
-                logits = model(
-                    src_BxS=eb['src_tokens'],
-                    tgt_BxTxC=eb['tgt_tokens'],
-                    src_positions=eb['src_positions'],
-                    tgt_positions=eb['tgt_positions'],
-                    enc_self_attn_mask=eb['enc_self_attn_mask'],
-                    dec_self_attn_mask=eb['dec_self_attn_mask'],
-                    dec_cross_attn_mask=eb['dec_cross_attn_mask'],
-                    enable_dropout=False,
-                )
-                
-                # Truncate logits if needed (usually model output matches target length, but let's check)
-                # Dia model usually outputs (B, T, C, V).
-                # On TPU, we must avoid dynamic slicing. We use the full fixed length and rely on masking.
-                
-                logits = logits[:, :-1]
-                target = eb['tgt_tokens'][:, 1:, :]
-                
-                B_e, T_e, C_e = target.shape
-                V_e = logits.size(-1)
-
-                loss_e = 0.0
-                # Custom weighting for eval as well to match training objective
-                weights_e = []
-                num_groups = C_e // 9
-                if num_groups > 0:
-                    for _ in range(num_groups):
-                        weights_e.extend(CODEBOOK_WEIGHTS)
-                else:
-                    weights_e = [1.0] * C_e
-                
-                # For TPU: Only use audio_token_mask, don't use tgt_lens for masking
-                audio_token_mask_e = (target >= 0) & (target <= 1023)
-                pad_val_e = dia_cfg.data.audio_pad_value
-                target_masked = torch.where(audio_token_mask_e, target, torch.full_like(target, pad_val_e))
-                
-                for c, w in enumerate(weights_e):
-                    lc = logits[:, :, c, :].reshape(-1, V_e)
-                    tc = target_masked[:, :, c].reshape(-1)
-                    loss_e += w * F.cross_entropy(
-                        lc, tc, ignore_index=pad_val_e
+                with accelerator.autocast():
+                    logits = model(
+                        src_BxS=eb['src_tokens'],
+                        tgt_BxTxC=eb['tgt_tokens'],
+                        src_positions=eb['src_positions'],
+                        tgt_positions=eb['tgt_positions'],
+                        enc_self_attn_mask=eb['enc_self_attn_mask'],
+                        dec_self_attn_mask=eb['dec_self_attn_mask'],
+                        dec_cross_attn_mask=eb['dec_cross_attn_mask'],
+                        enable_dropout=False,
                     )
-                loss_e = loss_e / sum(weights_e)
+                    
+                    # Truncate logits if needed (usually model output matches target length, but let's check)
+                    # Dia model usually outputs (B, T, C, V).
+                    # On TPU, we must avoid dynamic slicing. We use the full fixed length and rely on masking.
+                    
+                    logits = logits[:, :-1]
+                    target = eb['tgt_tokens'][:, 1:, :]
+                    
+                    B_e, T_e, C_e = target.shape
+                    V_e = logits.size(-1)
+
+                    loss_e = 0.0
+                    # Custom weighting for eval as well to match training objective
+                    weights_e = []
+                    num_groups = C_e // 9
+                    if num_groups > 0:
+                        for _ in range(num_groups):
+                            weights_e.extend(CODEBOOK_WEIGHTS)
+                    else:
+                        weights_e = [1.0] * C_e
+                    
+                    # For TPU: Only use audio_token_mask, don't use tgt_lens for masking
+                    audio_token_mask_e = (target >= 0) & (target <= 1023)
+                    pad_val_e = dia_cfg.data.audio_pad_value
+                    target_masked = torch.where(audio_token_mask_e, target, torch.full_like(target, pad_val_e))
+                    
+                    for c, w in enumerate(weights_e):
+                        lc = logits[:, :, c, :].reshape(-1, V_e)
+                        tc = target_masked[:, :, c].reshape(-1)
+                        loss_e += w * F.cross_entropy(
+                            lc, tc, ignore_index=pad_val_e
+                        )
+                    loss_e = loss_e / sum(weights_e)
 
                 eval_losses.append(loss_e.item()) # Append float
 
@@ -813,6 +813,9 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: A
         return should_stop
 
     # Only main process does audio generation to avoid conflicts
+    if accelerator.is_main_process:
+        Path(EVAL_AUDIO_DIR).mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         logger.info(f"Starting eval demo generation at step {global_step}")
         # Unwrap model for generation (removes DDP wrapper)
@@ -968,7 +971,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     use_sliding_window = args.use_sliding_window
     # Note: setup_loaders now returns a standard DataLoader; Accelerator wraps it later
     train_loader, val_loader = setup_loaders(dataset, dia_cfg, train_cfg, use_sliding_window)
-    opt, sched = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
+    opt = setup_optimizer(model, train_cfg)
 
     # Cache lengths before Accelerator potentially shards loaders
     pre_steps_per_epoch = getattr(train_loader, 'steps_per_epoch', None)
@@ -1002,12 +1005,12 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     # Prepare validation loader as well if it exists
     if shard_dataloaders:
         if val_loader:
-            model, opt, train_loader, val_loader, sched = accelerator.prepare(
-                model, opt, train_loader, val_loader, sched
+            model, opt, train_loader, val_loader = accelerator.prepare(
+                model, opt, train_loader, val_loader
             )
         else:
-            model, opt, train_loader, sched = accelerator.prepare(
-                model, opt, train_loader, sched
+            model, opt, train_loader = accelerator.prepare(
+                model, opt, train_loader
             )
         use_xla_native = False
     else:
@@ -1057,6 +1060,13 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             f"Training dataloader is empty (steps_per_epoch={steps_per_epoch}, dataset_len={dataset_len}). "
             "Check input paths/filters; TPU runs cannot proceed without batches."
         )
+    # Keep an explicit attribute for downstream logging regardless of sharding mode
+    try:
+        train_loader.steps_per_epoch = steps_per_epoch
+    except Exception:
+        pass
+
+    sched = setup_scheduler(opt, train_cfg, steps_per_epoch)
 
     stop_training = False
     for epoch in range(train_cfg.epochs):
@@ -1115,7 +1125,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 }, step=global_step)
 
             # evaluation during epoch (only if epoch-based eval is not requested)
-            if args.eval_every_epochs is None and global_step > 0 and global_step % train_cfg.eval_step == 0:
+            if args.eval_every_epochs is None and train_cfg.eval_step and global_step > 0 and global_step % train_cfg.eval_step == 0:
                 # Determine if we should generate demos (respecting demo_after_epoch)
                 demo_interval = args.demo_every if args.demo_every is not None else train_cfg.eval_step
                 past_demo_threshold = (epoch + 1) > args.demo_after_epoch
@@ -1265,53 +1275,54 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
 
     # Manual gradient accumulation (like original Nari Labs script)
     # Don't use accelerator.accumulate() - it causes graph fragmentation on TPU
-    logits = model(
-        src_BxS=batch['src_tokens'],
-        tgt_BxTxC=batch['tgt_tokens'],
-        src_positions=batch['src_positions'],
-        tgt_positions=batch['tgt_positions'],
-        enc_self_attn_mask=batch['enc_self_attn_mask'],
-        dec_self_attn_mask=batch['dec_self_attn_mask'],
-        dec_cross_attn_mask=batch['dec_cross_attn_mask'],
-        enable_dropout=False,
-    )
-    # Note: tgt_lens not used for TPU - we rely on audio_token_mask and ignore_index
-    
-    logits = logits[:, :-1]
-    target = batch['tgt_tokens'][:, 1:, :]
-    
-    B, Tm1, C = target.shape
-    pad_val = dia_cfg.data.audio_pad_value
-    
-    # For TPU: Use fixed-shape operations only.
-    # Don't use tgt_lens for masking - let ignore_index handle padding.
-    # The audio_token_mask will exclude special tokens (BOS, EOS, PAD).
-    
-    channel_weights = []
-    num_groups = C // 9
-    if num_groups > 0:
-        for _ in range(num_groups):
-            channel_weights.extend(CODEBOOK_WEIGHTS)
-    else:
-        channel_weights = [1.0] * C
-
-    loss_c = 0.0
-    _, _, _, V = logits.size()
-    
-    # Only compute loss on valid audio tokens (0-1023), exclude special tokens
-    audio_token_mask = (target >= 0) & (target <= 1023)
-    
-    # For TPU: Set non-audio tokens to pad_val so cross_entropy ignores them
-    target_masked = torch.where(audio_token_mask, target, torch.full_like(target, pad_val))
-    
-    for c, w in enumerate(channel_weights):
-        lc = logits[:, :, c, :].reshape(-1, V)
-        tc = target_masked[:, :, c].reshape(-1)
-        loss_c += w * F.cross_entropy(
-            lc, tc,
-            ignore_index=pad_val
+    with accelerator.autocast():
+        logits = model(
+            src_BxS=batch['src_tokens'],
+            tgt_BxTxC=batch['tgt_tokens'],
+            src_positions=batch['src_positions'],
+            tgt_positions=batch['tgt_positions'],
+            enc_self_attn_mask=batch['enc_self_attn_mask'],
+            dec_self_attn_mask=batch['dec_self_attn_mask'],
+            dec_cross_attn_mask=batch['dec_cross_attn_mask'],
+            enable_dropout=False,
         )
-    loss = loss_c / sum(channel_weights)
+        # Note: tgt_lens not used for TPU - we rely on audio_token_mask and ignore_index
+        
+        logits = logits[:, :-1]
+        target = batch['tgt_tokens'][:, 1:, :]
+        
+        B, Tm1, C = target.shape
+        pad_val = dia_cfg.data.audio_pad_value
+        
+        # For TPU: Use fixed-shape operations only.
+        # Don't use tgt_lens for masking - let ignore_index handle padding.
+        # The audio_token_mask will exclude special tokens (BOS, EOS, PAD).
+        
+        channel_weights = []
+        num_groups = C // 9
+        if num_groups > 0:
+            for _ in range(num_groups):
+                channel_weights.extend(CODEBOOK_WEIGHTS)
+        else:
+            channel_weights = [1.0] * C
+
+        loss_c = 0.0
+        _, _, _, V = logits.size()
+        
+        # Only compute loss on valid audio tokens (0-1023), exclude special tokens
+        audio_token_mask = (target >= 0) & (target <= 1023)
+        
+        # For TPU: Set non-audio tokens to pad_val so cross_entropy ignores them
+        target_masked = torch.where(audio_token_mask, target, torch.full_like(target, pad_val))
+        
+        for c, w in enumerate(channel_weights):
+            lc = logits[:, :, c, :].reshape(-1, V)
+            tc = target_masked[:, :, c].reshape(-1)
+            loss_c += w * F.cross_entropy(
+                lc, tc,
+                ignore_index=pad_val
+            )
+        loss = loss_c / sum(channel_weights)
 
     # Scale loss for gradient accumulation
     loss = loss / train_cfg.grad_accum_steps
@@ -1385,7 +1396,9 @@ def run_training(args):
         
     # Load DAC model
     # We need it on the correct device
-    dac_model = dac.DAC.load(dac.utils.download()).eval()
+    with accelerator.main_process_first():
+        dac_ckpt = dac.utils.download()
+    dac_model = dac.DAC.load(dac_ckpt).eval()
     removed_dac_wn = strip_weight_norms(dac_model)
     dac_model = dac_model.to(accelerator.device)
     if accelerator.is_main_process and removed_dac_wn:
@@ -1426,6 +1439,7 @@ def run_training(args):
         output_dir = args.output_dir,
         seed = args.seed,
         no_decay_embed = args.no_decay_embed,
+        eval_step = args.eval_step,
     )
 
     model = DiaModel(dia_cfg)
@@ -1508,16 +1522,6 @@ def run_training(args):
     if accelerator.is_main_process and removed_model_wn:
         logger.info("Removed %d weight_norm wrappers from Dia model for XLA compatibility", removed_model_wn)
 
-    # Ensure all parameters have consistent dtype
-    # Accelerate usually handles mixed precision, but if we force half here:
-    if args.half:
-        # This might conflict with Accelerate's mixed_precision="bf16" or "fp16"
-        # Usually better to let Accelerate handle it, but if the user wants storage in half:
-        model = model.half()
-        for param in model.parameters():
-            if param.dtype != torch.float16:
-                param.data = param.data.half()
-    
     # Optionally freeze encoder
     try:
         if train_cfg.unconditional_frac >= 0.9:

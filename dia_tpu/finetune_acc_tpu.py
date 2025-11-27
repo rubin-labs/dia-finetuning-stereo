@@ -24,6 +24,7 @@ from tqdm import tqdm
 import wandb
 import time
 import torchaudio
+import soundfile as sf
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -37,6 +38,15 @@ except ImportError:
 
 import dac
 
+# Add path to parent for dia imports
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from dia.audio import build_revert_indices, revert_audio_delay
+
+
+# Eval demo settings
+EVAL_AUDIO_DIR = "./audio_demos"
+EVAL_SAMPLE_RATE = 44100
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,7 +107,7 @@ class TrainConfig:
     weight_decay: float = 0.1
     warmup_steps: int = 500
     unconditional_frac: float = 0.15
-    save_step: int = 2000
+    save_step: int = 100
     seed: int = 786
     runs_dir: Path = Path("runs")
     run_name: str = "audio_finetune_scratch"
@@ -456,6 +466,236 @@ def apply_audio_delay(
     return torch.where(mask_bos, bos_tensor, torch.where(mask_pad, pad_tensor, gathered_BxTxC))
 
 
+def decode_dac(dac_model, codebook: torch.Tensor) -> torch.Tensor:
+    """Decode DAC codes to audio waveform."""
+    device = next(dac_model.parameters()).device
+    codebook = codebook.to(device)
+    z, _, _ = dac_model.quantizer.from_codes(codebook)
+    audio = dac_model.decode(z)
+    return audio.squeeze(0).squeeze(0)  # Remove batch and channel dims
+
+
+def codebook_to_audio_simple(generated_codes: torch.Tensor, dac_model, delay_pattern: list[int], C: int = 18):
+    """Process codebooks to generate audio. Supports mono (9) and stereo (18)."""
+    # Remove BOS token if present
+    if generated_codes.dim() == 2:
+        # Shape: (T, C) -> add batch dim
+        generated_codes = generated_codes.unsqueeze(0)
+    
+    # generated_codes shape: (B, T, C)
+    B, T_len, num_channels = generated_codes.shape
+    
+    # Remove first token (BOS)
+    generated_codes = generated_codes[:, 1:]
+    seq_length = generated_codes.shape[1]
+    
+    if seq_length < 2:
+        return None
+    
+    # Build revert indices for the delay pattern
+    t_idx_BxTxC, indices_BTCx3 = build_revert_indices(B=B, T=seq_length, C=num_channels, delay_pattern=delay_pattern)
+    
+    # Revert the delay pattern
+    reverted_codebook = revert_audio_delay(
+        audio_BxTxC=generated_codes,
+        pad_value=0,
+        precomp=(t_idx_BxTxC, indices_BTCx3),
+        T=seq_length,
+    )
+    
+    # Trim end (delay artifacts)
+    trim_amount = min(30, reverted_codebook.shape[1] - 1)
+    if trim_amount > 0:
+        reverted_codebook = reverted_codebook[:, :-trim_amount, :]
+    
+    # Shape: [B, T, C] -> [B, C, T] for DAC
+    codebook = reverted_codebook.permute(0, 2, 1)
+    
+    # Clamp to valid range
+    codebook = torch.clamp(codebook, 0, 1023)
+    
+    total_codebooks = codebook.shape[1]
+    if total_codebooks == 9:
+        return decode_dac(dac_model, codebook)
+    elif total_codebooks == 18:
+        left_codes = codebook[:, :9, :]
+        right_codes = codebook[:, 9:, :]
+        left_audio = decode_dac(dac_model, left_codes)
+        right_audio = decode_dac(dac_model, right_codes)
+        return torch.stack([left_audio, right_audio], dim=0)
+    else:
+        raise ValueError(f"Unsupported codebook channels {total_codebooks}; expected 9 or 18.")
+
+
+@torch.inference_mode()
+def generate_audio_simple(
+    model: SimpleAudioModel,
+    data_cfg: DataSettings,
+    device: torch.device,
+    text: str = "",
+    temperature: float = 0.0,
+    max_steps: int | None = None,
+) -> torch.Tensor:
+    """
+    Simple autoregressive generation for SimpleAudioModel.
+    Returns generated codes of shape (T, C).
+    """
+    model.eval()
+    
+    max_len = max_steps if max_steps else data_cfg.audio_length
+    C = data_cfg.channels
+    bos_val = data_cfg.audio_bos_value
+    eos_val = data_cfg.audio_eos_value
+    pad_val = data_cfg.audio_pad_value
+    
+    # Encode text prompt
+    max_text = data_cfg.text_length
+    pad_tok = data_cfg.text_pad_value
+    b_full = text.encode('utf-8')
+    bts = b_full[:max_text]
+    arr = list(bts) + [pad_tok] * (max_text - len(bts))
+    src = torch.tensor(arr, dtype=torch.long, device=device).unsqueeze(0)  # (1, S)
+    src_pos = torch.arange(max_text, device=device).unsqueeze(0)
+    src_pad = src.ne(pad_tok)
+    enc_self_attn_mask = (src_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
+    
+    # Start with BOS token for all channels
+    generated = torch.full((1, 1, C), bos_val, dtype=torch.long, device=device)
+    
+    for step in range(max_len):
+        T_cur = generated.shape[1]
+        tgt_pos = torch.arange(T_cur, device=device).unsqueeze(0)
+        tgt_pad = generated.ne(pad_val).any(-1)
+        causal = torch.tril(torch.ones((T_cur, T_cur), dtype=torch.bool, device=device))
+        dec_self_attn_mask = (tgt_pad.unsqueeze(2) & tgt_pad.unsqueeze(1) & causal).unsqueeze(1)
+        dec_cross_attn_mask = (tgt_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
+        
+        logits = model(
+            src_BxS=src,
+            tgt_BxTxC=generated,
+            src_positions=src_pos,
+            tgt_positions=tgt_pos,
+            enc_self_attn_mask=enc_self_attn_mask,
+            dec_self_attn_mask=dec_self_attn_mask,
+            dec_cross_attn_mask=dec_cross_attn_mask,
+            enable_dropout=False,
+        )  # (B, T, C, V)
+        
+        # Get logits for last position
+        last_logits = logits[:, -1, :, :]  # (B, C, V)
+        
+        # Sample next tokens
+        if temperature == 0.0:
+            next_tokens = torch.argmax(last_logits, dim=-1)  # (B, C)
+        else:
+            probs = F.softmax(last_logits / temperature, dim=-1)
+            next_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(1, C)
+        
+        # Check for EOS on first codebook
+        if (next_tokens[0, 0] == eos_val).item():
+            break
+        
+        # Append to generated
+        generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
+    
+    return generated.squeeze(0)  # (T, C)
+
+
+def eval_demo_step(
+    model,
+    data_cfg: DataSettings,
+    dac_model,
+    global_step: int,
+    device: torch.device,
+    accelerator: Accelerator,
+    train_cfg: TrainConfig,
+):
+    """
+    Generate 3 eval demos with temp=0, cfg=0, prompt="" for overfitting testing.
+    """
+    if not accelerator.is_main_process:
+        return
+    
+    logger.info(f"Starting eval demo generation at step {global_step}")
+    
+    # Create audio demo directory
+    audio_dir = Path(EVAL_AUDIO_DIR)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Unwrap model if needed
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.eval()
+    
+    audio_samples = {}
+    seeds = [train_cfg.seed, train_cfg.seed + 1, train_cfg.seed + 2]
+    
+    try:
+        for i, s in enumerate(seeds):
+            try:
+                seed_everything(s)
+                logger.info(f"Generating demo {i+1}/3 (seed={s}, temp=0, cfg=0, prompt='')")
+                
+                # Generate audio codes
+                generated_codes = generate_audio_simple(
+                    model=unwrapped_model,
+                    data_cfg=data_cfg,
+                    device=device,
+                    text="",
+                    temperature=0.0,
+                    max_steps=data_cfg.audio_length,
+                )
+                
+                if generated_codes is None or generated_codes.shape[0] < 2:
+                    logger.warning(f"Demo {i+1}: generation too short, skipping")
+                    continue
+                
+                # Decode to audio
+                audio = codebook_to_audio_simple(
+                    generated_codes,
+                    dac_model,
+                    data_cfg.delay_pattern,
+                    C=data_cfg.channels,
+                )
+                
+                if audio is None:
+                    logger.warning(f"Demo {i+1}: decoding failed, skipping")
+                    continue
+                
+                # Convert to numpy
+                arr = audio.detach().cpu().numpy()
+                if arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
+                    arr = arr.T  # (C, T) -> (T, C) for soundfile
+                
+                # Save audio file
+                audio_filename = f"step_{global_step}_demo{i+1}_seed{s}.wav"
+                audio_path = audio_dir / audio_filename
+                sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
+                logger.info(f"Saved demo audio: {audio_path}")
+                
+                # Add to wandb
+                audio_samples[f"eval_audio/demo{i+1}_seed{s}"] = wandb.Audio(
+                    arr, sample_rate=EVAL_SAMPLE_RATE,
+                    caption=f"temp=0, seed={s}"
+                )
+                
+            except Exception as e:
+                logger.exception(f"Error generating demo {i+1} (seed={s}): {e}")
+                continue
+        
+        # Log all audio samples to wandb
+        if audio_samples:
+            logger.info(f"Logging {len(audio_samples)} audio samples to wandb")
+            wandb.log(audio_samples, step=global_step)
+        else:
+            logger.warning("No audio samples generated for logging")
+            
+    except Exception as e:
+        logger.exception(f"Eval demo generation failed: {e}")
+    finally:
+        unwrapped_model.train()
+        logger.info(f"Completed eval demo generation at step {global_step}")
+
+
 def get_args() -> argparse.Namespace:
     train_defaults = TrainConfig()
     data_defaults = DataSettings()
@@ -525,6 +765,12 @@ def get_args() -> argparse.Namespace:
         type=str,
         default=",".join(str(v) for v in data_defaults.delay_pattern),
         help="Comma-separated per-channel delays (length should match --channels).",
+    )
+    parser.add_argument(
+        "--eval_every_step",
+        type=int,
+        default=0,
+        help="Generate eval demos every N steps. 0 = disabled.",
     )
     
     args = parser.parse_args()
@@ -743,7 +989,7 @@ def setup_scheduler(opt, train_cfg, steps_per_epoch: int):
 
 
 
-def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, accelerator: Accelerator):
+def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, accelerator: Accelerator, dac_model=None):
     
     if accelerator.is_main_process:
         train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -907,6 +1153,23 @@ def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, 
                     'train_loss': loss,
                     'learning_rate': current_lr,
                 }, step=global_step)
+
+            # Eval demo generation
+            eval_every = getattr(args, 'eval_every_step', 0)
+            if eval_every > 0 and global_step > 0 and global_step % eval_every == 0 and dac_model is not None:
+                accelerator.wait_for_everyone()
+                model.eval()
+                with torch.no_grad():
+                    eval_demo_step(
+                        model=model,
+                        data_cfg=data_cfg,
+                        dac_model=dac_model,
+                        global_step=global_step,
+                        device=accelerator.device,
+                        accelerator=accelerator,
+                        train_cfg=train_cfg,
+                    )
+                model.train()
 
             should_save = train_cfg.save_step > 0 and global_step > 0 and (global_step % train_cfg.save_step == 0)
             if should_save:
@@ -1075,8 +1338,21 @@ def run_training(args):
     use_sliding_window = not args.no_sliding_window
 
     dac_model = None
+    need_dac_for_eval = args.eval_every_step > 0
+    
     if args.preencoded_dir:
         dataset = PreEncodedDACDataset(args.preencoded_dir, data_cfg, use_sliding_window=use_sliding_window)
+        # Load DAC for eval demos even with pre-encoded data
+        if need_dac_for_eval:
+            if accelerator.is_main_process:
+                print("Loading DAC model for eval demos...")
+            with accelerator.main_process_first():
+                dac_ckpt = dac.utils.download()
+            dac_model = dac.DAC.load(dac_ckpt).eval()
+            removed_dac_wn = strip_weight_norms(dac_model)
+            dac_model = dac_model.to(accelerator.device)
+            if accelerator.is_main_process and removed_dac_wn:
+                logger.info("Removed %d weight_norm wrappers from DAC model for XLA compatibility", removed_dac_wn)
     elif args.audio_folder:
         if accelerator.is_main_process:
             print("Loading DAC model...")
@@ -1122,7 +1398,7 @@ def run_training(args):
     accelerator.wait_for_everyone()
     
     # Launch training
-    train(model, data_cfg, dataset, train_cfg, args, accelerator)
+    train(model, data_cfg, dataset, train_cfg, args, accelerator, dac_model=dac_model)
 
 
 def main():

@@ -631,6 +631,8 @@ def eval_demo_step(
         return
     
     logger.info(f"Starting eval demo generation at step {global_step}")
+    import sys
+    sys.stdout.flush()
     
     # Create audio demo directory
     audio_dir = Path(EVAL_AUDIO_DIR)
@@ -1180,8 +1182,15 @@ def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, 
 
             # Eval demo generation
             eval_every = getattr(args, 'eval_every_step', 0)
+            # Use print() to bypass logging buffering - this will show immediately
+            if eval_every > 0:
+                print(f"[DEBUG PRINT] Checking eval: eval_every={eval_every}, global_step={global_step}, modulo={global_step % eval_every if global_step > 0 else 'N/A'}, dac={'yes' if dac_model is not None else 'no'}", flush=True)
+            
             if eval_every > 0 and global_step > 0 and global_step % eval_every == 0 and dac_model is not None:
+                print(f"[DEBUG PRINT] EVAL TRIGGERED! global_step={global_step}", flush=True)
                 logger.info(f"[DEBUG] Eval trigger: eval_every={eval_every}, global_step={global_step}, dac_model={'present' if dac_model is not None else 'None'}")
+                import sys
+                sys.stdout.flush()
                 logger.info(f"[DEBUG] Waiting for all processes...")
                 accelerator.wait_for_everyone()
                 logger.info(f"[DEBUG] Setting model to eval mode...")

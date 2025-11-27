@@ -40,6 +40,7 @@ from accelerate.utils import set_seed
 # TPU-specific imports
 try:
     import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
     HAS_XLA = True
 except ImportError:
     HAS_XLA = False
@@ -889,6 +890,12 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             model, opt, train_loader, sched
         )
 
+    # Wrap DataLoaders with TPU-specific parallel loader for efficient data transfer
+    if HAS_XLA:
+        train_loader = pl.MpDeviceLoader(train_loader, accelerator.device)
+        if val_loader:
+            val_loader = pl.MpDeviceLoader(val_loader, accelerator.device)
+
     model.train()
 
     steps_per_epoch = getattr(train_loader, 'steps_per_epoch', None)
@@ -1181,10 +1188,12 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         opt.zero_grad()
         
         # CRITICAL for TPU: mark_step tells XLA to execute the accumulated graph
+        # This must be called BEFORE .item() to avoid blocking
         if HAS_XLA:
             xm.mark_step()
 
     # Just return the loss item (it's local) - multiply back to report actual batch loss
+    # Note: .item() forces sync which is slow but needed for logging
     return loss.item() * train_cfg.grad_accum_steps
 
 

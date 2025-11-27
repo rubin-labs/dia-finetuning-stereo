@@ -427,7 +427,8 @@ def collate_fn(batch, config: DiaConfig, device: torch.device, use_sliding_windo
     src_pad = src.ne(pad_tok)
     enc_self_attn_mask = (src_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
 
-    batch_max = max(e.size(0) for e in encodings)
+    # Force fixed size for TPU to avoid recompilation
+    batch_max = config.data.audio_length
     
     padded_encodings = []
     for e in encodings:

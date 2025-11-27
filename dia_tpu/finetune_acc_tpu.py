@@ -40,7 +40,6 @@ from accelerate.utils import set_seed
 # TPU-specific imports
 try:
     import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.parallel_loader as pl
     HAS_XLA = True
 except ImportError:
     HAS_XLA = False
@@ -649,9 +648,6 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: A
                 # Dia model usually outputs (B, T, C, V).
                 # On TPU, we must avoid dynamic slicing. We use the full fixed length and rely on masking.
                 
-                lens = eb['tgt_lens']
-                # max_L = int(lens.max().item())  # Removed dynamic slicing
-                
                 logits = logits[:, :-1]
                 target = eb['tgt_tokens'][:, 1:, :]
                 
@@ -668,20 +664,10 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: A
                 else:
                     weights_e = [1.0] * C_e
                 
-                # CRITICAL: Only compute loss on actual audio tokens (0-1023)
-                audio_token_mask_e = (target >= 0) & (target <= 1023)  # (B, T, C)
-                
-                # Expand mask based on lengths
-                time_idx = torch.arange(T_e, device=lens.device).unsqueeze(0)
-                valid_time = time_idx < (lens.unsqueeze(1) - 1)
-                mask = valid_time.unsqueeze(-1).expand(-1, -1, C_e)
-                
-                # For TPU: avoid boolean indexing which creates dynamic shapes.
-                # Set invalid positions to pad_val and use cross_entropy's ignore_index.
+                # For TPU: Only use audio_token_mask, don't use tgt_lens for masking
+                audio_token_mask_e = (target >= 0) & (target <= 1023)
                 pad_val_e = dia_cfg.data.audio_pad_value
-                target_masked = target.clone()
-                target_masked = torch.where(mask, target_masked, torch.full_like(target_masked, pad_val_e))
-                target_masked = torch.where(audio_token_mask_e, target_masked, torch.full_like(target_masked, pad_val_e))
+                target_masked = torch.where(audio_token_mask_e, target, torch.full_like(target, pad_val_e))
                 
                 for c, w in enumerate(weights_e):
                     lc = logits[:, :, c, :].reshape(-1, V_e)
@@ -890,11 +876,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             model, opt, train_loader, sched
         )
 
-    # Wrap DataLoaders with TPU-specific parallel loader for efficient data transfer
-    if HAS_XLA:
-        train_loader = pl.MpDeviceLoader(train_loader, accelerator.device)
-        if val_loader:
-            val_loader = pl.MpDeviceLoader(val_loader, accelerator.device)
+    # Note: Don't wrap with MpDeviceLoader when using Accelerate - they conflict
+    # Accelerate should handle TPU data loading internally
 
     model.train()
 
@@ -1119,17 +1102,17 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
             dec_cross_attn_mask=batch['dec_cross_attn_mask'],
             enable_dropout=False,
         )
-        lens = batch['tgt_lens']
-        # max_L = int(lens.max().item()) # Removed dynamic slicing for TPU
+        # Note: tgt_lens not used for TPU - we rely on audio_token_mask and ignore_index
         
         logits = logits[:, :-1]
         target = batch['tgt_tokens'][:, 1:, :]
         
         B, Tm1, C = target.shape
         pad_val = dia_cfg.data.audio_pad_value
-        time_idx = torch.arange(Tm1, device=lens.device).unsqueeze(0)
-        valid_time = time_idx < (lens.unsqueeze(1) - 1)
-        mask = valid_time.unsqueeze(-1).expand(-1, -1, C)
+        
+        # For TPU: Use fixed-shape operations only.
+        # Don't use tgt_lens for masking - let ignore_index handle padding.
+        # The audio_token_mask will exclude special tokens (BOS, EOS, PAD).
         
         channel_weights = []
         num_groups = C // 9
@@ -1142,16 +1125,11 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         loss_c = 0.0
         _, _, _, V = logits.size()
         
+        # Only compute loss on valid audio tokens (0-1023), exclude special tokens
         audio_token_mask = (target >= 0) & (target <= 1023)
         
-        # For TPU: avoid boolean indexing which creates dynamic shapes.
-        # Instead, set invalid positions to ignore_index and use cross_entropy's built-in masking.
-        # We create a modified target where invalid positions are set to pad_val (ignore_index).
-        target_masked = target.clone()
-        # Positions outside valid time range -> pad_val
-        target_masked = torch.where(mask, target_masked, torch.full_like(target_masked, pad_val))
-        # Positions that are not audio tokens (special tokens) -> pad_val
-        target_masked = torch.where(audio_token_mask, target_masked, torch.full_like(target_masked, pad_val))
+        # For TPU: Set non-audio tokens to pad_val so cross_entropy ignores them
+        target_masked = torch.where(audio_token_mask, target, torch.full_like(target, pad_val))
         
         for c, w in enumerate(channel_weights):
             lc = logits[:, :, c, :].reshape(-1, V)

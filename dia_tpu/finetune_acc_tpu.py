@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, random_split
 from transformers import get_scheduler
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.nn.utils import parametrize
 # import bitsandbytes as bnb # Removed for TPU compatibility
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
@@ -205,6 +206,29 @@ def compute_output_entropy(logits):
     
     # Mean entropy across all positions
     return entropy.mean().item()
+
+
+def strip_weight_norms(module: torch.nn.Module) -> int:
+    """
+    Remove weight_norm parametrizations so XLA doesn't fall back to CPU for
+    aten::_weight_norm_interface (unsupported op on TPU).
+    """
+    removed = 0
+    for m in module.modules():
+        if parametrize.is_parametrized(m) and "weight" in getattr(m, "parametrizations", {}):
+            try:
+                parametrize.remove_parametrizations(m, "weight", leave_parametrized=False)
+                removed += 1
+                continue
+            except Exception:
+                pass
+        if hasattr(m, "weight_g") or hasattr(m, "weight_orig"):
+            try:
+                torch.nn.utils.remove_weight_norm(m)
+                removed += 1
+            except ValueError:
+                pass
+    return removed
 
 
 def verify_dac_encoding(audio_path: Path, dac_model: dac.DAC, seconds: float = 1.0, target_sr: int = 44100):
@@ -1306,7 +1330,11 @@ def run_training(args):
         
     # Load DAC model
     # We need it on the correct device
-    dac_model = dac.DAC.load(dac.utils.download()).eval().to(accelerator.device)
+    dac_model = dac.DAC.load(dac.utils.download()).eval()
+    removed_dac_wn = strip_weight_norms(dac_model)
+    dac_model = dac_model.to(accelerator.device)
+    if accelerator.is_main_process and removed_dac_wn:
+        logger.info("Removed %d weight_norm wrappers from DAC model for XLA compatibility", removed_dac_wn)
 
     use_sliding_window = args.use_sliding_window
     if args.preencoded_dir:
@@ -1416,6 +1444,10 @@ def run_training(args):
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
         if accelerator.is_main_process:
             logger.info(f"Rank {accelerator.process_index} after checkpoint load RSS ~{rss_mb:.1f} MB (PID {os.getpid()})")
+
+    removed_model_wn = strip_weight_norms(model)
+    if accelerator.is_main_process and removed_model_wn:
+        logger.info("Removed %d weight_norm wrappers from Dia model for XLA compatibility", removed_model_wn)
 
     # Ensure all parameters have consistent dtype
     # Accelerate usually handles mixed precision, but if we force half here:

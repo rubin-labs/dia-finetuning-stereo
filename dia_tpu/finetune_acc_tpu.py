@@ -668,19 +668,19 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: A
                 valid_time = time_idx < (lens.unsqueeze(1) - 1)
                 mask = valid_time.unsqueeze(-1).expand(-1, -1, C_e)
                 
+                # For TPU: avoid boolean indexing which creates dynamic shapes.
+                # Set invalid positions to pad_val and use cross_entropy's ignore_index.
+                pad_val_e = dia_cfg.data.audio_pad_value
+                target_masked = target.clone()
+                target_masked = torch.where(mask, target_masked, torch.full_like(target_masked, pad_val_e))
+                target_masked = torch.where(audio_token_mask_e, target_masked, torch.full_like(target_masked, pad_val_e))
+                
                 for c, w in enumerate(weights_e):
                     lc = logits[:, :, c, :].reshape(-1, V_e)
-                    tc = target[:, :, c].reshape(-1)
-                    mc = mask[:, :, c].reshape(-1)
-                    audio_mc = audio_token_mask_e[:, :, c].reshape(-1)
-                    combined_mask = mc & audio_mc
-                    
-                    lc_valid = lc[combined_mask]
-                    tc_valid = tc[combined_mask]
-                    if tc_valid.numel() > 0:  # Only compute if we have valid tokens
-                        loss_e += w * F.cross_entropy(
-                            lc_valid, tc_valid, ignore_index=dia_cfg.data.audio_pad_value
-                        )
+                    tc = target_masked[:, :, c].reshape(-1)
+                    loss_e += w * F.cross_entropy(
+                        lc, tc, ignore_index=pad_val_e
+                    )
                 loss_e = loss_e / sum(weights_e)
 
                 eval_losses.append(loss_e.item()) # Append float
@@ -1130,19 +1130,22 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         
         audio_token_mask = (target >= 0) & (target <= 1023)
         
+        # For TPU: avoid boolean indexing which creates dynamic shapes.
+        # Instead, set invalid positions to ignore_index and use cross_entropy's built-in masking.
+        # We create a modified target where invalid positions are set to pad_val (ignore_index).
+        target_masked = target.clone()
+        # Positions outside valid time range -> pad_val
+        target_masked = torch.where(mask, target_masked, torch.full_like(target_masked, pad_val))
+        # Positions that are not audio tokens (special tokens) -> pad_val
+        target_masked = torch.where(audio_token_mask, target_masked, torch.full_like(target_masked, pad_val))
+        
         for c, w in enumerate(channel_weights):
             lc = logits[:, :, c, :].reshape(-1, V)
-            tc = target[:, :, c].reshape(-1)
-            mc = mask[:, :, c].reshape(-1)
-            audio_mc = audio_token_mask[:, :, c].reshape(-1)
-            combined_mask = mc & audio_mc
-            lc_valid = lc[combined_mask]
-            tc_valid = tc[combined_mask]
-            if tc_valid.numel() > 0:
-                loss_c += w * F.cross_entropy(
-                    lc_valid, tc_valid,
-                    ignore_index=pad_val
-                )
+            tc = target_masked[:, :, c].reshape(-1)
+            loss_c += w * F.cross_entropy(
+                lc, tc,
+                ignore_index=pad_val
+            )
         loss = loss_c / sum(channel_weights)
 
         # Compute output entropy every 50 steps (measures model confidence)

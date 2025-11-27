@@ -37,6 +37,13 @@ import soundfile as sf
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
+# TPU-specific imports
+try:
+    import torch_xla.core.xla_model as xm
+    HAS_XLA = True
+except ImportError:
+    HAS_XLA = False
+
 import dac
 from dia.config import DiaConfig
 from dia.layers import DiaModel
@@ -1172,6 +1179,10 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         opt.step()
         sched.step()
         opt.zero_grad()
+        
+        # CRITICAL for TPU: mark_step tells XLA to execute the accumulated graph
+        if HAS_XLA:
+            xm.mark_step()
 
     # Just return the loss item (it's local) - multiply back to report actual batch loss
     return loss.item() * train_cfg.grad_accum_steps

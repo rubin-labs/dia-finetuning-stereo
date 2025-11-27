@@ -275,6 +275,23 @@ def load_train_config(config_path: Path) -> dict:
         flat['tag_no_shuffle'] = cfg['flags'].get('tag_no_shuffle')
         flat['force_single_gpu'] = cfg['flags'].get('force_single_gpu')
         flat['use_sliding_window'] = cfg['flags'].get('use_sliding_window')
+        flat['require_prompts'] = cfg['flags'].get('require_prompts')
+        flat['no_decay_embed'] = cfg['flags'].get('no_decay_embed')
+        flat['stop_on_overfit'] = cfg['flags'].get('stop_on_overfit')
+    
+    if 'eval' in cfg:
+        flat['eval_step'] = cfg['eval'].get('eval_step')
+        flat['demo_every'] = cfg['eval'].get('demo_every')
+        flat['eval_every_epochs'] = cfg['eval'].get('eval_every_epochs')
+        flat['demo_every_epochs'] = cfg['eval'].get('demo_every_epochs')
+        flat['demo_after_epoch'] = cfg['eval'].get('demo_after_epoch')
+    
+    # Root level or training level seed
+    if 'seed' in cfg:
+        flat['seed'] = cfg['seed']
+    elif 'training' in cfg and 'seed' in cfg['training']:
+        flat['seed'] = cfg['training']['seed']
+        
     return {k: v for k, v in flat.items() if v is not None}
 
 
@@ -299,7 +316,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--run_name",  type=str,  default=cfg_defaults.get('run_name'))
     parser.add_argument("--output_dir",type=Path, default=cfg_defaults.get('output_dir'),
                         help="Output directory for checkpoints.")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=cfg_defaults.get('seed', 42),
                         help="Random seed for reproducibility.")
     parser.add_argument("--half", action="store_true", help="load model in fp16")
     parser.add_argument("--compile", action="store_true", help="torch compile model")
@@ -334,19 +351,31 @@ def get_args() -> argparse.Namespace:
                         help="Number of warmup steps.")
     parser.add_argument("--unconditional_frac", type=float, default=cfg_defaults.get('unconditional_frac'),
                         help="Fraction of unconditional training steps.")
+    parser.add_argument("--eval_step", type=int, default=cfg_defaults.get('eval_step', 200),
+                        help="Run evaluation every N steps (default: 200).")
+    parser.add_argument("--demo_every", type=int, default=cfg_defaults.get('demo_every', 2000),
+                        help="Generate demo audio every N steps (default: 2000).")
+    parser.add_argument("--eval_every_epochs", type=int, default=cfg_defaults.get('eval_every_epochs'),
+                        help="Run evaluation every N epochs (overrides eval_step).")
+    parser.add_argument("--demo_every_epochs", type=int, default=cfg_defaults.get('demo_every_epochs'),
+                        help="Generate demo audio every N epochs (overrides demo_every).")
     parser.add_argument("--save_every_epochs", type=int, default=None,
                         help="Save checkpoint at the end of every N epochs (overrides step-based save).")
     parser.add_argument("--save_after_epoch", type=int, default=cfg_defaults.get('save_after_epoch', 0),
                         help="Only start saving checkpoints after this epoch (default: 0, save from start).")
+    parser.add_argument("--demo_after_epoch", type=int, default=cfg_defaults.get('demo_after_epoch', 0),
+                        help="Only start generating demos after this epoch (default: 0, demo from start).")
     parser.add_argument("--early_stop_loss", type=float, default=None,
                         help="Early stop when training loss <= this value; saves final checkpoint then exits.")
+    parser.add_argument("--stop_on_overfit", action="store_true", default=cfg_defaults.get('stop_on_overfit', False),
+                        help="Stop training and generate demo when eval loss > train loss")
     
     parser.add_argument("--use_sliding_window", action="store_true", default=cfg_defaults.get('use_sliding_window', False),
                         help="Enable sliding window: random cropping for data augmentation (default: off for deterministic training)")
-    parser.add_argument("--no_decay_embed", action="store_true",
+    parser.add_argument("--no_decay_embed", action="store_true", default=cfg_defaults.get('no_decay_embed', False),
                         help="Exclude nn.Embedding parameters from weight decay")
     
-    parser.add_argument("--require_prompts", action="store_true",
+    parser.add_argument("--require_prompts", action="store_true", default=cfg_defaults.get('require_prompts', False),
                         help="Fail if audio file is missing a corresponding prompt file (default: skip missing)")
     parser.add_argument("--skip_tags", type=str, default=None,
                         help="Comma-separated list of tags to skip (e.g. 'vocals,speech')")

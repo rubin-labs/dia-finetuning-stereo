@@ -1102,99 +1102,83 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         batch['enc_self_attn_mask'] = torch.zeros_like(batch['enc_self_attn_mask'])
         batch['dec_cross_attn_mask'] = torch.zeros_like(batch['dec_cross_attn_mask'])
 
-    # Accumulate context manager handles gradient accumulation
-    with accelerator.accumulate(model):
-        # Remove explicit autocast; Accelerate handles it
-        logits = model(
-            src_BxS=batch['src_tokens'],
-            tgt_BxTxC=batch['tgt_tokens'],
-            src_positions=batch['src_positions'],
-            tgt_positions=batch['tgt_positions'],
-            enc_self_attn_mask=batch['enc_self_attn_mask'],
-            dec_self_attn_mask=batch['dec_self_attn_mask'],
-            dec_cross_attn_mask=batch['dec_cross_attn_mask'],
-            enable_dropout=False,
+    # Manual gradient accumulation (like original Nari Labs script)
+    # Don't use accelerator.accumulate() - it causes graph fragmentation on TPU
+    logits = model(
+        src_BxS=batch['src_tokens'],
+        tgt_BxTxC=batch['tgt_tokens'],
+        src_positions=batch['src_positions'],
+        tgt_positions=batch['tgt_positions'],
+        enc_self_attn_mask=batch['enc_self_attn_mask'],
+        dec_self_attn_mask=batch['dec_self_attn_mask'],
+        dec_cross_attn_mask=batch['dec_cross_attn_mask'],
+        enable_dropout=False,
+    )
+    # Note: tgt_lens not used for TPU - we rely on audio_token_mask and ignore_index
+    
+    logits = logits[:, :-1]
+    target = batch['tgt_tokens'][:, 1:, :]
+    
+    B, Tm1, C = target.shape
+    pad_val = dia_cfg.data.audio_pad_value
+    
+    # For TPU: Use fixed-shape operations only.
+    # Don't use tgt_lens for masking - let ignore_index handle padding.
+    # The audio_token_mask will exclude special tokens (BOS, EOS, PAD).
+    
+    channel_weights = []
+    num_groups = C // 9
+    if num_groups > 0:
+        for _ in range(num_groups):
+            channel_weights.extend(CODEBOOK_WEIGHTS)
+    else:
+        channel_weights = [1.0] * C
+
+    loss_c = 0.0
+    _, _, _, V = logits.size()
+    
+    # Only compute loss on valid audio tokens (0-1023), exclude special tokens
+    audio_token_mask = (target >= 0) & (target <= 1023)
+    
+    # For TPU: Set non-audio tokens to pad_val so cross_entropy ignores them
+    target_masked = torch.where(audio_token_mask, target, torch.full_like(target, pad_val))
+    
+    for c, w in enumerate(channel_weights):
+        lc = logits[:, :, c, :].reshape(-1, V)
+        tc = target_masked[:, :, c].reshape(-1)
+        loss_c += w * F.cross_entropy(
+            lc, tc,
+            ignore_index=pad_val
         )
-        # Note: tgt_lens not used for TPU - we rely on audio_token_mask and ignore_index
-        
-        logits = logits[:, :-1]
-        target = batch['tgt_tokens'][:, 1:, :]
-        
-        B, Tm1, C = target.shape
-        pad_val = dia_cfg.data.audio_pad_value
-        
-        # For TPU: Use fixed-shape operations only.
-        # Don't use tgt_lens for masking - let ignore_index handle padding.
-        # The audio_token_mask will exclude special tokens (BOS, EOS, PAD).
-        
-        channel_weights = []
-        num_groups = C // 9
-        if num_groups > 0:
-            for _ in range(num_groups):
-                channel_weights.extend(CODEBOOK_WEIGHTS)
-        else:
-            channel_weights = [1.0] * C
+    loss = loss_c / sum(channel_weights)
 
-        loss_c = 0.0
-        _, _, _, V = logits.size()
-        
-        # Only compute loss on valid audio tokens (0-1023), exclude special tokens
-        audio_token_mask = (target >= 0) & (target <= 1023)
-        
-        # For TPU: Set non-audio tokens to pad_val so cross_entropy ignores them
-        target_masked = torch.where(audio_token_mask, target, torch.full_like(target, pad_val))
-        
-        for c, w in enumerate(channel_weights):
-            lc = logits[:, :, c, :].reshape(-1, V)
-            tc = target_masked[:, :, c].reshape(-1)
-            loss_c += w * F.cross_entropy(
-                lc, tc,
-                ignore_index=pad_val
-            )
-        loss = loss_c / sum(channel_weights)
+    # Scale loss for gradient accumulation
+    loss = loss / train_cfg.grad_accum_steps
 
-        # Note: compute_output_entropy disabled for TPU - the .item() call forces
-        # premature graph execution which causes recompilation every step.
-        # Uncomment for GPU training if needed.
-        # if global_step % 50 == 0:
-        #     entropy = compute_output_entropy(logits.detach())
-        #     if accelerator.is_main_process:
-        #         wandb.log({'output_entropy': entropy}, step=global_step)
-
-        # Scale loss for gradient accumulation so that gradients are averaged, not summed
-        loss = loss / train_cfg.grad_accum_steps
-
-        # Accelerate handles mixed precision loss scaling (if any)
-        accelerator.backward(loss)
-        
-        if accelerator.sync_gradients:
-            accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            
-            # Log gradients if needed (only main process)
-            if accelerator.is_main_process and (step + 1) % train_cfg.grad_accum_steps == 0:
-                # simplified logging to avoid complex gather logic for now
-                pass
-        
+    # Backward pass
+    accelerator.backward(loss)
+    
+    # Manual gradient accumulation: only step optimizer every grad_accum_steps
+    if (step + 1) % train_cfg.grad_accum_steps == 0:
+        accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
         opt.step()
         sched.step()
         opt.zero_grad()
-        
-        # CRITICAL for TPU: mark_step tells XLA to execute the accumulated graph
-        # This must be called BEFORE .item() to avoid blocking
-        if HAS_XLA:
-            xm.mark_step()
+    
+    # CRITICAL for TPU: mark_step tells XLA to execute the accumulated graph
+    if HAS_XLA:
+        xm.mark_step()
 
-    # Just return the loss item (it's local) - multiply back to report actual batch loss
-    # Note: .item() forces sync which is slow but needed for logging
+    # Return loss value
     return loss.item() * train_cfg.grad_accum_steps
 
 
 def run_training(args):
     # Initialize Accelerator
-    # gradient_accumulation_steps is managed by Accelerator if passed here or config
+    # For TPU: Don't pass gradient_accumulation_steps - we handle it manually
+    # to avoid graph fragmentation from accelerator.accumulate()
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.grad_accum_steps,
-        mixed_precision="bf16" if args.half else "no" # Simple default or rely on accelerate config
+        mixed_precision="bf16" if args.half else "no"
     )
     
     # Set seed

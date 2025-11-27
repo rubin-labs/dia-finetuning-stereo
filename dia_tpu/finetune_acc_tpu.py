@@ -282,6 +282,7 @@ def load_train_config(config_path: Path) -> dict:
         flat['run_name'] = cfg['output'].get('run_name')
         flat['save_every'] = cfg['output'].get('save_every')
         flat['save_after_epoch'] = cfg['output'].get('save_after_epoch')
+        flat['save_last'] = cfg['output'].get('save_last')
     if 'flags' in cfg:
         flat['scratch'] = cfg['flags'].get('scratch')
         flat['tag_no_shuffle'] = cfg['flags'].get('tag_no_shuffle')
@@ -338,6 +339,8 @@ def get_args() -> argparse.Namespace:
                         help="Weights & Biases entity/team name.")
     parser.add_argument("--save_every", type=int, default=cfg_defaults.get('save_every'),
                         help="Save checkpoint every N steps (overrides TrainConfig.save_step).")
+    parser.add_argument("--save_last", type=int, default=cfg_defaults.get('save_last'),
+                        help="Keep only the last N checkpoints (e.g., --save_last 4). Saves disk space.")
     parser.add_argument("--force_single_gpu", action="store_true", default=cfg_defaults.get('force_single_gpu', False),
                         help="Force single GPU training even with multiple GPUs available")
     parser.add_argument("--tag_shuffle", action="store_true", default=True,

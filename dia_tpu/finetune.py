@@ -27,17 +27,13 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 
 # TPU / XLA imports
-try:
-    import torch_xla
-    import torch_xla.core.xla_model as xm
-    import torch_xla.debug.metrics as met
-    import torch_xla.distributed.parallel_loader as pl
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    import torch_xla.runtime as xr
-    import torch_xla.utils.utils as xu
-except ImportError:
-    print("torch_xla not installed. This script requires a TPU environment.")
-    sys.exit(1)
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.debug.metrics as met
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.runtime as xr
+import torch_xla.utils.utils as xu
 
 import torchaudio
 import pandas as pd
@@ -475,8 +471,11 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     
     # Masks (handle boolean or float masks appropriately)
     # We assume masks are same type as initialized in collate (likely boolean or float)
-    zeros_enc = torch.zeros_like(batch['enc_self_attn_mask'])
-    zeros_dec = torch.zeros_like(batch['dec_cross_attn_mask'])
+    # CRITICAL FIX: Use ONES (True) instead of ZEROS (False) for unconditional mask.
+    # An all-False mask causes scaled_dot_product_attention to produce NaNs (softmax of -inf).
+    # We want to allow attention to the padded "empty" tokens for unconditional generation.
+    ones_enc = torch.ones_like(batch['enc_self_attn_mask'])
+    ones_dec = torch.ones_like(batch['dec_cross_attn_mask'])
     
     # Expand condition to broadcast
     # masks are (B, 1, T, T) or similar
@@ -485,8 +484,8 @@ def train_step_tpu(model, batch, dia_cfg, train_cfg, opt, sched, step, global_st
     # Cast cond to mask dtype for torch.where compatibility if needed
     # But boolean mask for where is fine.
     
-    batch['enc_self_attn_mask'] = torch.where(cond, zeros_enc, batch['enc_self_attn_mask'])
-    batch['dec_cross_attn_mask'] = torch.where(cond, zeros_dec, batch['dec_cross_attn_mask'])
+    batch['enc_self_attn_mask'] = torch.where(cond, ones_enc, batch['enc_self_attn_mask'])
+    batch['dec_cross_attn_mask'] = torch.where(cond, ones_dec, batch['dec_cross_attn_mask'])
 
     # No autocast needed for TPU usually (bf16 implicit)
     logits = model(

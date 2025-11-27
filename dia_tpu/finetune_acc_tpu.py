@@ -540,6 +540,7 @@ def generate_audio_simple(
     Returns generated codes of shape (T, C).
     Uses torch.no_grad() instead of inference_mode() for TPU compatibility.
     """
+    logger.info(f"[DEBUG generate_audio_simple] Starting generation, max_steps={max_steps}")
     model.eval()
     
     max_len = max_steps if max_steps else data_cfg.audio_length
@@ -548,8 +549,11 @@ def generate_audio_simple(
     eos_val = data_cfg.audio_eos_value
     pad_val = data_cfg.audio_pad_value
     
+    logger.info(f"[DEBUG generate_audio_simple] max_len={max_len}, C={C}, device={device}")
+    
     with torch.no_grad():
         # Encode text prompt
+        logger.info(f"[DEBUG generate_audio_simple] Encoding text prompt...")
         max_text = data_cfg.text_length
         pad_tok = data_cfg.text_pad_value
         b_full = text.encode('utf-8')
@@ -562,8 +566,12 @@ def generate_audio_simple(
         
         # Start with BOS token for all channels
         generated = torch.full((1, 1, C), bos_val, dtype=torch.long, device=device)
+        logger.info(f"[DEBUG generate_audio_simple] Starting autoregressive loop, max_len={max_len}")
         
         for step in range(max_len):
+            if step % 50 == 0:
+                logger.info(f"[DEBUG generate_audio_simple] Step {step}/{max_len}, generated shape={generated.shape}")
+            
             T_cur = generated.shape[1]
             tgt_pos = torch.arange(T_cur, device=device).unsqueeze(0)
             tgt_pad = generated.ne(pad_val).any(-1)
@@ -571,6 +579,7 @@ def generate_audio_simple(
             dec_self_attn_mask = (tgt_pad.unsqueeze(2) & tgt_pad.unsqueeze(1) & causal).unsqueeze(1)
             dec_cross_attn_mask = (tgt_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
             
+            logger.debug(f"[DEBUG generate_audio_simple] Step {step}: calling model forward...")
             logits = model(
                 src_BxS=src,
                 tgt_BxTxC=generated,
@@ -581,6 +590,7 @@ def generate_audio_simple(
                 dec_cross_attn_mask=dec_cross_attn_mask,
                 enable_dropout=False,
             )  # (B, T, C, V)
+            logger.debug(f"[DEBUG generate_audio_simple] Step {step}: model forward returned, logits shape={logits.shape}")
             
             # Get logits for last position
             last_logits = logits[:, -1, :, :]  # (B, C, V)
@@ -594,10 +604,13 @@ def generate_audio_simple(
             
             # Check for EOS on first codebook
             if (next_tokens[0, 0] == eos_val).item():
+                logger.info(f"[DEBUG generate_audio_simple] EOS detected at step {step}, stopping")
                 break
             
             # Append to generated
             generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
+        
+        logger.info(f"[DEBUG generate_audio_simple] Generation complete, final shape={generated.shape}")
     
     return generated.squeeze(0)  # (T, C)
 
@@ -633,10 +646,13 @@ def eval_demo_step(
     try:
         for i, s in enumerate(seeds):
             try:
+                logger.info(f"[DEBUG] Starting demo {i+1}/3, seed={s}")
                 seed_everything(s)
+                logger.info(f"[DEBUG] Seed set, calling generate_audio_simple...")
                 logger.info(f"Generating demo {i+1}/3 (seed={s}, temp=0, cfg=0, prompt='')")
                 
                 # Generate audio codes
+                logger.info(f"[DEBUG] About to call generate_audio_simple with max_steps={data_cfg.audio_length}")
                 generated_codes = generate_audio_simple(
                     model=unwrapped_model,
                     data_cfg=data_cfg,
@@ -645,39 +661,46 @@ def eval_demo_step(
                     temperature=0.0,
                     max_steps=data_cfg.audio_length,
                 )
+                logger.info(f"[DEBUG] generate_audio_simple returned, shape={generated_codes.shape if generated_codes is not None else None}")
                 
                 if generated_codes is None or generated_codes.shape[0] < 2:
                     logger.warning(f"Demo {i+1}: generation too short, skipping")
                     continue
                 
                 # Decode to audio
+                logger.info(f"[DEBUG] About to decode with codebook_to_audio_simple...")
                 audio = codebook_to_audio_simple(
                     generated_codes,
                     dac_model,
                     data_cfg.delay_pattern,
                     C=data_cfg.channels,
                 )
+                logger.info(f"[DEBUG] codebook_to_audio_simple returned, audio shape={audio.shape if audio is not None else None}")
                 
                 if audio is None:
                     logger.warning(f"Demo {i+1}: decoding failed, skipping")
                     continue
                 
                 # Convert to numpy
+                logger.info(f"[DEBUG] Converting audio to numpy...")
                 arr = audio.detach().cpu().numpy()
                 if arr.ndim == 2 and arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
                     arr = arr.T  # (C, T) -> (T, C) for soundfile
                 
                 # Save audio file
+                logger.info(f"[DEBUG] Saving audio file...")
                 audio_filename = f"step_{global_step}_demo{i+1}_seed{s}.wav"
                 audio_path = audio_dir / audio_filename
                 sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
                 logger.info(f"Saved demo audio: {audio_path}")
                 
                 # Add to wandb
+                logger.info(f"[DEBUG] Adding to wandb...")
                 audio_samples[f"eval_audio/demo{i+1}_seed{s}"] = wandb.Audio(
                     arr, sample_rate=EVAL_SAMPLE_RATE,
                     caption=f"temp=0, seed={s}"
                 )
+                logger.info(f"[DEBUG] Demo {i+1}/3 completed successfully")
                 
             except Exception as e:
                 logger.exception(f"Error generating demo {i+1} (seed={s}): {e}")
@@ -1158,9 +1181,14 @@ def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, 
             # Eval demo generation
             eval_every = getattr(args, 'eval_every_step', 0)
             if eval_every > 0 and global_step > 0 and global_step % eval_every == 0 and dac_model is not None:
+                logger.info(f"[DEBUG] Eval trigger: eval_every={eval_every}, global_step={global_step}, dac_model={'present' if dac_model is not None else 'None'}")
+                logger.info(f"[DEBUG] Waiting for all processes...")
                 accelerator.wait_for_everyone()
+                logger.info(f"[DEBUG] Setting model to eval mode...")
                 model.eval()
+                logger.info(f"[DEBUG] Entering torch.no_grad() context...")
                 with torch.no_grad():
+                    logger.info(f"[DEBUG] Calling eval_demo_step...")
                     eval_demo_step(
                         model=model,
                         data_cfg=data_cfg,
@@ -1170,7 +1198,9 @@ def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, 
                         accelerator=accelerator,
                         train_cfg=train_cfg,
                     )
+                logger.info(f"[DEBUG] Eval complete, setting model back to train mode...")
                 model.train()
+                logger.info(f"[DEBUG] Model back to train mode")
 
             should_save = train_cfg.save_step > 0 and global_step > 0 and (global_step % train_cfg.save_step == 0)
             if should_save:

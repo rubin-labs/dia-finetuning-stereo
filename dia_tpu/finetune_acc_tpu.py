@@ -638,15 +638,14 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: A
                 )
                 
                 # Truncate logits if needed (usually model output matches target length, but let's check)
-                # If model outputs one step ahead, we might need slicing. 
                 # Dia model usually outputs (B, T, C, V).
-                # Based on train_step, we slice logits [:, :max_L-1] and targets [:, 1:max_L].
-                # We should match train_step logic exactly for comparable loss.
+                # On TPU, we must avoid dynamic slicing. We use the full fixed length and rely on masking.
                 
                 lens = eb['tgt_lens']
-                max_L = int(lens.max().item())
-                logits = logits[:, : max_L - 1]
-                target = eb['tgt_tokens'][:, 1:max_L, :]
+                # max_L = int(lens.max().item())  # Removed dynamic slicing
+                
+                logits = logits[:, :-1]
+                target = eb['tgt_tokens'][:, 1:, :]
                 
                 B_e, T_e, C_e = target.shape
                 V_e = logits.size(-1)
@@ -1107,9 +1106,11 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
             enable_dropout=False,
         )
         lens = batch['tgt_lens']
-        max_L = int(lens.max().item())
-        logits = logits[:, : max_L - 1]
-        target = batch['tgt_tokens'][:, 1:max_L, :]
+        # max_L = int(lens.max().item()) # Removed dynamic slicing for TPU
+        
+        logits = logits[:, :-1]
+        target = batch['tgt_tokens'][:, 1:, :]
+        
         B, Tm1, C = target.shape
         pad_val = dia_cfg.data.audio_pad_value
         time_idx = torch.arange(Tm1, device=lens.device).unsqueeze(0)

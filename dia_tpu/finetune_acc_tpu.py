@@ -402,6 +402,12 @@ def get_args() -> argparse.Namespace:
         parser.error("--output_dir is required (set in train_config.json or via CLI)")
     if args.unconditional_frac is None:
         parser.error("--unconditional_frac is required (set in train_config.json or via CLI)")
+
+    # Treat non-positive epoch-based intervals as disabled to avoid modulo-by-zero
+    if args.eval_every_epochs is not None and args.eval_every_epochs <= 0:
+        args.eval_every_epochs = None
+    if args.demo_every_epochs is not None and args.demo_every_epochs <= 0:
+        args.demo_every_epochs = None
     
     return args
 
@@ -725,7 +731,7 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: A
             dia_gen = Dia(dia_cfg, accelerator.device)
             dia_gen.model, dia_gen.dac_model = unwrapped_model, dac_model
 
-            with torch.inference_mode(), torch.cuda.amp.autocast(enabled=False):
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
                 audio_samples = {}
                 
                 # Check if we're doing unconditional generation

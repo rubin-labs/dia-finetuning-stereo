@@ -38,11 +38,11 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 import dac
-from .config import DiaConfig
-from .layers import DiaModel
-from .model import Dia
-from .audio import build_delay_indices, apply_audio_delay
-from .dataset import MusicDataset, PreEncodedDACDataset
+from dia.config import DiaConfig
+from dia.layers import DiaModel
+from dia.model import Dia
+from dia.audio import build_delay_indices, apply_audio_delay
+from dia.dataset import MusicDataset, PreEncodedDACDataset
 from torch.nn.functional import pad
 
 

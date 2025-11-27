@@ -14,6 +14,7 @@ import numpy as np
 import resource
 
 import torch
+import torchaudio
 # DDP imports removed
 from torch.utils.data import DataLoader, random_split
 # autocast removed - handled by Accelerate
@@ -206,6 +207,39 @@ def compute_output_entropy(logits):
     return entropy.mean().item()
 
 
+def verify_dac_encoding(audio_path: Path, dac_model: dac.DAC, seconds: float = 1.0, target_sr: int = 44100):
+    """
+    Run a quick DAC encode on a short snippet to ensure the pipeline works.
+    Raises on failure; logs the produced code shape on success.
+    """
+    device = next(dac_model.parameters()).device
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load audio for DAC verification: {audio_path}") from e
+    
+    if sr != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
+    
+    # Use at most the requested seconds to keep verification fast
+    max_samples = int(seconds * target_sr)
+    if waveform.shape[1] > max_samples:
+        waveform = waveform[:, :max_samples]
+    
+    # Keep only first two channels
+    waveform = waveform[:2, :]
+    
+    with torch.no_grad():
+        audio_tensor = dac_model.preprocess(waveform.unsqueeze(0), target_sr).to(device)
+        _, enc, *_ = dac_model.encode(audio_tensor, n_quantizers=None)
+    
+    if enc is None or enc.numel() == 0:
+        raise RuntimeError("DAC verification produced empty codes.")
+    
+    logger.info("DAC verification succeeded on %s -> codes shape %s", audio_path, tuple(enc.shape))
+    return enc
+
+
 def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):
     """Keep only the last N checkpoints, delete older ones to save space."""
     if keep_last_n is None:
@@ -386,6 +420,8 @@ def get_args() -> argparse.Namespace:
                         help="Early stop when training loss <= this value; saves final checkpoint then exits.")
     parser.add_argument("--stop_on_overfit", action="store_true", default=cfg_defaults.get('stop_on_overfit', False),
                         help="Stop training and generate demo when eval loss > train loss")
+    parser.add_argument("--skip_dac_verify", action="store_true", default=False,
+                        help="Skip one-off DAC encoding verification when using --audio_folder.")
     
     parser.add_argument("--use_sliding_window", action="store_true", default=cfg_defaults.get('use_sliding_window', False),
                         help="Enable sliding window: random cropping for data augmentation (default: off for deterministic training)")
@@ -514,6 +550,9 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
     collate = partial(collate_fn, config=dia_cfg, device=torch.device("cpu"), use_sliding_window=use_sliding_window)
     
     ds_len = len(dataset)
+    if ds_len == 0:
+        raise ValueError("Dataset is empty. Check your --audio_folder/--preencoded_dir paths and filtering settings.")
+
     n_train = int(train_cfg.split_ratio * ds_len)
     n_val = ds_len - n_train
     
@@ -526,6 +565,15 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
         train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=g)
 
     # Accelerator handles distribution, we just provide standard loaders
+    # If the dataset is smaller than the requested batch size, drop_last=True would yield 0 steps.
+    drop_last = True
+    if len(train_ds) < train_cfg.batch_size:
+        drop_last = False
+        logger.warning(
+            "Dataset size (%d) is smaller than batch_size (%d); disabling drop_last so training still runs.",
+            len(train_ds),
+            train_cfg.batch_size,
+        )
     
     train_loader = DataLoader(
         train_ds, 
@@ -534,11 +582,17 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
         collate_fn=collate,
         num_workers=0,
         pin_memory=False,
-        drop_last=True,
+        drop_last=drop_last,
         persistent_workers=False,
     )
     
     steps_per_epoch = len(train_loader)
+    if steps_per_epoch == 0:
+        raise ValueError(
+            f"DataLoader produced zero steps (len(train_ds)={len(train_ds)}, "
+            f"batch_size={train_cfg.batch_size}, drop_last={drop_last}). "
+            "Reduce batch_size or disable drop_last."
+        )
     train_loader.steps_per_epoch = steps_per_epoch
     
     if val_ds is not None:
@@ -1250,6 +1304,14 @@ def run_training(args):
         dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
                              ignore_missing_prompts=not args.require_prompts,
                              skip_tags=skip_tags_list)
+        # Quick one-off verification that DAC encoding works on the current environment
+        if accelerator.is_main_process and not args.skip_dac_verify:
+            try:
+                sample_audio = dataset.valid_files[0]
+                verify_dac_encoding(sample_audio, dac_model)
+            except Exception as e:
+                logger.error("DAC encoding verification failed: %s", e)
+                raise
     else:
         raise ValueError("Must specify either --audio_folder or --preencoded_dir")
 

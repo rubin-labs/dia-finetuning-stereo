@@ -592,8 +592,8 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
     n_train = int(train_cfg.split_ratio * ds_len)
     n_val = ds_len - n_train
     
-    # If dataset has only 1 sample (or split would result in 0 val samples), skip validation
-    if ds_len <= 1 or n_val == 0:
+    # If dataset has only 1 sample (or split would result in 0 train samples), skip validation entirely
+    if ds_len <= 1 or n_train == 0:
         train_ds = dataset
         val_ds = None
     else:
@@ -1003,6 +1003,16 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             steps_per_epoch = len(train_loader)
         except Exception:
             steps_per_epoch = None
+    dataset_len = None
+    try:
+        dataset_len = len(train_loader.dataset)
+    except Exception:
+        pass
+    if steps_per_epoch is None or steps_per_epoch == 0:
+        raise RuntimeError(
+            f"Training dataloader is empty (steps_per_epoch={steps_per_epoch}, dataset_len={dataset_len}). "
+            "Check input paths/filters; TPU runs cannot proceed without batches."
+        )
 
     stop_training = False
     for epoch in range(train_cfg.epochs):

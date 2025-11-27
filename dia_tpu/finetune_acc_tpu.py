@@ -487,8 +487,10 @@ def collate_fn(batch, config: DiaConfig, device: torch.device, use_sliding_windo
         'tgt_lens': torch.tensor(tgt_lens, dtype=torch.long, device=device),
     }
 
+from functools import partial
+
 def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_sliding_window=True):
-    collate = lambda b: collate_fn(b, dia_cfg, torch.device("cpu"), use_sliding_window)
+    collate = partial(collate_fn, config=dia_cfg, device=torch.device("cpu"), use_sliding_window=use_sliding_window)
     
     ds_len = len(dataset)
     n_train = int(train_cfg.split_ratio * ds_len)
@@ -892,6 +894,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     for epoch in range(train_cfg.epochs):
         # No manual sampler set_epoch needed; Accelerator handles it if it wrapped the loader
         
+        loss = 0.0 # Initialize loss to avoid UnboundLocalError if loop is empty
+        
         if accelerator.is_main_process:
             loader_iter = tqdm(
                 train_loader,
@@ -925,12 +929,20 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 else:
                     vram_str = "N/A"
                 
+                current_lr = sched.get_last_lr()[0]
+                
                 if isinstance(loader_iter, tqdm):
                     loader_iter.set_postfix({
                         'loss': f"{loss:.4f}",
                         'VRAM (GB)': vram_str,
                         'step_time': f"{total_step_time:.1f}s"
                     })
+                
+                # Log training metrics
+                wandb.log({
+                    'train_loss': loss,
+                    'learning_rate': current_lr,
+                }, step=global_step)
 
             # evaluation during epoch (only if epoch-based eval is not requested)
             if args.eval_every_epochs is None and global_step > 0 and global_step % train_cfg.eval_step == 0:
@@ -947,13 +959,18 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                     current_train_loss=loss, stop_on_overfit=args.stop_on_overfit
                 )
                 
-                if args.stop_on_overfit and should_stop:
-                    stop_training = True
-                    if accelerator.is_main_process:
-                        ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{global_step}.pth"
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        torch.save(unwrapped_model.state_dict(), ckpt_path)
-                        logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
+                if args.stop_on_overfit:
+                    # Broadcast stop decision to all processes to avoid deadlock
+                    flag = torch.tensor(1.0 if should_stop else 0.0, device=accelerator.device)
+                    flag = accelerator.reduce(flag, reduction="max")
+                    
+                    if flag.item() > 0.5:
+                        stop_training = True
+                        if accelerator.is_main_process:
+                            ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{global_step}.pth"
+                            unwrapped_model = accelerator.unwrap_model(model)
+                            torch.save(unwrapped_model.state_dict(), ckpt_path)
+                            logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
                 
                 model.train()
 
@@ -973,18 +990,29 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                     unwrapped_model = accelerator.unwrap_model(model)
                     torch.save(unwrapped_model.state_dict(), ckpt)
                     logger.info(f"Saved checkpoint: {ckpt}")
+                    
+                    # Cleanup old checkpoints
+                    cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
 
             if args.early_stop_loss is not None:
-                # Gather loss from all processes to decide on early stopping?
-                # Or just use local loss. Usually local loss is fine if it's consistent.
-                # But safe way is to check if ANY process wants to stop or Main.
-                # Let's stick to local trigger broadcasted.
-                trigger_local = torch.tensor(1 if loss <= args.early_stop_loss else 0, device=accelerator.device)
-                # Gather/Reduce across devices
-                # Simple way: if main process triggers, we stop
-                # But `loss` here is scalar float.
-                pass # Simplified for now, assume similar logic or update if needed.
-                # (Implementing strict early stop sync with Accelerate requires more code, skipping for brevity unless requested)
+                # Check local loss condition
+                local_stop = 1.0 if loss <= args.early_stop_loss else 0.0
+                flag = torch.tensor(local_stop, device=accelerator.device)
+                # Reduce: if any process wants to stop, all stop (max > 0)
+                flag = accelerator.reduce(flag, reduction="max")
+                
+                if flag.item() > 0.5:
+                    if accelerator.is_main_process:
+                        # Save final checkpoints
+                        final_ckpt = train_cfg.output_dir / f"ckpt_final_step{global_step}.pth"
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        torch.save(unwrapped_model.state_dict(), final_ckpt)
+                        latest_ckpt = train_cfg.output_dir / "latest.pth"
+                        torch.save(unwrapped_model.state_dict(), latest_ckpt)
+                        logger.info(f"Early stop triggered (loss <= {args.early_stop_loss}). Saved final checkpoints.")
+                        cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
+                    
+                    stop_training = True
 
         if stop_training:
             break
@@ -1013,13 +1041,18 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 current_train_loss=loss, stop_on_overfit=args.stop_on_overfit
             )
             
-            if args.stop_on_overfit and should_stop:
-                stop_training = True
-                if accelerator.is_main_process:
-                    ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{gsp}.pth"
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    torch.save(unwrapped_model.state_dict(), ckpt_path)
-                    logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
+            if args.stop_on_overfit:
+                # Broadcast stop decision to all processes to avoid deadlock
+                flag = torch.tensor(1.0 if should_stop else 0.0, device=accelerator.device)
+                # Use reduce with max to ensure if any process (e.g. main) wants to stop, all stop
+                flag = accelerator.reduce(flag, reduction="max")
+                if flag.item() > 0.5:
+                    stop_training = True
+                    if accelerator.is_main_process:
+                        ckpt_path = train_cfg.output_dir / f"ckpt_stop_overfit_{gsp}.pth"
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        torch.save(unwrapped_model.state_dict(), ckpt_path)
+                        logger.info(f"Saved overfit-stop checkpoint: {ckpt_path}")
 
             model.train()
 
@@ -1027,30 +1060,25 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             is_last_epoch = (epoch + 1) == train_cfg.epochs
             past_save_threshold = (epoch + 1) > args.save_after_epoch
             
+            should_save_epoch = False
             if args.save_every_epochs is not None:
                 should_save_epoch = ((epoch + 1) % args.save_every_epochs == 0) and past_save_threshold
-                if should_save_epoch or is_last_epoch:
-                    ckpt_e = train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth"
-                    accelerator.wait_for_everyone()
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    torch.save(unwrapped_model.state_dict(), ckpt_e)
-                    logger.info(f"Saved end-of-epoch checkpoint: {ckpt_e}")
-                    if is_last_epoch:
-                        latest_ckpt = train_cfg.output_dir / "latest.pth"
-                        torch.save(unwrapped_model.state_dict(), latest_ckpt)
-                        logger.info(f"Saved latest checkpoint: {latest_ckpt}")
             else:
                 should_save_epoch = (args.save_every is None and past_save_threshold) or is_last_epoch
-                if should_save_epoch:
-                    ckpt_e = train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth"
-                    accelerator.wait_for_everyone()
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    torch.save(unwrapped_model.state_dict(), ckpt_e)
-                    logger.info(f"Saved end-of-epoch checkpoint: {ckpt_e}")
-                    if is_last_epoch:
-                        latest_ckpt = train_cfg.output_dir / "latest.pth"
-                        torch.save(unwrapped_model.state_dict(), latest_ckpt)
-                        logger.info(f"Saved latest checkpoint: {latest_ckpt}")
+            
+            if should_save_epoch:
+                ckpt_e = train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth"
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                torch.save(unwrapped_model.state_dict(), ckpt_e)
+                logger.info(f"Saved end-of-epoch checkpoint: {ckpt_e}")
+                if is_last_epoch:
+                    latest_ckpt = train_cfg.output_dir / "latest.pth"
+                    torch.save(unwrapped_model.state_dict(), latest_ckpt)
+                    logger.info(f"Saved latest checkpoint: {latest_ckpt}")
+                
+                # Cleanup old checkpoints
+                cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
     
     accelerator.wait_for_everyone()
 
@@ -1114,7 +1142,17 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
                 )
         loss = loss_c / sum(channel_weights)
 
-        # Accelerate handles scaling
+        # Compute output entropy every 50 steps (measures model confidence)
+        if global_step % 50 == 0:
+            # Compute entropy on detached logits
+            entropy = compute_output_entropy(logits.detach())
+            if accelerator.is_main_process:
+                wandb.log({'output_entropy': entropy}, step=global_step)
+
+        # Scale loss for gradient accumulation so that gradients are averaged, not summed
+        loss = loss / train_cfg.grad_accum_steps
+
+        # Accelerate handles mixed precision loss scaling (if any)
         accelerator.backward(loss)
         
         if accelerator.sync_gradients:
@@ -1129,8 +1167,8 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         sched.step()
         opt.zero_grad()
 
-    # Just return the loss item (it's local)
-    return loss.item()
+    # Just return the loss item (it's local) - multiply back to report actual batch loss
+    return loss.item() * train_cfg.grad_accum_steps
 
 
 def run_training(args):

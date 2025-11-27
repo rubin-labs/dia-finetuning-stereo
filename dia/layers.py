@@ -1,4 +1,5 @@
 from typing import Any
+import math
 
 import torch
 import torch.nn as nn
@@ -128,6 +129,8 @@ class MlpBlock(nn.Module):
             dtype=compute_dtype,
             weight_dtype=weight_dtype,
         )
+        # Mark fused SwiGLU weights for He/kaiming init tuned to SiLU gates
+        self.wi_fused.use_glu_he_init = True
 
         self.activation_fn_0 = get_activation_fn(activations[0])  # silu
         self.activation_fn_1 = get_activation_fn(activations[1])  # linear
@@ -847,15 +850,22 @@ class DiaModel(nn.Module):
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, DenseGeneral):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if getattr(module, 'bias', None) is not None:
+                if getattr(module, "use_glu_he_init", False):
+                    # He uniform for SwiGLU/SiLU gates: variance 2/fan_in
+                    fan_in = module.in_shapes[0] if module.in_shapes else 1
+                    bound = math.sqrt(6.0 / fan_in)
+                    with torch.no_grad():
+                        module.weight.uniform_(-bound, bound)
+                else:
+                    torch.nn.init.xavier_uniform_(module.weight)
+                if getattr(module, "bias", None) is not None:
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, torch.nn.Embedding):
                 torch.nn.init.xavier_uniform_(module.weight)
             elif isinstance(module, torch.nn.LayerNorm) or isinstance(module, torch.nn.modules.normalization.RMSNorm):
-                if hasattr(module, 'weight') and module.weight is not None:
+                if hasattr(module, "weight") and module.weight is not None:
                     torch.nn.init.ones_(module.weight)
-                if hasattr(module, 'bias') and module.bias is not None:
+                if hasattr(module, "bias") and module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
 
     def forward(

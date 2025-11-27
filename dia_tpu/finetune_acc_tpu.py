@@ -1010,20 +1010,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 model, opt, train_loader, sched
             )
     else:
+        # Keep original loaders (no sharding); only prepare model/opt/sched
         model, opt, sched = accelerator.prepare(model, opt, sched)
-        # Replicate data on all devices; avoid distributed sampler
-        if not hasattr(accelerator, "prepare_data_loader"):
-            raise RuntimeError("Accelerate version does not support prepare_data_loader; cannot disable sharding safely.")
-        train_loader = accelerator.prepare_data_loader(
-            train_loader,
-            distributed_kwargs={"use_distributed_sampler": False},
-        )
-        if val_loader:
-            val_loader = accelerator.prepare_data_loader(
-                val_loader,
-                distributed_kwargs={"use_distributed_sampler": False},
-            )
-        # Preserve precomputed steps_per_epoch for logging/loops
         if pre_steps_per_epoch is not None:
             train_loader.steps_per_epoch = pre_steps_per_epoch
 
@@ -1084,6 +1072,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             loader_iter = train_loader
             
         for step, batch in enumerate(loader_iter):
+            if not shard_dataloaders:
+                batch = {k: (v.to(accelerator.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
             global_step = epoch * (steps_per_epoch or 0) + step
             
             batch_start = time.time()

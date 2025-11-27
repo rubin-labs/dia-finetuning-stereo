@@ -65,6 +65,9 @@ torch.backends.cudnn.benchmark = True
 
 CODEBOOK_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
+NONFINITE_HIT_LIMIT = 3
+_nonfinite_hits = 0
+
 
 # =============================================================================
 # EVALUATION & DEMO GENERATION CONFIGURATION
@@ -1095,6 +1098,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
 
 
 def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator: Accelerator):
+    global _nonfinite_hits
+
     gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
     if gen_val < train_cfg.unconditional_frac:
         pad_tok = dia_cfg.data.text_pad_value
@@ -1155,6 +1160,19 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
     # Scale loss for gradient accumulation
     loss = loss / train_cfg.grad_accum_steps
 
+    loss_detached = loss.detach()
+    if not torch.isfinite(loss_detached):
+        _nonfinite_hits += 1
+        logger.warning(
+            f"Non-finite loss at step {global_step} (hit {_nonfinite_hits}/{NONFINITE_HIT_LIMIT}); skipping backward"
+        )
+        opt.zero_grad()
+        if HAS_XLA:
+            xm.mark_step()
+        if _nonfinite_hits >= NONFINITE_HIT_LIMIT:
+            raise RuntimeError(f"Aborting: non-finite loss encountered {NONFINITE_HIT_LIMIT} times.")
+        return float('nan')
+
     # Backward pass - use pure PyTorch on TPU to avoid Accelerate state changes
     if HAS_XLA:
         loss.backward()
@@ -1166,9 +1184,10 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         # Use torch.nn.utils.clip_grad_norm_ directly for TPU
         if HAS_XLA:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            xm.optimizer_step(opt, barrier=False)
         else:
             accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        opt.step()
+            opt.step()
         sched.step()
         opt.zero_grad()
     
@@ -1177,7 +1196,7 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         xm.mark_step()
 
     # Return loss value
-    return loss.item() * train_cfg.grad_accum_steps
+    return float(loss_detached) * train_cfg.grad_accum_steps
 
 
 def run_training(args):

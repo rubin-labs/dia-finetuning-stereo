@@ -8,7 +8,7 @@
     },
     
     "training": {
-      "batch_size": 32,
+      "batch_size": 16,
       "grad_accum_steps": 2,
       "epochs": 100,
       "learning_rate": 2e-4,

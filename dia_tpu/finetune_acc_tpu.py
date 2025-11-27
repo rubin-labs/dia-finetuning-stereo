@@ -540,7 +540,7 @@ def generate_audio_simple(
     Returns generated codes of shape (T, C).
     Uses torch.no_grad() instead of inference_mode() for TPU compatibility.
     """
-    logger.info(f"[DEBUG generate_audio_simple] Starting generation, max_steps={max_steps}")
+    print(f"[GEN] Starting generation, max_steps={max_steps}", flush=True)
     model.eval()
     
     max_len = max_steps if max_steps else data_cfg.audio_length
@@ -549,11 +549,8 @@ def generate_audio_simple(
     eos_val = data_cfg.audio_eos_value
     pad_val = data_cfg.audio_pad_value
     
-    logger.info(f"[DEBUG generate_audio_simple] max_len={max_len}, C={C}, device={device}")
-    
     with torch.no_grad():
         # Encode text prompt
-        logger.info(f"[DEBUG generate_audio_simple] Encoding text prompt...")
         max_text = data_cfg.text_length
         pad_tok = data_cfg.text_pad_value
         b_full = text.encode('utf-8')
@@ -566,11 +563,11 @@ def generate_audio_simple(
         
         # Start with BOS token for all channels
         generated = torch.full((1, 1, C), bos_val, dtype=torch.long, device=device)
-        logger.info(f"[DEBUG generate_audio_simple] Starting autoregressive loop, max_len={max_len}")
+        print(f"[GEN] Starting loop, max_len={max_len}. First forward may take 5-10+ min for XLA compile...", flush=True)
         
         for step in range(max_len):
-            if step % 50 == 0:
-                logger.info(f"[DEBUG generate_audio_simple] Step {step}/{max_len}, generated shape={generated.shape}")
+            if step % 20 == 0:
+                print(f"[GEN] Step {step}/{max_len}", flush=True)
             
             T_cur = generated.shape[1]
             tgt_pos = torch.arange(T_cur, device=device).unsqueeze(0)
@@ -579,7 +576,6 @@ def generate_audio_simple(
             dec_self_attn_mask = (tgt_pad.unsqueeze(2) & tgt_pad.unsqueeze(1) & causal).unsqueeze(1)
             dec_cross_attn_mask = (tgt_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
             
-            logger.debug(f"[DEBUG generate_audio_simple] Step {step}: calling model forward...")
             logits = model(
                 src_BxS=src,
                 tgt_BxTxC=generated,
@@ -590,7 +586,10 @@ def generate_audio_simple(
                 dec_cross_attn_mask=dec_cross_attn_mask,
                 enable_dropout=False,
             )  # (B, T, C, V)
-            logger.debug(f"[DEBUG generate_audio_simple] Step {step}: model forward returned, logits shape={logits.shape}")
+            
+            # CRITICAL: Force XLA execution on TPU
+            if HAS_XLA:
+                xm.mark_step()
             
             # Get logits for last position
             last_logits = logits[:, -1, :, :]  # (B, C, V)
@@ -604,13 +603,13 @@ def generate_audio_simple(
             
             # Check for EOS on first codebook
             if (next_tokens[0, 0] == eos_val).item():
-                logger.info(f"[DEBUG generate_audio_simple] EOS detected at step {step}, stopping")
+                print(f"[GEN] EOS at step {step}", flush=True)
                 break
             
             # Append to generated
             generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
         
-        logger.info(f"[DEBUG generate_audio_simple] Generation complete, final shape={generated.shape}")
+        print(f"[GEN] Complete, shape={generated.shape}", flush=True)
     
     return generated.squeeze(0)  # (T, C)
 

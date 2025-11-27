@@ -527,7 +527,6 @@ def codebook_to_audio_simple(generated_codes: torch.Tensor, dac_model, delay_pat
         raise ValueError(f"Unsupported codebook channels {total_codebooks}; expected 9 or 18.")
 
 
-@torch.inference_mode()
 def generate_audio_simple(
     model: SimpleAudioModel,
     data_cfg: DataSettings,
@@ -539,6 +538,7 @@ def generate_audio_simple(
     """
     Simple autoregressive generation for SimpleAudioModel.
     Returns generated codes of shape (T, C).
+    Uses torch.no_grad() instead of inference_mode() for TPU compatibility.
     """
     model.eval()
     
@@ -548,55 +548,56 @@ def generate_audio_simple(
     eos_val = data_cfg.audio_eos_value
     pad_val = data_cfg.audio_pad_value
     
-    # Encode text prompt
-    max_text = data_cfg.text_length
-    pad_tok = data_cfg.text_pad_value
-    b_full = text.encode('utf-8')
-    bts = b_full[:max_text]
-    arr = list(bts) + [pad_tok] * (max_text - len(bts))
-    src = torch.tensor(arr, dtype=torch.long, device=device).unsqueeze(0)  # (1, S)
-    src_pos = torch.arange(max_text, device=device).unsqueeze(0)
-    src_pad = src.ne(pad_tok)
-    enc_self_attn_mask = (src_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
-    
-    # Start with BOS token for all channels
-    generated = torch.full((1, 1, C), bos_val, dtype=torch.long, device=device)
-    
-    for step in range(max_len):
-        T_cur = generated.shape[1]
-        tgt_pos = torch.arange(T_cur, device=device).unsqueeze(0)
-        tgt_pad = generated.ne(pad_val).any(-1)
-        causal = torch.tril(torch.ones((T_cur, T_cur), dtype=torch.bool, device=device))
-        dec_self_attn_mask = (tgt_pad.unsqueeze(2) & tgt_pad.unsqueeze(1) & causal).unsqueeze(1)
-        dec_cross_attn_mask = (tgt_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
+    with torch.no_grad():
+        # Encode text prompt
+        max_text = data_cfg.text_length
+        pad_tok = data_cfg.text_pad_value
+        b_full = text.encode('utf-8')
+        bts = b_full[:max_text]
+        arr = list(bts) + [pad_tok] * (max_text - len(bts))
+        src = torch.tensor(arr, dtype=torch.long, device=device).unsqueeze(0)  # (1, S)
+        src_pos = torch.arange(max_text, device=device).unsqueeze(0)
+        src_pad = src.ne(pad_tok)
+        enc_self_attn_mask = (src_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
         
-        logits = model(
-            src_BxS=src,
-            tgt_BxTxC=generated,
-            src_positions=src_pos,
-            tgt_positions=tgt_pos,
-            enc_self_attn_mask=enc_self_attn_mask,
-            dec_self_attn_mask=dec_self_attn_mask,
-            dec_cross_attn_mask=dec_cross_attn_mask,
-            enable_dropout=False,
-        )  # (B, T, C, V)
+        # Start with BOS token for all channels
+        generated = torch.full((1, 1, C), bos_val, dtype=torch.long, device=device)
         
-        # Get logits for last position
-        last_logits = logits[:, -1, :, :]  # (B, C, V)
-        
-        # Sample next tokens
-        if temperature == 0.0:
-            next_tokens = torch.argmax(last_logits, dim=-1)  # (B, C)
-        else:
-            probs = F.softmax(last_logits / temperature, dim=-1)
-            next_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(1, C)
-        
-        # Check for EOS on first codebook
-        if (next_tokens[0, 0] == eos_val).item():
-            break
-        
-        # Append to generated
-        generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
+        for step in range(max_len):
+            T_cur = generated.shape[1]
+            tgt_pos = torch.arange(T_cur, device=device).unsqueeze(0)
+            tgt_pad = generated.ne(pad_val).any(-1)
+            causal = torch.tril(torch.ones((T_cur, T_cur), dtype=torch.bool, device=device))
+            dec_self_attn_mask = (tgt_pad.unsqueeze(2) & tgt_pad.unsqueeze(1) & causal).unsqueeze(1)
+            dec_cross_attn_mask = (tgt_pad.unsqueeze(2) & src_pad.unsqueeze(1)).unsqueeze(1)
+            
+            logits = model(
+                src_BxS=src,
+                tgt_BxTxC=generated,
+                src_positions=src_pos,
+                tgt_positions=tgt_pos,
+                enc_self_attn_mask=enc_self_attn_mask,
+                dec_self_attn_mask=dec_self_attn_mask,
+                dec_cross_attn_mask=dec_cross_attn_mask,
+                enable_dropout=False,
+            )  # (B, T, C, V)
+            
+            # Get logits for last position
+            last_logits = logits[:, -1, :, :]  # (B, C, V)
+            
+            # Sample next tokens
+            if temperature == 0.0:
+                next_tokens = torch.argmax(last_logits, dim=-1)  # (B, C)
+            else:
+                probs = F.softmax(last_logits / temperature, dim=-1)
+                next_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(1, C)
+            
+            # Check for EOS on first codebook
+            if (next_tokens[0, 0] == eos_val).item():
+                break
+            
+            # Append to generated
+            generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
     
     return generated.squeeze(0)  # (T, C)
 

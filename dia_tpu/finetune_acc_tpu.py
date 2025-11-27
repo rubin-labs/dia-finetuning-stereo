@@ -470,6 +470,8 @@ def get_args() -> argparse.Namespace:
                         help="Comma-separated list of tags to skip (e.g. 'vocals,speech')")
     parser.add_argument("--scratch", action="store_true", default=cfg_defaults.get('scratch', False),
                         help="Train from scratch (random initialization) instead of loading a checkpoint.")
+    parser.add_argument("--no_data_sharding", action="store_true", default=False,
+                        help="Disable distributed sampler and replicate data on every device (useful for tiny/overfit datasets).")
 
     args = parser.parse_args()
     
@@ -968,16 +970,60 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     train_loader, val_loader = setup_loaders(dataset, dia_cfg, train_cfg, use_sliding_window)
     opt, sched = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
 
+    # Cache lengths before Accelerator potentially shards loaders
+    pre_steps_per_epoch = getattr(train_loader, 'steps_per_epoch', None)
+    if pre_steps_per_epoch is None:
+        try:
+            pre_steps_per_epoch = len(train_loader)
+        except Exception:
+            pre_steps_per_epoch = None
+    pre_dataset_len = None
+    try:
+        pre_dataset_len = len(train_loader.dataset)
+    except Exception:
+        pass
+
+    # Decide whether to shard the dataloaders; for tiny datasets (e.g., 1 sample) we disable sharding
+    shard_dataloaders = not args.no_data_sharding
+    if shard_dataloaders and pre_dataset_len is not None and pre_dataset_len < accelerator.num_processes:
+        shard_dataloaders = False
+        if accelerator.is_main_process:
+            logger.warning(
+                "Dataset has %d samples but %d processes; disabling data sharding so each device sees all data.",
+                pre_dataset_len,
+                accelerator.num_processes,
+            )
+
     # PREPARE EVERYTHING WITH ACCELERATOR
     # Prepare validation loader as well if it exists
-    if val_loader:
-        model, opt, train_loader, val_loader, sched = accelerator.prepare(
-            model, opt, train_loader, val_loader, sched
-        )
+    if shard_dataloaders:
+        if val_loader:
+            model, opt, train_loader, val_loader, sched = accelerator.prepare(
+                model, opt, train_loader, val_loader, sched
+            )
+        else:
+            model, opt, train_loader, sched = accelerator.prepare(
+                model, opt, train_loader, sched
+            )
     else:
-        model, opt, train_loader, sched = accelerator.prepare(
-            model, opt, train_loader, sched
+        model, opt, sched = accelerator.prepare(model, opt, sched)
+        # Replicate data on all devices; avoid distributed sampler
+        if not hasattr(accelerator, "prepare_data_loader"):
+            raise RuntimeError("Accelerate version does not support prepare_data_loader; cannot disable sharding safely.")
+        train_loader = accelerator.prepare_data_loader(
+            train_loader,
+            shuffle=True,
+            distributed_kwargs={"use_distributed_sampler": False},
         )
+        if val_loader:
+            val_loader = accelerator.prepare_data_loader(
+                val_loader,
+                shuffle=False,
+                distributed_kwargs={"use_distributed_sampler": False},
+            )
+        # Preserve precomputed steps_per_epoch for logging/loops
+        if pre_steps_per_epoch is not None:
+            train_loader.steps_per_epoch = pre_steps_per_epoch
 
     # Note: Don't wrap with MpDeviceLoader when using Accelerate - they conflict
     # Accelerate should handle TPU data loading internally
@@ -997,17 +1043,22 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                         state['exp_avg'] = torch.zeros_like(p)
                         state['exp_avg_sq'] = torch.zeros_like(p)
 
-    steps_per_epoch = getattr(train_loader, 'steps_per_epoch', None)
-    if steps_per_epoch is None:
+    if shard_dataloaders:
+        steps_per_epoch = getattr(train_loader, 'steps_per_epoch', None)
+        if steps_per_epoch is None:
+            try:
+                steps_per_epoch = len(train_loader)
+            except Exception:
+                steps_per_epoch = None
+        dataset_len = None
         try:
-            steps_per_epoch = len(train_loader)
+            dataset_len = len(train_loader.dataset)
         except Exception:
-            steps_per_epoch = None
-    dataset_len = None
-    try:
-        dataset_len = len(train_loader.dataset)
-    except Exception:
-        pass
+            dataset_len = pre_dataset_len
+    else:
+        steps_per_epoch = pre_steps_per_epoch
+        dataset_len = pre_dataset_len
+
     if steps_per_epoch is None or steps_per_epoch == 0:
         raise RuntimeError(
             f"Training dataloader is empty (steps_per_epoch={steps_per_epoch}, dataset_len={dataset_len}). "

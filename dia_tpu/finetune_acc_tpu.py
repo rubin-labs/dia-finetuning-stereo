@@ -1010,8 +1010,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                 model, opt, train_loader, sched
             )
     else:
-        # Keep original loaders (no sharding); only prepare model/opt/sched
-        model, opt, sched = accelerator.prepare(model, opt, sched)
+        # No sharding: keep original loaders; move model to device manually
+        model = model.to(accelerator.device)
         if pre_steps_per_epoch is not None:
             train_loader.steps_per_epoch = pre_steps_per_epoch
 

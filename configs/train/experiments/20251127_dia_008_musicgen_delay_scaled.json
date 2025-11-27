@@ -8,8 +8,8 @@
     },
     
     "training": {
-      "batch_size": 16,
-      "grad_accum_steps": 2,
+      "batch_size": 2,
+      "grad_accum_steps": 16,
       "epochs": 100,
       "learning_rate": 2e-4,
       "warmup_steps": 500,

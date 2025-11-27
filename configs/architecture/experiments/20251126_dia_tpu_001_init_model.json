@@ -28,7 +28,7 @@
     },
     "data": {
         "text_length": 512,
-        "audio_length": 600,
+        "audio_length": 5160,
         "channels": 18,
         "text_pad_value": 0,
         "audio_eos_value": 1024,

@@ -908,14 +908,14 @@ def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, 
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     ckpt = train_cfg.output_dir / f"ckpt_step{global_step}.pth"
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    torch.save(unwrapped_model.state_dict(), ckpt)
+                    state_dict = {k: v.cpu() for k, v in accelerator.get_state_dict(model).items()}
+                    accelerator.save(state_dict, ckpt)
                     logger.info(f"Saved checkpoint: {ckpt}")
         if accelerator.is_main_process and (epoch + 1) == train_cfg.epochs:
             accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
             latest_ckpt = train_cfg.output_dir / "latest.pth"
-            torch.save(unwrapped_model.state_dict(), latest_ckpt)
+            state_dict = {k: v.cpu() for k, v in accelerator.get_state_dict(model).items()}
+            accelerator.save(state_dict, latest_ckpt)
             logger.info(f"Saved latest checkpoint: {latest_ckpt}")
     
     accelerator.wait_for_everyone()

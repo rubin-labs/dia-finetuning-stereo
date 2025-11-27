@@ -1009,9 +1009,11 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             model, opt, train_loader, sched = accelerator.prepare(
                 model, opt, train_loader, sched
             )
+        use_xla_native = False
     else:
-        # No sharding: keep original loaders; still prepare model/opt/sched for XLA hooks
-        model, opt, sched = accelerator.prepare(model, opt, sched)
+        # No sharding: keep original loaders; run native XLA stepping
+        model = model.to(accelerator.device)
+        use_xla_native = True
         if pre_steps_per_epoch is not None:
             train_loader.steps_per_epoch = pre_steps_per_epoch
 
@@ -1080,7 +1082,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             batch_start = time.time()
             
             # Updated train step signature
-            loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator)
+            loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator, use_xla_native)
             
             total_step_time = time.time() - batch_start
 
@@ -1251,7 +1253,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     accelerator.wait_for_everyone()
 
 
-def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator: Accelerator):
+def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator: Accelerator, use_xla_native: bool):
     global _nonfinite_hits
 
     gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
@@ -1327,13 +1329,20 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
             raise RuntimeError(f"Aborting: non-finite loss encountered {NONFINITE_HIT_LIMIT} times.")
         return float('nan')
 
-    # Backward pass (use Accelerate to keep optimizer hooks intact on XLA)
-    accelerator.backward(loss)
+    # Backward pass
+    if use_xla_native and HAS_XLA:
+        loss.backward()
+    else:
+        accelerator.backward(loss)
     
     # Manual gradient accumulation: only step optimizer every grad_accum_steps
     if (step + 1) % train_cfg.grad_accum_steps == 0:
-        accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        opt.step()
+        if use_xla_native and HAS_XLA:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            xm.optimizer_step(opt, barrier=False)
+        else:
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            opt.step()
         sched.step()
         opt.zero_grad()
     

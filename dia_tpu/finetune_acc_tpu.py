@@ -523,9 +523,10 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
         batch_size=train_cfg.batch_size, 
         shuffle=True,
         collate_fn=collate,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=False,
         drop_last=True,
+        persistent_workers=False,
     )
     
     steps_per_epoch = len(train_loader)
@@ -538,7 +539,8 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
             shuffle=False, 
             collate_fn=collate,
             num_workers=0, # Eval usually fine with 0, or 1
-            pin_memory=True
+            pin_memory=False,
+            persistent_workers=False,
         )
     else:
         val_loader = None
@@ -622,9 +624,8 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, accelerator: A
     
     if val_loader is not None:
         # Accelerator handles device placement
-        # No strict need for torch.inference_mode() if we wrap in torch.no_grad(), 
-        # but inference_mode is better. Accelerate doesn't conflict with it.
-        with torch.inference_mode():
+        # Use torch.no_grad() instead of inference_mode to keep weight_norm happy (it bumps version counters)
+        with torch.no_grad():
             # Only show progress bar on main process
             disable_tqdm = not accelerator.is_local_main_process
             for eb in tqdm(val_loader, desc="eval", disable=disable_tqdm):

@@ -880,6 +880,19 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     # Accelerate should handle TPU data loading internally
 
     model.train()
+    
+    # CRITICAL FOR TPU: Initialize optimizer state before training to avoid
+    # graph recompilation on step 2. AdamW lazily creates momentum/variance
+    # tensors on first opt.step(), which changes the graph structure.
+    if HAS_XLA:
+        for param_group in opt.param_groups:
+            for p in param_group['params']:
+                if p.requires_grad:
+                    state = opt.state[p]
+                    if len(state) == 0:
+                        state['step'] = torch.tensor(0.0)
+                        state['exp_avg'] = torch.zeros_like(p)
+                        state['exp_avg_sq'] = torch.zeros_like(p)
 
     steps_per_epoch = getattr(train_loader, 'steps_per_epoch', None)
     if steps_per_epoch is None:

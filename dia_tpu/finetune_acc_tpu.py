@@ -243,6 +243,7 @@ class TrainConfig:
     run_name: str = "dia_finetune_cv"
     output_dir: Path = None
     no_decay_embed: bool = False
+    split_ratio: float = 0.997
 
 
 def load_train_config(config_path: Path) -> dict:
@@ -265,6 +266,7 @@ def load_train_config(config_path: Path) -> dict:
         flat['warmup_steps'] = cfg['training'].get('warmup_steps')
         flat['unconditional_frac'] = cfg['training'].get('unconditional_frac')
         flat['weight_decay'] = cfg['training'].get('weight_decay')
+        flat['split_ratio'] = cfg['training'].get('split_ratio')
     if 'output' in cfg:
         flat['output_dir'] = cfg['output'].get('output_dir')
         flat['run_name'] = cfg['output'].get('run_name')
@@ -351,6 +353,8 @@ def get_args() -> argparse.Namespace:
                         help="Number of warmup steps.")
     parser.add_argument("--unconditional_frac", type=float, default=cfg_defaults.get('unconditional_frac'),
                         help="Fraction of unconditional training steps.")
+    parser.add_argument("--split_ratio", type=float, default=cfg_defaults.get('split_ratio', 0.997),
+                        help="Train/val split ratio (default: 0.997)")
     parser.add_argument("--eval_step", type=int, default=cfg_defaults.get('eval_step', 200),
                         help="Run evaluation every N steps (default: 200).")
     parser.add_argument("--demo_every", type=int, default=cfg_defaults.get('demo_every', 2000),

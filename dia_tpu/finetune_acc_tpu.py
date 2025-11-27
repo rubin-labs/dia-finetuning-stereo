@@ -985,6 +985,10 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
 
     # Decide whether to shard the dataloaders; for tiny datasets (e.g., 1 sample) we disable sharding
     shard_dataloaders = not args.no_data_sharding
+    if pre_dataset_len == 1:
+        shard_dataloaders = False
+        if accelerator.is_main_process:
+            logger.warning("Dataset has exactly 1 sample; disabling sharding so every process reads it.")
     if shard_dataloaders and pre_dataset_len is not None and pre_dataset_len < accelerator.num_processes:
         shard_dataloaders = False
         if accelerator.is_main_process:
@@ -1012,13 +1016,11 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
             raise RuntimeError("Accelerate version does not support prepare_data_loader; cannot disable sharding safely.")
         train_loader = accelerator.prepare_data_loader(
             train_loader,
-            shuffle=True,
             distributed_kwargs={"use_distributed_sampler": False},
         )
         if val_loader:
             val_loader = accelerator.prepare_data_loader(
                 val_loader,
-                shuffle=False,
                 distributed_kwargs={"use_distributed_sampler": False},
             )
         # Preserve precomputed steps_per_epoch for logging/loops

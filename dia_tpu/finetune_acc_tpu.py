@@ -630,38 +630,46 @@ def eval_demo_step(
     if not accelerator.is_main_process:
         return
     
+    print(f"[DEBUG PRINT] eval_demo_step: Starting at step {global_step}", flush=True)
     logger.info(f"Starting eval demo generation at step {global_step}")
     import sys
     sys.stdout.flush()
     
     # Create audio demo directory
+    print(f"[DEBUG PRINT] eval_demo_step: Creating audio dir...", flush=True)
     audio_dir = Path(EVAL_AUDIO_DIR)
     audio_dir.mkdir(parents=True, exist_ok=True)
     
     # Unwrap model if needed
+    print(f"[DEBUG PRINT] eval_demo_step: Unwrapping model...", flush=True)
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.eval()
+    print(f"[DEBUG PRINT] eval_demo_step: Model unwrapped and set to eval", flush=True)
     
     audio_samples = {}
     seeds = [train_cfg.seed, train_cfg.seed + 1, train_cfg.seed + 2]
     
+    print(f"[DEBUG PRINT] eval_demo_step: Starting loop over {len(seeds)} seeds", flush=True)
     try:
         for i, s in enumerate(seeds):
+            print(f"[DEBUG PRINT] eval_demo_step: Starting demo {i+1}/{len(seeds)}, seed={s}", flush=True)
             try:
                 logger.info(f"[DEBUG] Starting demo {i+1}/3, seed={s}")
                 seed_everything(s)
                 logger.info(f"[DEBUG] Seed set, calling generate_audio_simple...")
                 logger.info(f"Generating demo {i+1}/3 (seed={s}, temp=0, cfg=0, prompt='')")
                 
-                # Generate audio codes
-                logger.info(f"[DEBUG] About to call generate_audio_simple with max_steps={data_cfg.audio_length}")
+                # Generate audio codes - limit to 100 steps for testing to avoid hanging
+                test_max_steps = min(100, data_cfg.audio_length)  # Limit for testing
+                print(f"[DEBUG PRINT] About to call generate_audio_simple with max_steps={test_max_steps} (limited from {data_cfg.audio_length})", flush=True)
+                logger.info(f"[DEBUG] About to call generate_audio_simple with max_steps={test_max_steps}")
                 generated_codes = generate_audio_simple(
                     model=unwrapped_model,
                     data_cfg=data_cfg,
                     device=device,
                     text="",
                     temperature=0.0,
-                    max_steps=data_cfg.audio_length,
+                    max_steps=test_max_steps,
                 )
                 logger.info(f"[DEBUG] generate_audio_simple returned, shape={generated_codes.shape if generated_codes is not None else None}")
                 
@@ -1187,29 +1195,34 @@ def train(model, data_cfg: DataSettings, dataset, train_cfg: TrainConfig, args, 
                 print(f"[DEBUG PRINT] Checking eval: eval_every={eval_every}, global_step={global_step}, modulo={global_step % eval_every if global_step > 0 else 'N/A'}, dac={'yes' if dac_model is not None else 'no'}", flush=True)
             
             if eval_every > 0 and global_step > 0 and global_step % eval_every == 0 and dac_model is not None:
-                print(f"[DEBUG PRINT] EVAL TRIGGERED! global_step={global_step}", flush=True)
-                logger.info(f"[DEBUG] Eval trigger: eval_every={eval_every}, global_step={global_step}, dac_model={'present' if dac_model is not None else 'None'}")
-                import sys
-                sys.stdout.flush()
-                logger.info(f"[DEBUG] Waiting for all processes...")
-                accelerator.wait_for_everyone()
-                logger.info(f"[DEBUG] Setting model to eval mode...")
-                model.eval()
-                logger.info(f"[DEBUG] Entering torch.no_grad() context...")
-                with torch.no_grad():
-                    logger.info(f"[DEBUG] Calling eval_demo_step...")
-                    eval_demo_step(
-                        model=model,
-                        data_cfg=data_cfg,
-                        dac_model=dac_model,
-                        global_step=global_step,
-                        device=accelerator.device,
-                        accelerator=accelerator,
-                        train_cfg=train_cfg,
-                    )
-                logger.info(f"[DEBUG] Eval complete, setting model back to train mode...")
-                model.train()
-                logger.info(f"[DEBUG] Model back to train mode")
+                print(f"[DEBUG PRINT] EVAL TRIGGERED! global_step={global_step}, is_main={accelerator.is_main_process}", flush=True)
+                
+                # Only main process does eval, but all processes need to sync
+                if accelerator.is_main_process:
+                    logger.info(f"[DEBUG] Main process: Starting eval at step {global_step}")
+                    print(f"[DEBUG PRINT] Main process: About to wait for everyone...", flush=True)
+                    accelerator.wait_for_everyone()
+                    print(f"[DEBUG PRINT] Main process: Wait complete, setting model to eval...", flush=True)
+                    model.eval()
+                    print(f"[DEBUG PRINT] Main process: Model in eval mode, calling eval_demo_step...", flush=True)
+                    with torch.no_grad():
+                        eval_demo_step(
+                            model=model,
+                            data_cfg=data_cfg,
+                            dac_model=dac_model,
+                            global_step=global_step,
+                            device=accelerator.device,
+                            accelerator=accelerator,
+                            train_cfg=train_cfg,
+                        )
+                    print(f"[DEBUG PRINT] Main process: Eval complete, setting model back to train...", flush=True)
+                    model.train()
+                    print(f"[DEBUG PRINT] Main process: Model back to train mode", flush=True)
+                else:
+                    # Non-main processes just wait and continue
+                    print(f"[DEBUG PRINT] Non-main process: Waiting for main process to finish eval...", flush=True)
+                    accelerator.wait_for_everyone()
+                    print(f"[DEBUG PRINT] Non-main process: Eval sync complete", flush=True)
 
             should_save = train_cfg.save_step > 0 and global_step > 0 and (global_step % train_cfg.save_step == 0)
             if should_save:

@@ -3,15 +3,12 @@ warnings.filterwarnings("ignore", message="`torch.nn.utils.weight_norm` is depre
 
 import argparse
 import logging
-import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
-import resource
 
 import torch
-import torchaudio
 # DDP imports removed
 from torch.utils.data import DataLoader
 # autocast removed - handled by Accelerate
@@ -26,8 +23,6 @@ from huggingface_hub import hf_hub_download
 import gc
 import wandb
 import time
-import re
-import glob
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -53,37 +48,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.backends.cudnn.benchmark = True
-
 
 CODEBOOK_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 NONFINITE_HIT_LIMIT = 3
 _nonfinite_hits = 0
-
-
-TAG_SHUFFLE = True
-TAG_DROPOUT = 0.0
-TAG_LIMIT = None  # type: int | None
-
-
-def _augment_tags(text: str) -> str:
-    try:
-        tags = [t.strip() for t in text.split(',') if t.strip()]
-        if not tags:
-            return text
-        if TAG_DROPOUT and TAG_DROPOUT > 0.0:
-            kept = [t for t in tags if random.random() > TAG_DROPOUT]
-            if kept:
-                tags = kept
-        if TAG_SHUFFLE and len(tags) > 1:
-            random.shuffle(tags)
-        if TAG_LIMIT is not None and TAG_LIMIT > 0:
-            tags = tags[:TAG_LIMIT]
-        return ', '.join(tags)
-    except Exception:
-        return text
 
 
 def seed_everything(seed: int):
@@ -95,46 +64,6 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def compute_vocabulary_coverage(dataset, max_valid_token=1023):
-    """
-    Compute vocabulary coverage statistics for a dataset.
-    
-    Returns dict with:
-        - unique_tokens: set of unique token IDs found
-        - coverage_pct: percentage of vocabulary covered (out of 1024 DAC codes)
-        - token_counts: Counter of token frequencies
-    """
-    from collections import Counter
-    
-    all_tokens = set()
-    token_counts = Counter()
-    
-    logger.info(f"Computing vocabulary coverage for {len(dataset)} samples...")
-    
-    for i in range(len(dataset)):
-        try:
-            _, encoded, _ = dataset[i]
-            # encoded is (T, C) tensor of audio codes
-            tokens = encoded.flatten().tolist()
-            # Filter to valid audio tokens (0-1023), exclude special tokens
-            valid_tokens = [t for t in tokens if 0 <= t <= max_valid_token]
-            all_tokens.update(valid_tokens)
-            token_counts.update(valid_tokens)
-        except Exception as e:
-            logger.warning(f"Error processing sample {i} for vocab coverage: {e}")
-            continue
-    
-    coverage_pct = len(all_tokens) / (max_valid_token + 1) * 100
-    
-    return {
-        'unique_tokens': all_tokens,
-        'num_unique': len(all_tokens),
-        'coverage_pct': coverage_pct,
-        'token_counts': token_counts,
-        'total_tokens': sum(token_counts.values()),
-    }
 
 
 def strip_weight_norms(module: torch.nn.Module) -> int:
@@ -158,80 +87,6 @@ def strip_weight_norms(module: torch.nn.Module) -> int:
             except ValueError:
                 pass
     return removed
-
-
-def verify_dac_encoding(audio_path: Path, dac_model: dac.DAC, seconds: float = 1.0, target_sr: int = 44100):
-    """
-    Run a quick DAC encode on a short snippet to ensure the pipeline works.
-    Handles mono or stereo by encoding each channel separately (DAC expects 1ch).
-    Raises on failure; logs the produced code shape on success.
-    """
-    device = next(dac_model.parameters()).device
-    try:
-        waveform, sr = torchaudio.load(audio_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load audio for DAC verification: {audio_path}") from e
-    
-    if sr != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-    
-    # Use at most the requested seconds to keep verification fast
-    max_samples = int(seconds * target_sr)
-    if waveform.shape[1] > max_samples:
-        waveform = waveform[:, :max_samples]
-    
-    # Encode each channel separately; DAC conv expects a single channel input
-    num_ch = waveform.shape[0]
-    if num_ch > 2:
-        raise RuntimeError(f"DAC verification only supports mono/stereo, got {num_ch} channels in {audio_path}")
-    
-    channel_codes = []
-    with torch.no_grad():
-        for ch in range(min(num_ch, 2)):
-            mono = waveform[ch:ch + 1, :]
-            audio_tensor = dac_model.preprocess(mono.unsqueeze(0), target_sr).to(device)
-            _, enc, *_ = dac_model.encode(audio_tensor, n_quantizers=None)
-            if enc is None or enc.numel() == 0:
-                raise RuntimeError("DAC verification produced empty codes.")
-            channel_codes.append(enc.squeeze(0).transpose(0, 1))  # (T, 9)
-
-    # If mono, duplicate to both sides so shape matches stereo training path
-    if len(channel_codes) == 1:
-        enc_stereo = torch.cat([channel_codes[0], channel_codes[0]], dim=1)
-    else:
-        enc_stereo = torch.cat(channel_codes, dim=1)
-    
-    logger.info("DAC verification succeeded on %s -> codes shape %s", audio_path, tuple(enc_stereo.shape))
-    return enc_stereo
-
-
-def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):
-    """Keep only the last N checkpoints, delete older ones to save space."""
-    if keep_last_n is None:
-        return
-    
-    # Find all checkpoint files (both step and epoch checkpoints)
-    step_checkpoints = sorted(glob.glob(str(output_dir / "ckpt_step*.pth")), 
-                            key=lambda x: int(re.search(r'ckpt_step(\d+).pth', x).group(1)) if re.search(r'ckpt_step(\d+).pth', x) else 0)
-    epoch_checkpoints = sorted(glob.glob(str(output_dir / "ckpt_epoch*.pth")),
-                             key=lambda x: int(re.search(r'ckpt_epoch(\d+).pth', x).group(1)) if re.search(r'ckpt_epoch(\d+).pth', x) else 0)
-    
-    # Keep latest N of each type
-    if len(step_checkpoints) > keep_last_n:
-        for old_ckpt in step_checkpoints[:-keep_last_n]:
-            try:
-                os.remove(old_ckpt)
-                logger.info(f"Removed old checkpoint: {old_ckpt}")
-            except Exception as e:
-                logger.warning(f"Failed to remove {old_ckpt}: {e}")
-    
-    if len(epoch_checkpoints) > keep_last_n:
-        for old_ckpt in epoch_checkpoints[:-keep_last_n]:
-            try:
-                os.remove(old_ckpt)
-                logger.info(f"Removed old checkpoint: {old_ckpt}")
-            except Exception as e:
-                logger.warning(f"Failed to remove {old_ckpt}: {e}")
 
 
 # Removed DDP setup functions as they are replaced by Accelerator
@@ -261,7 +116,6 @@ def load_train_config(config_path: Path) -> dict:
     with open(config_path) as f:
         cfg = json.load(f)
     flat = {}
-    flat['experiment_id'] = cfg.get('experiment_id')
     if 'data' in cfg:
         flat['preencoded_dir'] = cfg['data'].get('preencoded_dir')
         flat['audio_folder'] = cfg['data'].get('audio_folder')
@@ -277,15 +131,8 @@ def load_train_config(config_path: Path) -> dict:
     if 'output' in cfg:
         flat['output_dir'] = cfg['output'].get('output_dir')
         flat['run_name'] = cfg['output'].get('run_name')
-        flat['save_every'] = cfg['output'].get('save_every')
-        flat['save_after_epoch'] = cfg['output'].get('save_after_epoch')
-        flat['save_last'] = cfg['output'].get('save_last')
     if 'flags' in cfg:
         flat['scratch'] = cfg['flags'].get('scratch')
-        flat['tag_no_shuffle'] = cfg['flags'].get('tag_no_shuffle')
-        flat['force_single_gpu'] = cfg['flags'].get('force_single_gpu')
-        flat['use_sliding_window'] = cfg['flags'].get('use_sliding_window')
-        flat['require_prompts'] = cfg['flags'].get('require_prompts')
         flat['no_decay_embed'] = cfg['flags'].get('no_decay_embed')
     
     # Root level or training level seed
@@ -326,21 +173,6 @@ def get_args() -> argparse.Namespace:
                         help="Weights & Biases project name.")
     parser.add_argument("--wandb_entity", type=str, default=None,
                         help="Weights & Biases entity/team name.")
-    parser.add_argument("--save_every", type=int, default=cfg_defaults.get('save_every'),
-                        help="Save checkpoint every N steps (overrides TrainConfig.save_step).")
-    parser.add_argument("--save_last", type=int, default=cfg_defaults.get('save_last'),
-                        help="Keep only the last N checkpoints (e.g., --save_last 4). Saves disk space.")
-    parser.add_argument("--force_single_gpu", action="store_true", default=cfg_defaults.get('force_single_gpu', False),
-                        help="Force single GPU training even with multiple GPUs available")
-    parser.add_argument("--tag_shuffle", action="store_true", default=True,
-                        help="Shuffle comma-separated tags in prompts (default: on)")
-    parser.add_argument("--tag_no_shuffle", action="store_true", default=cfg_defaults.get('tag_no_shuffle', False),
-                        help="Disable tag shuffling (overrides --tag_shuffle)")
-    parser.add_argument("--tag_dropout", type=float, default=0.0,
-                        help="Per-tag dropout probability in [0,1] (default: 0.0)")
-    parser.add_argument("--tag_limit", type=int, default=None,
-                        help="Keep at most this many tags after shuffle/dropout (default: unlimited)")
-    
     parser.add_argument("--epochs", type=int, default=cfg_defaults.get('epochs', 500),
                         help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=cfg_defaults.get('batch_size', 4),
@@ -355,29 +187,11 @@ def get_args() -> argparse.Namespace:
                         help="Number of warmup steps.")
     parser.add_argument("--unconditional_frac", type=float, default=cfg_defaults.get('unconditional_frac'),
                         help="Fraction of unconditional training steps.")
-    parser.add_argument("--save_every_epochs", type=int, default=None,
-                        help="Save checkpoint at the end of every N epochs (overrides step-based save).")
-    parser.add_argument("--save_after_epoch", type=int, default=cfg_defaults.get('save_after_epoch', 0),
-                        help="Only start saving checkpoints after this epoch (default: 0, save from start).")
-    parser.add_argument("--early_stop_loss", type=float, default=None,
-                        help="Early stop when training loss <= this value; saves final checkpoint then exits.")
-    parser.add_argument("--skip_dac_verify", action="store_true", default=False,
-                        help="Skip one-off DAC encoding verification when using --audio_folder.")
-    
-    parser.add_argument("--use_sliding_window", action="store_true", default=cfg_defaults.get('use_sliding_window', False),
-                        help="Enable sliding window: random cropping for data augmentation (default: off for deterministic training)")
+    parser.add_argument("--scratch", action="store_true", default=cfg_defaults.get('scratch', False),
+                        help="Train from scratch (random initialization) instead of loading a checkpoint.")
     parser.add_argument("--no_decay_embed", action="store_true", default=cfg_defaults.get('no_decay_embed', False),
                         help="Exclude nn.Embedding parameters from weight decay")
     
-    parser.add_argument("--require_prompts", action="store_true", default=cfg_defaults.get('require_prompts', False),
-                        help="Fail if audio file is missing a corresponding prompt file (default: skip missing)")
-    parser.add_argument("--skip_tags", type=str, default=None,
-                        help="Comma-separated list of tags to skip (e.g. 'vocals,speech')")
-    parser.add_argument("--scratch", action="store_true", default=cfg_defaults.get('scratch', False),
-                        help="Train from scratch (random initialization) instead of loading a checkpoint.")
-    parser.add_argument("--no_data_sharding", action="store_true", default=False,
-                        help="Disable distributed sampler and replicate data on every device (useful for tiny/overfit datasets).")
-
     args = parser.parse_args()
     
     if args.output_dir is None:
@@ -389,17 +203,14 @@ def get_args() -> argparse.Namespace:
 
 
 
-def collate_fn(batch, config: DiaConfig, device: torch.device, use_sliding_window: bool = True):
+def collate_fn(batch, config: DiaConfig, device: torch.device):
     texts, encodings, waveforms = zip(*batch)
 
     window_size = config.data.audio_length
     cropped_encodings = []
     for e in encodings:
         if e.size(0) > window_size:
-            if use_sliding_window:
-                start = random.randint(0, e.size(0) - window_size)
-            else:
-                start = 0
+            start = random.randint(0, e.size(0) - window_size)
             cropped_encodings.append(e[start : start + window_size])
         else:
             cropped_encodings.append(e)
@@ -409,8 +220,7 @@ def collate_fn(batch, config: DiaConfig, device: torch.device, use_sliding_windo
     pad_tok = config.data.text_pad_value
     text_ids = []
     for txt in texts:
-        txt_aug = _augment_tags(txt)
-        b_full = txt_aug.encode('utf-8')
+        b_full = txt.encode('utf-8')
         bts = b_full[:max_text]
         arr = list(bts) + [pad_tok] * (max_text - len(bts))
         text_ids.append(torch.tensor(arr, dtype=torch.long))
@@ -483,8 +293,8 @@ def collate_fn(batch, config: DiaConfig, device: torch.device, use_sliding_windo
 
 from functools import partial
 
-def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_sliding_window=True):
-    collate = partial(collate_fn, config=dia_cfg, device=torch.device("cpu"), use_sliding_window=use_sliding_window)
+def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig):
+    collate = partial(collate_fn, config=dia_cfg, device=torch.device("cpu"))
     
     ds_len = len(dataset)
     if ds_len == 0:
@@ -613,9 +423,8 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
     
     # No need for barrier or manual DDP wrap or manual device move
     
-    use_sliding_window = args.use_sliding_window
     # Note: setup_loaders now returns a standard DataLoader; Accelerator wraps it later
-    train_loader = setup_loaders(dataset, dia_cfg, train_cfg, use_sliding_window)
+    train_loader = setup_loaders(dataset, dia_cfg, train_cfg)
     opt = setup_optimizer(model, train_cfg)
 
     # Cache lengths before Accelerator potentially shards loaders
@@ -632,7 +441,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
         pass
 
     # Decide whether to shard the dataloaders; for tiny datasets (e.g., 1 sample) we disable sharding
-    shard_dataloaders = not args.no_data_sharding
+    shard_dataloaders = True
     if pre_dataset_len == 1:
         shard_dataloaders = False
         if accelerator.is_main_process:
@@ -707,12 +516,9 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
 
     sched = setup_scheduler(opt, train_cfg, steps_per_epoch)
 
-    stop_training = False
     for epoch in range(train_cfg.epochs):
         # No manual sampler set_epoch needed; Accelerator handles it if it wrapped the loader
-        
-        loss = 0.0 # Initialize loss to avoid UnboundLocalError if loop is empty
-        
+
         if accelerator.is_main_process:
             loader_iter = tqdm(
                 train_loader,
@@ -737,23 +543,11 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
 
             if accelerator.is_main_process:
                 # VRAM stats might be GPU specific, but let's keep basic logging
-                # For TPU we might not get torch.cuda stats
-                if torch.cuda.is_available():
-                    cur_alloc = torch.cuda.memory_allocated()
-                    peak_alloc = torch.cuda.max_memory_allocated()
-                    cur_gb  = cur_alloc  / 1024**3
-                    peak_gb = peak_alloc / 1024**3
-                    vram_str = f"{cur_gb:.2f}/{peak_gb:.2f}"
-                    torch.cuda.reset_peak_memory_stats()
-                else:
-                    vram_str = "N/A"
-                
                 current_lr = sched.get_last_lr()[0]
                 
                 if isinstance(loader_iter, tqdm):
                     loader_iter.set_postfix({
                         'loss': f"{loss:.4f}",
-                        'VRAM (GB)': vram_str,
                         'step_time': f"{total_step_time:.1f}s"
                     })
                 
@@ -763,14 +557,7 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                     'learning_rate': current_lr,
                 }, step=global_step)
 
-            should_save = False
-            past_save_threshold = (epoch + 1) > args.save_after_epoch
-            if args.save_every_epochs is None and past_save_threshold:
-                if args.save_every is not None:
-                    should_save = global_step > 0 and global_step % args.save_every == 0
-                else:
-                    should_save = global_step > 0 and global_step % train_cfg.save_step == 0
-            
+            should_save = train_cfg.save_step > 0 and global_step > 0 and (global_step % train_cfg.save_step == 0)
             if should_save:
                 # Wait for everyone before saving
                 accelerator.wait_for_everyone()
@@ -779,56 +566,12 @@ def train(model, dia_cfg: DiaConfig, dac_model: dac.DAC, dataset, train_cfg: Tra
                     unwrapped_model = accelerator.unwrap_model(model)
                     torch.save(unwrapped_model.state_dict(), ckpt)
                     logger.info(f"Saved checkpoint: {ckpt}")
-                    
-                    # Cleanup old checkpoints
-                    cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
-
-            if args.early_stop_loss is not None:
-                # Check local loss condition
-                local_stop = 1.0 if loss <= args.early_stop_loss else 0.0
-                flag = torch.tensor(local_stop, device=accelerator.device)
-                # Reduce: if any process wants to stop, all stop (max > 0)
-                flag = accelerator.reduce(flag, reduction="max")
-                
-                if flag.item() > 0.5:
-                    if accelerator.is_main_process:
-                        # Save final checkpoints
-                        final_ckpt = train_cfg.output_dir / f"ckpt_final_step{global_step}.pth"
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        torch.save(unwrapped_model.state_dict(), final_ckpt)
-                        latest_ckpt = train_cfg.output_dir / "latest.pth"
-                        torch.save(unwrapped_model.state_dict(), latest_ckpt)
-                        logger.info(f"Early stop triggered (loss <= {args.early_stop_loss}). Saved final checkpoints.")
-                        cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
-                    
-                    stop_training = True
-
-        if stop_training:
-            break
-
-        if accelerator.is_main_process:
-            is_last_epoch = (epoch + 1) == train_cfg.epochs
-            past_save_threshold = (epoch + 1) > args.save_after_epoch
-            
-            should_save_epoch = False
-            if args.save_every_epochs is not None:
-                should_save_epoch = ((epoch + 1) % args.save_every_epochs == 0) and past_save_threshold
-            else:
-                should_save_epoch = (args.save_every is None and past_save_threshold) or is_last_epoch
-            
-            if should_save_epoch:
-                ckpt_e = train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth"
-                accelerator.wait_for_everyone()
-                unwrapped_model = accelerator.unwrap_model(model)
-                torch.save(unwrapped_model.state_dict(), ckpt_e)
-                logger.info(f"Saved end-of-epoch checkpoint: {ckpt_e}")
-                if is_last_epoch:
-                    latest_ckpt = train_cfg.output_dir / "latest.pth"
-                    torch.save(unwrapped_model.state_dict(), latest_ckpt)
-                    logger.info(f"Saved latest checkpoint: {latest_ckpt}")
-                
-                # Cleanup old checkpoints
-                cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
+        if accelerator.is_main_process and (epoch + 1) == train_cfg.epochs:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            latest_ckpt = train_cfg.output_dir / "latest.pth"
+            torch.save(unwrapped_model.state_dict(), latest_ckpt)
+            logger.info(f"Saved latest checkpoint: {latest_ckpt}")
     
     accelerator.wait_for_everyone()
 
@@ -954,11 +697,6 @@ def run_training(args):
         logger.info(f"Accelerator initialized. Device: {accelerator.device}, Num processes: {accelerator.num_processes}")
 
     dia_cfg = DiaConfig.load(args.config)
-    
-    global TAG_SHUFFLE, TAG_DROPOUT, TAG_LIMIT
-    TAG_SHUFFLE = False if getattr(args, 'tag_no_shuffle', False) else bool(getattr(args, 'tag_shuffle', True))
-    TAG_DROPOUT = float(getattr(args, 'tag_dropout', 0.0))
-    TAG_LIMIT = getattr(args, 'tag_limit', None)
 
     if accelerator.is_main_process:
         print(f"Loaded config from: {args.config}")
@@ -974,26 +712,10 @@ def run_training(args):
     if accelerator.is_main_process and removed_dac_wn:
         logger.info("Removed %d weight_norm wrappers from DAC model for XLA compatibility", removed_dac_wn)
 
-    use_sliding_window = args.use_sliding_window
-    allow_empty_prompts = args.unconditional_frac >= 1.0 and not args.require_prompts
-    if allow_empty_prompts and accelerator.is_main_process:
-        logger.warning("unconditional_frac >= 1.0; allowing missing prompts by using empty strings.")
     if args.preencoded_dir:
-        dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
+        dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window=True)
     elif args.audio_folder:
-        skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
-        dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
-                             ignore_missing_prompts=not args.require_prompts,
-                             skip_tags=skip_tags_list,
-                             allow_empty_prompts=allow_empty_prompts)
-        # Quick one-off verification that DAC encoding works on the current environment
-        if accelerator.is_main_process and not args.skip_dac_verify:
-            try:
-                sample_audio = dataset.valid_files[0]
-                verify_dac_encoding(sample_audio, dac_model)
-            except Exception as e:
-                logger.error("DAC encoding verification failed: %s", e)
-                raise
+        dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window=True)
     else:
         raise ValueError("Must specify either --audio_folder or --preencoded_dir")
 
@@ -1018,7 +740,6 @@ def run_training(args):
             print("Initializing model from scratch (random weights)...")
         if hasattr(model, '_init_weights'):
             model._init_weights()
-        expanded_stereo = False
     else:
         if args.local_ckpt:
             ckpt_file = args.local_ckpt
@@ -1026,66 +747,11 @@ def run_training(args):
             ckpt_file = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
         
         state = torch.load(ckpt_file, map_location="cpu")
-        expanded_stereo = False
-
-        try:
-            key = "decoder.logits_dense.weight"
-            if key in state:
-                expected_W = model.decoder.logits_dense.weight
-                W_ckpt = state[key]
-                if (
-                    W_ckpt is not None
-                    and expected_W is not None
-                    and W_ckpt.dim() == 3
-                    and expected_W.dim() == 3
-                    and W_ckpt.shape[0] == expected_W.shape[0]
-                    and W_ckpt.shape[2] == expected_W.shape[2]
-                    and W_ckpt.shape[1] != expected_W.shape[1]
-                ):
-                    if W_ckpt.shape[1] * 2 == expected_W.shape[1]:
-                        state[key] = torch.cat([W_ckpt, W_ckpt], dim=1)
-                        expanded_stereo = True
-                        if accelerator.is_main_process:
-                            logger.info(
-                                f"Expanded {key} from {tuple(W_ckpt.shape)} to {tuple(state[key].shape)} by duplication"
-                            )
-                    else:
-                        del state[key]
-                        if accelerator.is_main_process:
-                            logger.warning(
-                                f"Removed {key} from checkpoint due to incompatible shape {tuple(W_ckpt.shape)} -> expected {tuple(expected_W.shape)}"
-                            )
-        except Exception as e:
-            if accelerator.is_main_process:
-                logger.warning(f"While adapting checkpoint weights: {e}")
-        
         missing, unexpected = model.load_state_dict(state, strict=False)
         if accelerator.is_main_process:
             logger.info(f"Loaded checkpoint with strict=False; missing={len(missing)}, unexpected={len(unexpected)}")
-        
-        if expanded_stereo:
-            try:
-                if dia_cfg.data.channels == 18:
-                    if accelerator.is_main_process:
-                        logger.info("Warm-starting stereo channels (copying Left -> Right)...")
-                    if hasattr(model.decoder, "embeddings") and len(model.decoder.embeddings) >= 18:
-                        for i in range(9, 18):
-                            model.decoder.embeddings[i].weight.data.copy_(model.decoder.embeddings[i - 9].weight.data)
-                    W = model.decoder.logits_dense.weight
-                    if W.dim() == 3 and W.shape[1] >= 18:
-                        W.data[:, 9:18, :].copy_(W.data[:, 0:9, :])
-            except Exception as e:
-                if accelerator.is_main_process:
-                    logger.warning(f"Stereo warm-start duplication skipped: {e}")
-        else:
-            if dia_cfg.data.channels == 18 and accelerator.is_main_process:
-                logger.info("Skipping stereo warm-start duplication (loaded checkpoint appears to be stereo already)")
         del state
         gc.collect()
-
-        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        if accelerator.is_main_process:
-            logger.info(f"Rank {accelerator.process_index} after checkpoint load RSS ~{rss_mb:.1f} MB (PID {os.getpid()})")
 
     removed_model_wn = strip_weight_norms(model)
     if accelerator.is_main_process and removed_model_wn:

@@ -1140,12 +1140,13 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
             )
         loss = loss_c / sum(channel_weights)
 
-        # Compute output entropy every 50 steps (measures model confidence)
-        if global_step % 50 == 0:
-            # Compute entropy on detached logits
-            entropy = compute_output_entropy(logits.detach())
-            if accelerator.is_main_process:
-                wandb.log({'output_entropy': entropy}, step=global_step)
+        # Note: compute_output_entropy disabled for TPU - the .item() call forces
+        # premature graph execution which causes recompilation every step.
+        # Uncomment for GPU training if needed.
+        # if global_step % 50 == 0:
+        #     entropy = compute_output_entropy(logits.detach())
+        #     if accelerator.is_main_process:
+        #         wandb.log({'output_entropy': entropy}, step=global_step)
 
         # Scale loss for gradient accumulation so that gradients are averaged, not summed
         loss = loss / train_cfg.grad_accum_steps

@@ -12,7 +12,7 @@ import dac
 
 from .config import DiaConfig
 from .layers import DiaModel, DenseGeneral, Attention, MlpBlock
-from .dataset import MusicDataset, PreEncodedDACDataset
+from .dataset import TestingDataset, PreEncodedDACDataset
 from . import finetune_acc
 
 # Reuse training utilities from finetune_acc
@@ -198,8 +198,7 @@ def run_ddp_worker_lora(rank: int, world_size: int, args):
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
         elif args.audio_folder:
             skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
-            dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
-                                 ignore_missing_prompts=not args.require_prompts,
+            dataset = TestingDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
                                  skip_tags=skip_tags_list)
         else:
             raise ValueError("Must specify either --audio_folder or --preencoded_dir")
@@ -363,8 +362,7 @@ def main():
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
         elif args.audio_folder:
             skip_tags_list = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
-            dataset = MusicDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
-                                 ignore_missing_prompts=not args.require_prompts,
+            dataset = TestingDataset(args.audio_folder, dia_cfg, dac_model, use_sliding_window,
                                  skip_tags=skip_tags_list)
         else:
             raise ValueError("Must specify either --audio_folder or --preencoded_dir")

@@ -8,6 +8,7 @@ import torchaudio
 from tqdm import tqdm
 
 import dac
+from dia.dac_utils import encode_waveform_stereo
 
 
 def load_prompt(prompts_dir: Path, stem: str) -> tuple[str, bool]:
@@ -82,21 +83,13 @@ def main():
 
             # Encode stereo as 9+9 codebooks by processing each channel separately
             with torch.no_grad():
-                def encode_mono(wav_1xS: torch.Tensor) -> torch.Tensor:
-                    x = model.preprocess(wav_1xS.unsqueeze(0).to(device), sr_target)  # (1,1,S)
-                    _, c, *_ = model.encode(x, n_quantizers=None)  # (1,9,T)
-                    return c.squeeze(0).transpose(0, 1).contiguous()  # (T,9)
-
-                if waveform.shape[0] >= 2:
-                    left = waveform[0:1, :]
-                    right = waveform[1:2, :]
-                    codes_L = encode_mono(left)
-                    codes_R = encode_mono(right)
-                    codes = torch.cat([codes_L, codes_R], dim=1)  # (T,18)
-                else:
-                    mono = waveform[0:1, :]
-                    codes_L = encode_mono(mono)
-                    codes = torch.cat([codes_L, codes_L], dim=1)  # (T,18)
+                codes = encode_waveform_stereo(
+                    waveform,
+                    dac_model=model,
+                    sample_rate=sr_target,
+                    device=device,
+                    dtype=None,  # convert below based on args.dtype
+                )
 
             if args.dtype == "int16":
                 save_tensor = codes.to(torch.int16).cpu()
@@ -123,5 +116,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

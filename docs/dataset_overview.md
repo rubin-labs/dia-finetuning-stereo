@@ -18,7 +18,7 @@ This document outlines the data loading and processing logic in `dia/dataset.py`
 │           │                               │                                  │
 │           ▼                               ▼                                  │
 │  ┌──────────────────┐          ┌─────────────────────┐                      │
-│  │  MusicDataset    │          │ PreEncodedDACDataset│                      │
+│  │  TestingDataset  │          │ PreEncodedDACDataset│                      │
 │  │  (on-the-fly     │          │  (fast loading)     │                      │
 │  │   DAC encoding)  │          │                     │                      │
 │  └────────┬─────────┘          └──────────┬──────────┘                      │
@@ -40,20 +40,20 @@ This document outlines the data loading and processing logic in `dia/dataset.py`
 
 ## Two Dataset Classes
 
-### 1. `MusicDataset` — On-the-fly DAC Encoding
+### 1. `TestingDataset` — On-the-fly DAC Encoding
 
 **Use case:** Development, small datasets, or when pre-encoding isn't feasible.
 
 **Warning:** Very slow due to DAC encoding blocking training. Not recommended for production.
 
 ```python
-MusicDataset(
+TestingDataset(
     audio_folder: Path,       # Folder containing raw audio files
     config: DiaConfig,        # Model configuration
     dac_model: dac.DAC,       # Pre-loaded DAC model instance
     use_sliding_window: bool, # Random vs fixed cropping (default: True)
-    ignore_missing_prompts: bool,  # Skip files without prompts (default: True)
-    skip_tags: list           # Filter out samples containing these text tags
+    skip_tags: list,          # Filter out samples containing these text tags
+    allow_empty_prompts: bool # Allow missing prompts (default: True)
 )
 ```
 
@@ -242,7 +242,7 @@ Both dataset classes return the same tuple format:
 (
     text_prompt: str,           # Text description/prompt
     encoded: Tensor (T, 18),    # DAC codes (stereo)
-    waveform: Tensor | None     # Raw waveform (MusicDataset only)
+    waveform: Tensor | None     # Raw waveform (TestingDataset only)
 )
 ```
 

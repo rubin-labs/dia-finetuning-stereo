@@ -15,9 +15,9 @@ Analysis of `dia/finetune_acc.py`, `dia/finetune_acc_lora.py`, and `dia/dataset.
 
 ### 2. Data Loading Performance Bottleneck
 **Severity:** High
-**Location:** `dataset.py` (`MusicDataset.__getitem__`, `_encode_mono_channel`)
+**Location:** `dataset.py` (`TestingDataset.__getitem__`, `_encode_mono_channel`)
 
-- **Issue:** The `MusicDataset` performs the full DAC model encoding (forward pass) inside `__getitem__`.
+- **Issue:** The `TestingDataset` performs the full DAC model encoding (forward pass) inside `__getitem__`.
 - **Mechanism:** `finetune_acc.py` sets `num_workers=0` for the DataLoader. This means data loading happens in the main process, blocking the training loop. For every audio sample, the code loads the wav, resamples it, and runs the heavy DAC encoder on the GPU (or CPU if not moved properly) sequentially.
 - **Consequence:** Training will be extremely slow as the GPU will starve waiting for the CPU/Single-threaded data loading and encoding.
 - **Fix:** Pre-encode the dataset using `scripts/preencode_audio.py` (or similar) and use `PreEncodedDACDataset`, or implement a robust multi-process caching mechanism (difficult with CUDA in workers).
@@ -34,10 +34,10 @@ Analysis of `dia/finetune_acc.py`, `dia/finetune_acc_lora.py`, and `dia/dataset.
 
 ### 4. Stereo/Mono Handling Consistency
 **Severity:** Medium
-**Location:** `dataset.py` (`MusicDataset`) vs `PreEncodedDACDataset`
+**Location:** `dataset.py` (`TestingDataset`) vs `PreEncodedDACDataset`
 
 - **Issue:**
-    - `MusicDataset` returns `(text, encoded, waveform)`.
+    - `TestingDataset` returns `(text, encoded, waveform)`.
     - `PreEncodedDACDataset` returns `(text, encoded, None)`.
 - **Consequence:** `collate_fn` expects 3 values. While current training logic doesn't seem to use the raw `waveforms` for loss calculation, any future logging or evaluation that expects `waveforms` in the batch will crash or behave unexpectedly when using pre-encoded data.
 
@@ -47,11 +47,11 @@ Analysis of `dia/finetune_acc.py`, `dia/finetune_acc_lora.py`, and `dia/dataset.
 
 - **Issue:** If metadata is missing, it falls back to `filename.replace('_', ' ')`.
 - **Consequence:** This heuristic is often insufficient for high-quality training (e.g., filenames like `track_01.pt` become prompt "track 01").
-- **Fix:** Ensure metadata is robust or add a mechanism to load separate `.txt` prompt files matching the `.pt` files (similar to `MusicDataset`).
+- **Fix:** Ensure metadata is robust or add a mechanism to load separate `.txt` prompt files matching the `.pt` files (similar to `TestingDataset`).
 
 ### 6. Inefficient Resampling
 **Severity:** Low
-**Location:** `dataset.py` (`MusicDataset`)
+**Location:** `dataset.py` (`TestingDataset`)
 
 - **Issue:** `torchaudio.functional.resample` is called on every load if SR mismatches.
 - **Consequence:** High CPU usage and latency.

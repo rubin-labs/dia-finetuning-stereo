@@ -1,6 +1,5 @@
 from typing import Any
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +7,7 @@ from torch import Tensor
 from torch.nn import RMSNorm
 
 from .config import DiaConfig
-
+from .state import KVCache
 
 def _normalize_axes(axes: tuple[int, ...], ndim: int) -> tuple[int, ...]:
     return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
@@ -129,7 +128,8 @@ class MlpBlock(nn.Module):
             dtype=compute_dtype,
             weight_dtype=weight_dtype,
         )
-        # Mark fused SwiGLU weights for He/kaiming init tuned to SiLU gates
+        # [Change 1] Mark fused SwiGLU weights for He/kaiming init tuned to SiLU gates
+            # This is a change from the original codebase to improve the initialization of the fused SwiGLU weights
         self.wi_fused.use_glu_he_init = True
 
         self.activation_fn_0 = get_activation_fn(activations[0])  # silu
@@ -211,6 +211,8 @@ class RotaryEmbedding(nn.Module):
 
 
 class KVCache:
+    # [Change 2] Add batch_size argument to KVCache
+        # This is a change from the original codebase to allow for batch size to be passed in from the attention class
     def __init__(self, num_heads, max_len, head_dim, device, batch_size=2, k=None, v=None):
         self.k = torch.zeros((batch_size, num_heads, max_len, head_dim), device=device) if k is None else k
         self.v = torch.zeros((batch_size, num_heads, max_len, head_dim), device=device) if v is None else v
@@ -849,6 +851,8 @@ class DiaModel(nn.Module):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
+            # [Change 3] Add He/kaiming init to DenseGeneral
+                # This is a change from the original codebase to improve the initialization of the DenseGeneral weights
             elif isinstance(module, DenseGeneral):
                 if getattr(module, "use_glu_he_init", False):
                     # He uniform for SwiGLU/SiLU gates: variance 2/fan_in

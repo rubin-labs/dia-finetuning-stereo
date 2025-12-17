@@ -502,17 +502,16 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                                 seed_everything(s)
                                 audio = dia_gen.generate(text="", cfg_scale=EVAL_CFG_SCALE_UNCOND, temperature=temp)
                                 path = Path(EVAL_AUDIO_DIR) / f"step_{global_step}_temp{safe_temp(temp)}_seed{s}.wav"
-                                # Assuming save_and_log_audio is your helper
-                                save_and_log_audio(audio, path, f"eval_audio/temp{safe_temp(temp)}/seed{s}", 
-                                                 f"temp={temp}", audio_samples, EVAL_SAMPLE_RATE)
+                                _save_and_log_audio(audio, path, f"eval_audio/temp{safe_temp(temp)}/seed{s}", 
+                                                 f"temp={temp}", audio_samples)
                 else:
                     cfg_s = EVAL_CFG_SCALE if train_cfg.unconditional_frac > 0 else None
                     for temp in EVAL_TEMPERATURES:
                         for name, prompt in TEST_PROMPTS.items():
                             audio = dia_gen.generate(text=prompt, cfg_scale=cfg_s, temperature=temp, top_p=EVAL_TOP_P)
                             path = Path(EVAL_AUDIO_DIR) / f"step_{global_step}_{name}_temp{safe_temp(temp)}.wav"
-                            save_and_log_audio(audio, path, f"eval_audio/temp{safe_temp(temp)}/{name}", 
-                                             f"{prompt}", audio_samples, EVAL_SAMPLE_RATE)
+                            _save_and_log_audio(audio, path, f"eval_audio/temp{safe_temp(temp)}/{name}", 
+                                             f"{prompt}", audio_samples)
                 
                 if audio_samples: 
                     wandb.log(audio_samples, step=global_step)

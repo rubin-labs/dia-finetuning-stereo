@@ -1,0 +1,35 @@
+{
+  "experiment_id": "20251127_dia_009_gpu_refactor_overfit_test",
+  "description": "Added back EOS to loss calculation as well as refactored the code to be more neat and concise. There are some univesal changes that bled over during the TPU refactor as well so this is a test to see if everything still works consistently with previous runs.",
+  
+  "data": {
+    "preencoded_dir": "/home/ocamp/dia-finetuning-stereo/data/encoded",
+    "config": "/home/ocamp/dia-finetuning-stereo/configs/architecture/experiments/20251127_dia_009_gpu_refactor_overfit_test_model.json"
+  },
+  
+  "training": {
+    "batch_size": 1,
+    "grad_accum_steps": 1,
+    "epochs": 200,
+    "learning_rate": 1e-4,
+    "warmup_steps": 0,
+    "unconditional_frac": 1
+  },
+  
+  "output": {
+    "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/experiments/20251127_dia_009_gpu_refactor_overfit_test",
+    "run_name": "20251127_dia_009_gpu_refactor_overfit_test",
+    "save_every": 2000
+  },
+  
+  "eval": {
+    "eval_step": 199,
+    "demo_every": 199
+  },
+  
+  "flags": {
+    "scratch": true,
+    "tag_no_shuffle": true,
+    "use_sliding_window": false
+  }
+}

@@ -103,3 +103,4 @@
 - `2025-11-27 14:49` [`7a355f8`] **main**: 20251126_dia_tpu_001_init
 - `2025-11-27 15:44` [`ce678a0`] **main**: 20251126_dia_tpu_001_init
 - `2025-11-27 15:52` [`ae39f17`] **main**: 20251126_dia_tpu_001_init
+- `2025-12-17 11:09` [`1e2955f`] **main**: Concise train_acc_gpu.py and train_acc_tpu.py

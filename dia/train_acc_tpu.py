@@ -358,23 +358,36 @@ def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg
     # Encoder
     encoder_out = model.encoder(src_BxS, src_pos, deterministic=True, attn_mask=enc_mask)
     
-    # Caches
+    # Static Caches
     cross_cache = model.decoder.precompute_cross_attention_kv(max_tokens, encoder_out, src_pos)
     self_cache = [KVCache(dia_cfg.model.decoder.gqa_query_heads, max_tokens, dia_cfg.model.decoder.gqa_head_dim, device, batch_size=1) for _ in range(model.decoder.num_layers)]
     
     generated = torch.full((1, 1, dia_cfg.data.channels), dia_cfg.data.audio_bos_value, dtype=torch.long, device=device)
     
+    # Pre-allocate static mask buffer
+    static_indices = torch.arange(max_tokens, device=device).view(1, 1, 1, max_tokens)
+
     # Decode Loop
     for step in range(max_tokens):
         if step % 20 == 0 and HAS_XLA: xm.mark_step()
         
         tgt_ids = generated[:, step].unsqueeze(1)
         tgt_pos = torch.full((1, 1), step, dtype=torch.long, device=device)
+        
+        # 1. Cross Mask
         dec_cross_mask = dia_gen._create_attn_mask(torch.ones((1, 1), dtype=torch.bool, device=device), src_pad, is_causal=False)
         
-        logits, new_cache_list = model.decoder.decode_step(tgt_ids, tgt_pos, encoder_out, None, dec_cross_mask, self_cache, cross_cache)
-        for i, (k, v) in enumerate(new_cache_list): self_cache[i].update_cache(k, v)
+        # 2. Self Mask (Static logic)
+        current_step_t = torch.tensor(step, device=device)
+        self_attn_mask = torch.where(
+            static_indices <= current_step_t,
+            torch.tensor(0.0, device=device),
+            torch.tensor(float('-inf'), device=device)
+        )
         
+        logits, _ = model.decoder.decode_step(tgt_ids, tgt_pos, encoder_out, self_attn_mask, dec_cross_mask, self_cache, cross_cache)
+        # Manual cache update removed
+
         # Sampling (Temperature)
         logits = logits[:, -1, :, :] # (1, C, V)
         if temp > 0:

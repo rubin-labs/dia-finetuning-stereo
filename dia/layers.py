@@ -219,6 +219,26 @@ class KVCache:
         self.current_idx = 0
         self.max_len = max_len
 
+    def update_inplace(self, k, v):
+        """
+        Writes new K/V tokens into the static buffer at current_idx.
+        Returns the FULL buffer (which is static shape).
+        """
+        seq_len = k.shape[2]
+        
+        # Safety check for overflow
+        if self.current_idx + seq_len > self.max_len:
+            # In production you might raise an error, for now we clamp/return
+            # or rely on the generation loop to stop.
+            return self.k, self.v
+
+        # In-place update (TPU efficient)
+        self.k[:, :, self.current_idx : self.current_idx + seq_len, :] = k
+        self.v[:, :, self.current_idx : self.current_idx + seq_len, :] = v
+        
+        self.current_idx += seq_len
+        return self.k, self.v
+
     def get_kv_for_attention(self, current_k, current_v):
         if self.current_idx == 0:
             return current_k, current_v
@@ -391,8 +411,10 @@ class Attention(nn.Module):
                     cache.prefill_kv(attn_k, attn_v)
                 # In decode step, we add current K/V to cache step by step
                 else:
-                    new_kv_cache = Xk_BxNxSxH, Xv_BxNxSxH
-                    attn_k, attn_v = cache.get_kv_for_attention(Xk_BxNxSxH, Xv_BxNxSxH)
+                    # STATIC CACHE: Update in-place and use FULL buffer
+                    # Note: You MUST provide an attn_mask to hide future positions
+                    attn_k, attn_v = cache.update_inplace(Xk_BxNxSxH, Xv_BxNxSxH)
+                    new_kv_cache = None
 
         attn_output = F.scaled_dot_product_attention(
             Xq_BxNxTxH,
@@ -721,7 +743,7 @@ class Decoder(nn.Module):
         tgt_ids_Bx1xC: torch.Tensor,  # [B, 1, C]
         tgt_pos_Bx1: torch.Tensor,  # [B, 1]
         encoder_out: torch.Tensor,  # [B, S, E]
-        self_attn_mask: Any,  # None
+        self_attn_mask: Any,  # NOW REQUIRED for static cache
         cross_attn_mask: torch.Tensor,  # [B, 1, 1, S]
         self_attention_cache: list[KVCache],
         cross_attention_cache: list[KVCache],
@@ -733,7 +755,7 @@ class Decoder(nn.Module):
             A tuple containing:
             - logits_Bx1xCV: The final output logits for the current step (B, 1, C*V), cast to float32.
         """
-        assert self_attn_mask is None, "Self-attention mask should be None, kept for pattern"
+        # assert self_attn_mask is None, "Self-attention mask should be None, kept for pattern"
 
         x = None
         for i in range(self.num_channels):
@@ -752,17 +774,17 @@ class Decoder(nn.Module):
                 src_positions=None,  # CA KV is already computed
                 tgt_positions=tgt_pos_Bx1,  # (2, 1)
                 deterministic=True,
-                self_attn_mask=None,
+                self_attn_mask=self_attn_mask, # Pass the mask!
                 cross_attn_mask=cross_attn_mask,
                 self_attn_cache=self_cache,
                 cross_attn_cache=cross_cache,
             )
-            new_cache.append(new_kv_cache)
+            # new_cache.append(new_kv_cache) # No longer needed
 
         x = self.norm(x)
         logits_Bx1xCxV = self.logits_dense(x)
 
-        return logits_Bx1xCxV.to(torch.float32), new_cache
+        return logits_Bx1xCxV.to(torch.float32), None
 
     def forward(
         self,

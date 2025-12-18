@@ -584,7 +584,8 @@ def train(model, dia_cfg, dac_model, dataset, train_cfg, args):
     Robust training loop with Accelerate.
     Handles distributed synchronization, stopping logic, and precise checkpointing.
     """
-    accelerator = Accelerator()
+    # Disable mixed precision to avoid bf16/fp16 dtype issues with optimizer
+    accelerator = Accelerator(mixed_precision="no")
     device = accelerator.device
     
     # 1. Setup (Main Process Only)
@@ -723,7 +724,7 @@ def main():
     except Exception:
         # If multiple processes race, wait a random bit and retry (simple heuristic)
         import time, random
-        time.sleep(random.random() * 2) 
+        time.sleep(random.random() * 2)
         dac_path = dac.utils.download()
         
     dac_model = dac.DAC.load(dac_path).eval().to(device)

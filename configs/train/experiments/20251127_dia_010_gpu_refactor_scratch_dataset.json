@@ -1,0 +1,35 @@
+{
+    "experiment_id": "20251127_dia_010_gpu_refactor_scratch_dataset",
+    "description": "Scaled up architecture using standard model.json config with same training params as 007",
+    
+    "data": {
+      "preencoded_dir": "/home/ocamp/dia-finetuning-stereo",
+      "config": "./configs/architecture/experiments/20251127_dia_010_gpu_refactor_scratch_dataset_model.json"
+    },
+    
+    "training": {
+      "batch_size": 4,
+      "grad_accum_steps": 1,
+      "epochs": 15,
+      "learning_rate": 1e-4,
+      "warmup_steps": 2000,
+      "unconditional_frac": 1
+    },
+    
+    "output": {
+      "output_dir": "/nfs/turbo/smtd-hwdong/ocamp/experiments/dia_010_gpu_refactor_scratch_dataset",
+      "run_name": "dia_010_gpu_refactor_scratch_dataset",
+      "save_every": 2000
+    },
+    
+    "eval": {
+      "eval_step": 200,
+      "demo_every": 400
+    },
+    
+    "flags": {
+      "scratch": true,
+      "tag_no_shuffle": true,
+      "use_sliding_window": false
+    }
+  }

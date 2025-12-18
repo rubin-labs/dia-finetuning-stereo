@@ -106,3 +106,4 @@
 - `2025-12-17 11:09` [`1e2955f`] **main**: Concise train_acc_gpu.py and train_acc_tpu.py
 - `2025-12-17 11:48` [`dbc1fde`] **main**: Static KV Cache for TPU demo speedup
 - `2025-12-17 13:13` [`2cacb60`] **main**: 20251127_dia_009_gpu_refactor_overfit_test
+- `2025-12-17 13:49` [`bbddac5`] **main**: Depth scaling weight initialization

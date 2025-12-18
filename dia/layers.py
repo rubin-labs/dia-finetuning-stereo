@@ -511,11 +511,12 @@ class Encoder(nn.Module):
         model_config = config.model
         enc_config = config.model.encoder
         compute_dtype = _str_to_dtype(config.training.dtype)
+        weight_dtype = _str_to_dtype(config.model.weight_dtype)
 
         self.embedding = nn.Embedding(
             model_config.src_vocab_size,
             enc_config.n_embd,
-            dtype=compute_dtype,
+            dtype=weight_dtype,
         )
         self.dropout = nn.Dropout(model_config.dropout)
         self.layers = nn.ModuleList([EncoderLayer(config=config) for _ in range(enc_config.n_layer)])
@@ -682,7 +683,7 @@ class Decoder(nn.Module):
 
         self.embeddings = nn.ModuleList(
             [
-                nn.Embedding(model_config.tgt_vocab_size, dec_config.n_embd, dtype=compute_dtype)
+                nn.Embedding(model_config.tgt_vocab_size, dec_config.n_embd, dtype=weight_dtype)
                 for _ in range(self.num_channels)
             ]
         )
@@ -868,46 +869,25 @@ class DiaModel(nn.Module):
 
     
     def _init_weights(self):
-        """Initialize weights with depth scaling for stable training from scratch."""
-        # Calculate layers for depth scaling
-        enc_layers = self.config.model.encoder.n_layer
-        dec_layers = self.config.model.decoder.n_layer
-        
-        for name, module in self.named_modules():
-            # Determine if module is in encoder or decoder for correct depth N
-            is_encoder = 'encoder' in name
-            n_layers = enc_layers if is_encoder else dec_layers
-            
+        for module in self.modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
-
             elif isinstance(module, DenseGeneral):
-                # [Solution 1] Scale down residual path outputs (o_proj in attention, wo in MLP)
-                # This prevents variance from growing with depth in the residual stream
-                if any(proj in name for proj in ['o_proj', 'wo']):
-                    std = 0.02 / math.sqrt(2 * n_layers)
-                    with torch.no_grad():
-                        module.weight.normal_(mean=0.0, std=std)
-                
-                # [Change 3] Existing He uniform for SwiGLU/SiLU gates
-                elif getattr(module, "use_glu_he_init", False):
+                if getattr(module, "use_glu_he_init", False):
+                    # He uniform for SwiGLU/SiLU gates: variance 2/fan_in
                     fan_in = module.in_shapes[0] if module.in_shapes else 1
                     bound = math.sqrt(6.0 / fan_in)
                     with torch.no_grad():
                         module.weight.uniform_(-bound, bound)
                 else:
                     torch.nn.init.xavier_uniform_(module.weight)
-                
                 if getattr(module, "bias", None) is not None:
                     torch.nn.init.zeros_(module.bias)
-
             elif isinstance(module, torch.nn.Embedding):
-                # [Recommendation] Smaller embedding init helps large vocab stability
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-            elif isinstance(module, (torch.nn.LayerNorm, torch.nn.modules.normalization.RMSNorm)):
+                torch.nn.init.xavier_uniform_(module.weight)
+            elif isinstance(module, torch.nn.LayerNorm) or isinstance(module, torch.nn.modules.normalization.RMSNorm):
                 if hasattr(module, "weight") and module.weight is not None:
                     torch.nn.init.ones_(module.weight)
                 if hasattr(module, "bias") and module.bias is not None:

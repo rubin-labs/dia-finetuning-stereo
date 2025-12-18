@@ -375,9 +375,6 @@ class Dia:
             is_causal=False,
         )  # [B, 1, 1, S]
         
-        # Pre-allocate static mask buffer to avoid re-creation (optimization)
-        static_indices = torch.arange(max_tokens, device=self.device).view(1, 1, 1, max_tokens)
-
         for step in range(current_step, current_step + max_tokens):
             tgt_ids_Bx1xC = generated_BxTxC[:, step, :].unsqueeze(1)
             tgt_pos_Bx1 = torch.full(
@@ -387,27 +384,18 @@ class Dia:
                 device=self.device,
             )
 
-            # Create Static KV Mask
-            current_step_t = torch.tensor(step, device=self.device)
-            self_attn_mask = torch.where(
-                static_indices <= current_step_t,
-                torch.tensor(0.0, device=self.device),
-                torch.tensor(float('-inf'), device=self.device)
-            )
-
-            logits_Bx1xCxV, _ = decode_step(
+            logits_Bx1xCxV, new_cache = decode_step(
                 tgt_ids_Bx1xC=tgt_ids_Bx1xC,
                 tgt_pos_Bx1=tgt_pos_Bx1,
                 encoder_out=encoder_out,
-                self_attn_mask=self_attn_mask,
+                self_attn_mask=None,
                 cross_attn_mask=decoder_cross_attn_mask,
                 self_attention_cache=decoder_self_attention_cache,
                 cross_attention_cache=decoder_cross_attention_cache,
             )
 
-            # Removed: Manual cache update loop (handled internally by Attention)
-            # for i, layer_cache in enumerate(decoder_self_attention_cache):
-            #     layer_cache.update_cache(new_cache[i][0], new_cache[i][1])
+            for i, layer_cache in enumerate(decoder_self_attention_cache):
+                layer_cache.update_cache(new_cache[i][0], new_cache[i][1])
 
             V = self.config.model.tgt_vocab_size
             logits_last_BxCxV = logits_Bx1xCxV[:, -1, :, :]  # B, C, V

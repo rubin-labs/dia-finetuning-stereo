@@ -73,6 +73,10 @@ EVAL_TEMPERATURES = [0.0, 0.5, 1.0]
 EVAL_SAMPLE_RATE = 44100
 EVAL_AUDIO_DIR = "./audio_demos"
 
+# Codebook weighting for loss calculation
+# First codebooks capture coarse features, later codebooks capture fine details
+CODEBOOK_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
 
 @dataclass
 class TrainConfig:
@@ -100,6 +104,9 @@ class TrainConfig:
     tag_shuffle: bool = True
     tag_dropout: float = 0.0
     tag_limit: Optional[int] = None
+    
+    # Optimizer
+    no_decay_embed: bool = False
 
 # =============================================================================
 # UTILS
@@ -246,7 +253,7 @@ def get_args() -> argparse.Namespace:
     # Standard boolean flags
     parser.add_argument("--half", action="store_true", help="Load model in fp16")
     parser.add_argument("--compile", action="store_true", help="Torch compile model")
-    parser.add_argument("--no_decay_embed", action="store_true")
+    parser.add_argument("--no_decay_embed", action="store_true", help="Exclude nn.Embedding parameters from weight decay")
     parser.add_argument("--require_prompts", action="store_true")
     parser.add_argument("--skip_tags", type=str, default=None)
     
@@ -389,9 +396,10 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
             
             is_bias = name.endswith("bias")
             is_norm = isinstance(module, norm_types)
+            is_embed = isinstance(module, torch.nn.Embedding)
             is_lora = "lora" in name.lower() and ("alpha" in name.lower() or "scale" in name.lower())
             
-            if is_bias or is_norm or is_lora:
+            if is_bias or is_norm or is_lora or (train_cfg.no_decay_embed and is_embed):
                 no_decay.append(p)
             else:
                 decay.append(p)
@@ -403,10 +411,11 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
             seen.add(id(p))
 
     # 2. Setup Optimizer
+    # NOTE: fused=False required for Accelerate bf16 mixed precision compatibility
     opt = optim.AdamW([
         {"params": decay, "weight_decay": train_cfg.weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
-    ], lr=train_cfg.learning_rate)
+    ], lr=train_cfg.learning_rate, fused=False)
 
     # 3. Setup Scheduler (with streaming support)
     try:
@@ -457,7 +466,15 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                 audio_token_mask = (target >= 0) & (target <= 1023)
                 
                 loss = 0.0
-                channel_weights = [1.0] * target.shape[2]
+                # Custom weighting for eval as well to match training objective
+                channel_weights = []
+                num_groups = target.shape[2] // 9
+                if num_groups > 0:
+                    for _ in range(num_groups):
+                        channel_weights.extend(CODEBOOK_WEIGHTS)
+                else:
+                    channel_weights = [1.0] * target.shape[2]
+                
                 for c, w in enumerate(channel_weights):
                     l_c = logits[:, :, c, :].reshape(-1, logits.size(-1))
                     t_c = target[:, :, c].reshape(-1)
@@ -554,7 +571,7 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
             enc_self_attn_mask=batch['enc_self_attn_mask'],
             dec_self_attn_mask=batch['dec_self_attn_mask'],
             dec_cross_attn_mask=batch['dec_cross_attn_mask'],
-            enable_dropout=True,
+            enable_dropout=False,
         )
         max_L = int(batch['tgt_lens'].max().item())
         logits = logits[:, :max_L-1]
@@ -568,7 +585,15 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         audio_token_mask = (target >= 0) & (target <= 1023)
         
         loss = 0.0
-        channel_weights = [1.0] * target.shape[2]
+        # Custom weighting: weights defined in CODEBOOK_WEIGHTS config at top of file
+        channel_weights = []
+        num_groups = target.shape[2] // 9
+        if num_groups > 0:
+            for _ in range(num_groups):
+                channel_weights.extend(CODEBOOK_WEIGHTS)
+        else:
+            channel_weights = [1.0] * target.shape[2]
+        
         for c, w in enumerate(channel_weights):
             l_c = logits[:, :, c, :].reshape(-1, logits.size(-1))
             t_c = target[:, :, c].reshape(-1)
@@ -592,7 +617,15 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
     
     if (step + 1) % train_cfg.grad_accum_steps == 0:
         norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
-        if accelerator.is_main_process: wandb.log({'grad_norm': norm}, step=global_step)
+        if accelerator.is_main_process:
+            wandb.log({'grad_norm/pre_clip': norm}, step=global_step)
+            # Post-clip norm computation
+            post_clip_sq = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    g = p.grad.detach()
+                    post_clip_sq += g.float().norm(2).item() ** 2
+            wandb.log({'grad_norm/post_clip': post_clip_sq ** 0.5}, step=global_step)
         opt.step()
         sched.step()
         opt.zero_grad()
@@ -602,13 +635,11 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
     return loss.item() * train_cfg.grad_accum_steps
 
 
-def train(model, dia_cfg, dac_model, dataset, train_cfg, args):
+def train(model, dia_cfg, dac_model, dataset, train_cfg, args, accelerator):
     """
     Robust training loop with Accelerate.
     Handles distributed synchronization, stopping logic, and precise checkpointing.
     """
-    # Disable mixed precision to avoid bf16/fp16 dtype issues with optimizer
-    accelerator = Accelerator(mixed_precision="no")
     device = accelerator.device
     
     # 1. Setup (Main Process Only)
@@ -730,29 +761,23 @@ def main():
     """
     args = get_args()
     
-    # 1. Deterministic Setup
+    # 1. Initialize Accelerator FIRST (before any GPU ops)
+    # This ensures each process gets the correct device in multi-GPU setups
+    accelerator = Accelerator(mixed_precision="bf16")
+    device = accelerator.device
+    
+    # 2. Deterministic Setup
     seed_everything(args.seed)
     torch.set_float32_matmul_precision("high")
     
-    # 2. Config & Device
+    # 3. Config
     dia_cfg = DiaConfig.load(args.config)
     
-    # In 'accelerate launch', cuda:0 is automatically mapped to the local rank's GPU
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    
-    # 3. Load DAC Model (Handle distributed download race condition)
-    # We use a simple try/except block to let rank 0 download first if needed
-    try:
-        dac_path = dac.utils.download()
-    except Exception:
-        # If multiple processes race, wait a random bit and retry (simple heuristic)
-        import time, random
-        time.sleep(random.random() * 2)
-        dac_path = dac.utils.download()
-        
+    # 4. Load DAC Model (now safe - each process has correct device)
+    dac_path = dac.utils.download()
     dac_model = dac.DAC.load(dac_path).eval().to(device)
     
-    # 4. Dataset Selection
+    # 5. Dataset Selection
     use_sliding_window = args.use_sliding_window
     if args.preencoded_dir:
         dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, use_sliding_window)
@@ -762,7 +787,7 @@ def main():
     else:
         raise ValueError("Must specify either --audio_folder or --preencoded_dir")
 
-    # 5. Build Training Config
+    # 6. Build Training Config
     train_cfg = TrainConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -778,9 +803,10 @@ def main():
         tag_shuffle=(not args.tag_no_shuffle and args.tag_shuffle),
         tag_dropout=args.tag_dropout,
         tag_limit=args.tag_limit,
+        no_decay_embed=args.no_decay_embed,
     )
 
-    # 6. Initialize Model & Checkpoints
+    # 7. Initialize Model & Checkpoints
     model = DiaModel(dia_cfg)
     
     if args.scratch:
@@ -822,7 +848,7 @@ def main():
                     model.decoder.logits_dense.weight.data[:, 0:9, :]
                 )
 
-    # 7. Optimization Tweaks
+    # 8. Optimization Tweaks
     if args.half:
         model = model.half()
         
@@ -836,10 +862,8 @@ def main():
         logger.info("Compiling model...")
         model = torch.compile(model, backend="inductor")
     
-    # 8. Start Training
-    # We pass the model and configs to the training loop
-    # Note: Accelerator will be initialized inside 'train()'
-    train(model, dia_cfg, dac_model, dataset, train_cfg, args)
+    # 9. Start Training
+    train(model, dia_cfg, dac_model, dataset, train_cfg, args, accelerator)
 
 if __name__ == "__main__":
     main()

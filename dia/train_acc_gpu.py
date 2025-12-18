@@ -449,16 +449,28 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                 logits = logits.float() 
                 target = eb['tgt_tokens'][:, 1:]
                 
+                # Masking padding in loss
+                mask = torch.arange(target.shape[1], device=target.device).unsqueeze(0) < (eb['tgt_lens'].unsqueeze(1) - 1)
+                mask = mask.unsqueeze(-1).expand_as(target)
+                
+                # [FIX] Create mask for valid audio tokens (0-1023) to ignore BOS/EOS
+                audio_token_mask = (target >= 0) & (target <= 1023)
+                
                 loss = 0.0
                 channel_weights = [1.0] * target.shape[2]
-                
-                # Vectorized loss calculation (cleaner than Function 1)
                 for c, w in enumerate(channel_weights):
-                    loss += w * F.cross_entropy(
-                        logits[:, :, c, :].flatten(0, 1), 
-                        target[:, :, c].flatten(), 
-                        ignore_index=dia_cfg.data.audio_pad_value
-                    )
+                    l_c = logits[:, :, c, :].reshape(-1, logits.size(-1))
+                    t_c = target[:, :, c].reshape(-1)
+                    
+                    # [FIX] Combine length mask (m_c) with audio value mask (valid_c)
+                    m_c = mask[:, :, c].reshape(-1)
+                    valid_c = audio_token_mask[:, :, c].reshape(-1)
+                    final_mask = m_c & valid_c
+                    
+                    # [FIX] Compute loss only on valid audio tokens
+                    if final_mask.any():
+                        loss += w * F.cross_entropy(l_c[final_mask], t_c[final_mask], ignore_index=dia_cfg.data.audio_pad_value)
+                
                 eval_losses.append(loss / sum(channel_weights))
 
     # 2. Logging & Stop Check

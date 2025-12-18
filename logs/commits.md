@@ -108,3 +108,4 @@
 - `2025-12-17 13:13` [`2cacb60`] **main**: 20251127_dia_009_gpu_refactor_overfit_test
 - `2025-12-17 13:49` [`bbddac5`] **main**: Depth scaling weight initialization
 - `2025-12-17 22:42` [`2c9eedc`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}
+- `2025-12-18 01:32` [`34ded1a`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}_{NoSpecialToks}

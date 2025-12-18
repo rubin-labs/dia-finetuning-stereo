@@ -184,17 +184,18 @@ class DiaConfig(BaseModel, frozen=True):
             f.write(config_json)
 
     @classmethod
-    def load(cls, path: str) -> "DiaConfig":
+    def load(cls, path: str) -> "DiaConfig | None":
         """Load and validate a Dia configuration from a JSON file.
 
         Args:
             path: The path to the configuration file.
 
         Returns:
-            A validated DiaConfig instance.
+            A validated DiaConfig instance if the file exists and is valid,
+            otherwise None if the file is not found.
 
         Raises:
-            FileNotFoundError: If the configuration file does not exist.
+            ValueError: If the path does not point to an existing .json file.
             pydantic.ValidationError: If the JSON content fails validation against the DiaConfig schema.
         """
         try:
@@ -202,4 +203,4 @@ class DiaConfig(BaseModel, frozen=True):
                 content = f.read()
             return cls.model_validate_json(content)
         except FileNotFoundError:
-            raise FileNotFoundError(f"Model config file not found: {path}")
+            return None

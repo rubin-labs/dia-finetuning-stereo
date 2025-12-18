@@ -374,7 +374,7 @@ class Dia:
             src_padding_mask_BxS,  # Key mask [B, S]
             is_causal=False,
         )  # [B, 1, 1, S]
-        
+
         for step in range(current_step, current_step + max_tokens):
             tgt_ids_Bx1xC = generated_BxTxC[:, step, :].unsqueeze(1)
             tgt_pos_Bx1 = torch.full(

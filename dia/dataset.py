@@ -7,7 +7,6 @@ from torch.utils.data import Dataset
 
 import dac
 from .config import DiaConfig
-from .dac_utils import encode_waveform_stereo
 import random
 import json
 import logging
@@ -15,7 +14,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class TestingDataset(Dataset):
+class MusicDataset(Dataset):
     """Load from audio folder and audio_prompts folder structure."""
     def __init__(
         self,
@@ -23,9 +22,11 @@ class TestingDataset(Dataset):
         config: DiaConfig,
         dac_model: dac.DAC,
         use_sliding_window: bool = True,
+        ignore_missing_prompts: bool = True,
         skip_tags: list = None,
-        allow_empty_prompts: bool = True,
+        allow_empty_prompts: bool = False,
     ):
+        print("WARNING: MusicDataset performs on-the-fly DAC encoding which is very slow and blocks training. Consider using scripts/preencode_audio.py and --preencoded_dir for much faster training.")
         self.audio_folder = Path(audio_folder)
         self.prompts_folder = self.audio_folder.parent / "audio_prompts"
         self.config = config
@@ -40,34 +41,76 @@ class TestingDataset(Dataset):
         for ext in audio_extensions:
             self.audio_files.extend(list(self.audio_folder.glob(f"*{ext}")))
         
-        # Filter to only include files that pass skip_tags filter
+        # Filter to only include files that have corresponding prompt files
         self.valid_files = []
+        skipped_missing = 0
         skipped_tags = 0
+        allowed_empty = 0
 
         for audio_file in self.audio_files:
             prompt_file = self.prompts_folder / f"{audio_file.stem}_prompt.txt"
             
-            # Check for skip tags if prompt exists
-            if prompt_file.exists() and skip_tags:
+            if not prompt_file.exists():
+                if allow_empty_prompts:
+                    allowed_empty += 1
+                    self.valid_files.append(audio_file)
+                    continue
+                if ignore_missing_prompts:
+                    skipped_missing += 1
+                    continue
+                raise FileNotFoundError(f"Missing prompt file: {prompt_file}")
+            
+            # Check for skip tags if provided
+            if skip_tags:
                 try:
                     with open(prompt_file, 'r', encoding='utf-8') as f:
                         text = f.read().strip().lower()
-                    if any(tag.strip().lower() in text for tag in skip_tags):
+                    
+                    should_skip = False
+                    for tag in skip_tags:
+                        if tag.strip().lower() in text:
+                            should_skip = True
+                            break
+                    
+                    if should_skip:
                         skipped_tags += 1
                         continue
                 except Exception as e:
                     print(f"Warning: error reading prompt {prompt_file}: {e}")
-            
+                    skipped_missing += 1
+                    continue
+
             self.valid_files.append(audio_file)
         
         if not self.valid_files:
-            raise ValueError(f"No valid audio files found in {self.audio_folder}. Skipped {skipped_tags} by tags.")
+            raise ValueError(f"No valid audio-prompt pairs found in {self.audio_folder}. Skipped {skipped_missing} missing, {skipped_tags} by tags.")
         
-        print(f"Found {len(self.valid_files)} audio files. Skipped: {skipped_tags} filtered by tags.")
+        if allow_empty_prompts and allowed_empty > 0:
+            print(f"Found {len(self.valid_files)} audio files. Using empty prompts for {allowed_empty}. Skipped: {skipped_missing} missing prompts, {skipped_tags} filtered by tags.")
+        else:
+            print(f"Found {len(self.valid_files)} audio-prompt pairs. Skipped: {skipped_missing} missing prompts, {skipped_tags} filtered by tags.")
 
     def __len__(self) -> int:
         return len(self.valid_files)
     
+    def _encode_mono_channel(self, wav_1xS: torch.Tensor) -> torch.Tensor:
+        """Encode a single mono channel with DAC.
+        
+        Args:
+            wav_1xS: Audio tensor of shape (1, samples)
+            
+        Returns:
+            Encoded tensor of shape (T, 9)
+        """
+        device = next(self.dac_model.parameters()).device
+        audio_tensor = self.dac_model.preprocess(
+            wav_1xS.unsqueeze(0),  # -> (1, 1, S)
+            44100
+        ).to(device)
+        _, enc, *_ = self.dac_model.encode(audio_tensor, n_quantizers=None)  # (1, 9, T)
+        enc = enc.squeeze(0).transpose(0, 1).to(torch.long)  # (T, 9)
+        return enc
+
     def __getitem__(self, idx: int):
         audio_file = self.valid_files[idx]
         prompt_file = self.prompts_folder / f"{audio_file.stem}_prompt.txt"
@@ -110,12 +153,18 @@ class TestingDataset(Dataset):
             num_channels = waveform.shape[0]
             if num_channels > 2:
                 raise ValueError(f"Audio file {audio_file} has {num_channels} channels. Only mono (1) or stereo (2) are supported.")
-            encoded = encode_waveform_stereo(
-                waveform,
-                dac_model=self.dac_model,
-                sample_rate=44100,
-                dtype=torch.long,
-            )  # (T, 18)
+            elif num_channels == 2:
+                left = waveform[0:1, :]
+                right = waveform[1:2, :]
+                enc_L = self._encode_mono_channel(left)
+                enc_R = self._encode_mono_channel(right)
+            else:
+                # Duplicate mono to both channels
+                mono = waveform[0:1, :]
+                enc_L = self._encode_mono_channel(mono)
+                enc_R = enc_L.clone()
+
+            encoded = torch.cat([enc_L, enc_R], dim=1)  # (T, 18)
 
         # Keep waveform (with batch dim) for potential logging; not used in training logic
         waveform = waveform.unsqueeze(0)

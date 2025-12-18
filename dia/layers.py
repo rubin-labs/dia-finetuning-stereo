@@ -1,5 +1,6 @@
 from typing import Any
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +8,7 @@ from torch import Tensor
 from torch.nn import RMSNorm
 
 from .config import DiaConfig
+
 
 def _normalize_axes(axes: tuple[int, ...], ndim: int) -> tuple[int, ...]:
     return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
@@ -127,8 +129,7 @@ class MlpBlock(nn.Module):
             dtype=compute_dtype,
             weight_dtype=weight_dtype,
         )
-        # [Change 1] Mark fused SwiGLU weights for He/kaiming init tuned to SiLU gates
-            # This is a change from the original codebase to improve the initialization of the fused SwiGLU weights
+        # Mark fused SwiGLU weights for He/kaiming init tuned to SiLU gates
         self.wi_fused.use_glu_he_init = True
 
         self.activation_fn_0 = get_activation_fn(activations[0])  # silu

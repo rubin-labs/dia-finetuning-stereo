@@ -552,13 +552,24 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         mask = torch.arange(target.shape[1], device=target.device).unsqueeze(0) < (batch['tgt_lens'].unsqueeze(1) - 1)
         mask = mask.unsqueeze(-1).expand_as(target)
         
+        # [FIX] Create mask for valid audio tokens (0-1023) to ignore BOS/EOS
+        audio_token_mask = (target >= 0) & (target <= 1023)
+        
         loss = 0.0
         channel_weights = [1.0] * target.shape[2]
         for c, w in enumerate(channel_weights):
             l_c = logits[:, :, c, :].reshape(-1, logits.size(-1))
             t_c = target[:, :, c].reshape(-1)
+            
+            # [FIX] Combine length mask (m_c) with audio value mask (valid_c)
             m_c = mask[:, :, c].reshape(-1)
-            loss += w * F.cross_entropy(l_c[m_c], t_c[m_c], ignore_index=dia_cfg.data.audio_pad_value)
+            valid_c = audio_token_mask[:, :, c].reshape(-1)
+            final_mask = m_c & valid_c
+            
+            # [FIX] Compute loss only on valid audio tokens
+            if final_mask.any():
+                loss += w * F.cross_entropy(l_c[final_mask], t_c[final_mask], ignore_index=dia_cfg.data.audio_pad_value)
+                
         loss = loss / sum(channel_weights)
 
         if global_step % ENTROPY_LOG_INTERVAL == 0 and accelerator.is_main_process:

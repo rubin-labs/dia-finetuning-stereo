@@ -107,3 +107,4 @@
 - `2025-12-17 11:48` [`dbc1fde`] **main**: Static KV Cache for TPU demo speedup
 - `2025-12-17 13:13` [`2cacb60`] **main**: 20251127_dia_009_gpu_refactor_overfit_test
 - `2025-12-17 13:49` [`bbddac5`] **main**: Depth scaling weight initialization
+- `2025-12-17 22:42` [`2c9eedc`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}

@@ -112,3 +112,4 @@
 - `2025-12-18 11:11` [`ed643b0`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}_{NoSpecialToks}_eval_fix
 - `2025-12-18 14:04` [`14123d6`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}_{NoSpecialToks}_{revertedto008 + model.py fix}
 - `2025-12-18 14:36` [`ae3bd8a`] **main**: Running dia reverted back to 008
+- `2025-12-19 01:01` [`b50bebc`] **main**: Safety

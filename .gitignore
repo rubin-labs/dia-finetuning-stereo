@@ -29,3 +29,5 @@ dia-finetuning-stereo/
 data/
 
 !requirements.txt
+
+logs/commits.md

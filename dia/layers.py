@@ -1,5 +1,4 @@
 from typing import Any
-import math
 
 import torch
 import torch.nn as nn
@@ -129,8 +128,6 @@ class MlpBlock(nn.Module):
             dtype=compute_dtype,
             weight_dtype=weight_dtype,
         )
-        # Mark fused SwiGLU weights for He/kaiming init tuned to SiLU gates
-        self.wi_fused.use_glu_he_init = True
 
         self.activation_fn_0 = get_activation_fn(activations[0])  # silu
         self.activation_fn_1 = get_activation_fn(activations[1])  # linear
@@ -844,28 +841,36 @@ class DiaModel(nn.Module):
 
     
     def _init_weights(self):
-        for module in self.modules():
+        # Determine depth for scaling (use decoder depth as it's usually deeper)
+        n_layers = max(self.config.model.encoder.n_layer, self.config.model.decoder.n_layer)
+        
+        for name, module in self.named_modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
-                torch.nn.init.xavier_uniform_(module.weight)
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, DenseGeneral):
-                if getattr(module, "use_glu_he_init", False):
-                    # He uniform for SwiGLU/SiLU gates: variance 2/fan_in
-                    fan_in = module.in_shapes[0] if module.in_shapes else 1
-                    bound = math.sqrt(6.0 / fan_in)
+                
+                # Scale residual output projections
+                if name.endswith('o_proj') or name.endswith('wo'):
                     with torch.no_grad():
-                        module.weight.uniform_(-bound, bound)
-                else:
-                    torch.nn.init.xavier_uniform_(module.weight)
-                if getattr(module, "bias", None) is not None:
+                        module.weight.mul_(1.0 / (2 * n_layers) ** 0.5)
+                        
+            elif isinstance(module, DenseGeneral):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if getattr(module, 'bias', None) is not None:
                     torch.nn.init.zeros_(module.bias)
+                
+                # Scale residual output projections
+                if name.endswith('o_proj') or name.endswith('wo'):
+                    with torch.no_grad():
+                        module.weight.mul_(1.0 / (2 * n_layers) ** 0.5)
+
             elif isinstance(module, torch.nn.Embedding):
-                torch.nn.init.xavier_uniform_(module.weight)
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             elif isinstance(module, torch.nn.LayerNorm) or isinstance(module, torch.nn.modules.normalization.RMSNorm):
-                if hasattr(module, "weight") and module.weight is not None:
+                if hasattr(module, 'weight') and module.weight is not None:
                     torch.nn.init.ones_(module.weight)
-                if hasattr(module, "bias") and module.bias is not None:
+                if hasattr(module, 'bias') and module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
 
     def forward(

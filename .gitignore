@@ -31,3 +31,4 @@ data/
 !requirements.txt
 
 logs/commits.md
+logs/daily/*.md

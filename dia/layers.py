@@ -839,11 +839,30 @@ class DiaModel(nn.Module):
         self.config = config
         self.encoder = Encoder(config)
         self.decoder = Decoder(config)
-        self._init_weights()
+        # Default init without depth scaling (for fine-tuning/checkpoint loading)
+        # For scratch pretraining, call _init_weights(use_depth_scaling=True) explicitly
+        self._init_weights(use_depth_scaling=False)
 
     
-    def _init_weights(self):
-        for module in self.modules():
+    def _init_weights(self, use_depth_scaling: bool = True):
+        """
+        Initialize weights with optional depth scaling for pretraining.
+        
+        Depth scaling reduces the output of residual blocks by 1/sqrt(2*depth)
+        to prevent gradient explosion in very deep networks trained from scratch.
+        Reference: GPT-2, Megatron-LM initialization strategies.
+        
+        Args:
+            use_depth_scaling: If True, scale output projections by 1/sqrt(2*n_layers)
+        """
+        enc_depth = self.config.model.encoder.n_layer
+        dec_depth = self.config.model.decoder.n_layer
+        
+        # Scaling factors for output projections (attention o_proj and MLP wo)
+        enc_scale = 1.0 / math.sqrt(2 * enc_depth) if use_depth_scaling else 1.0
+        dec_scale = 1.0 / math.sqrt(2 * dec_depth) if use_depth_scaling else 1.0
+        
+        for name, module in self.named_modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
@@ -857,6 +876,13 @@ class DiaModel(nn.Module):
                         module.weight.uniform_(-bound, bound)
                 else:
                     torch.nn.init.xavier_uniform_(module.weight)
+                    
+                # Apply depth scaling to output projections (residual path)
+                if use_depth_scaling and ("o_proj" in name or "wo" in name):
+                    scale = enc_scale if "encoder" in name else dec_scale
+                    with torch.no_grad():
+                        module.weight.mul_(scale)
+                        
                 if getattr(module, "bias", None) is not None:
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, torch.nn.Embedding):
@@ -866,6 +892,11 @@ class DiaModel(nn.Module):
                     torch.nn.init.ones_(module.weight)
                 if hasattr(module, "bias") and module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
+        
+        # Scale final logits projection small for stable initial outputs
+        if use_depth_scaling and hasattr(self, 'decoder') and hasattr(self.decoder, 'logits_dense'):
+            with torch.no_grad():
+                self.decoder.logits_dense.weight.mul_(0.1)
 
     def forward(
         self,

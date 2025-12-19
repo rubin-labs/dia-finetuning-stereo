@@ -110,3 +110,4 @@
 - `2025-12-17 22:42` [`2c9eedc`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}
 - `2025-12-18 01:32` [`34ded1a`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}_{NoSpecialToks}
 - `2025-12-18 11:11` [`ed643b0`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}_{NoSpecialToks}_eval_fix
+- `2025-12-19 13:18` [`06a2f95`] ****: current

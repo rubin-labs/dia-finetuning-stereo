@@ -57,10 +57,8 @@ torch.backends.cudnn.benchmark = True
 # CONSTANTS & CONFIG
 # =============================================================================
 
-# Default gradient clipping - can be overridden via CLI for pretraining
-DEFAULT_GRAD_CLIP_MAX_NORM = 1.0  # More conservative for pretraining
+GRAD_CLIP_MAX_NORM = 5.0
 ENTROPY_LOG_INTERVAL = 50
-GRAD_CLIP_WARMUP_STEPS = 500  # Gradually increase clip norm during early training
 
 TEST_PROMPTS = {
     "piano_ambient": "piano, pads, ambient, cinematic, melancholic, peaceful, reflective, instrumental",
@@ -109,11 +107,6 @@ class TrainConfig:
     
     # Optimizer
     no_decay_embed: bool = False
-    
-    # Gradient clipping (pretraining settings)
-    grad_clip_max_norm: float = 1.0  # More conservative for pretraining from scratch
-    grad_clip_warmup: bool = False   # Gradually increase clip threshold
-    min_lr_ratio: float = 0.1        # Final LR = peak_lr * min_lr_ratio
 
 # =============================================================================
 # UTILS
@@ -271,17 +264,6 @@ def get_args() -> argparse.Namespace:
     # Augmentation
     parser.add_argument("--tag_dropout", type=float, default=0.0)
     parser.add_argument("--tag_limit", type=int, default=None)
-    
-    # Gradient clipping & LR schedule (pretraining)
-    parser.add_argument("--grad_clip", type=float, default=defaults.get('grad_clip', 1.0),
-                        help="Max gradient norm for clipping (1.0 recommended for pretraining)")
-    parser.add_argument("--grad_clip_warmup", action="store_true", 
-                        help="Gradually increase clip threshold during warmup")
-    parser.add_argument("--min_lr_ratio", type=float, default=defaults.get('min_lr_ratio', 0.1),
-                        help="Final LR = peak_lr * min_lr_ratio for cosine decay")
-    parser.add_argument("--depth_scaling", action=argparse.BooleanOptionalAction, 
-                        default=defaults.get('depth_scaling', True),
-                        help="Scale residual outputs by 1/sqrt(2*depth) for pretraining stability")
 
     args = parser.parse_args()
     
@@ -443,23 +425,9 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
         if not steps_per_epoch: raise RuntimeError("Loader has no length or steps_per_epoch")
 
     total_steps = steps_per_epoch * train_cfg.epochs
-    effective_warmup = train_cfg.warmup_steps // train_cfg.grad_accum_steps
-    effective_total = total_steps // train_cfg.grad_accum_steps
-    
-    # Use cosine with restarts for better pretraining, or standard cosine
-    sched = get_scheduler(
-        'cosine', 
-        opt, 
-        num_warmup_steps=effective_warmup,
-        num_training_steps=effective_total,
-        # Note: HF scheduler doesn't directly support min_lr_ratio
-        # The min LR will be ~0 by default. For pretraining, we often want
-        # final LR = 0.1 * peak_lr. This can be achieved via manual scheduling
-        # or using `cosine_with_min_lr` if available.
-    )
-    
-    logger.info(f"Scheduler: warmup={effective_warmup} steps, total={effective_total} steps, "
-                f"peak_lr={train_cfg.learning_rate}")
+    sched = get_scheduler('cosine', opt, 
+                          num_warmup_steps=train_cfg.warmup_steps // train_cfg.grad_accum_steps,
+                          num_training_steps=total_steps // train_cfg.grad_accum_steps)
     
     return opt, sched
 
@@ -525,9 +493,15 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
     # 2. Logging & Stop Check
     should_stop = False
     if eval_losses:
-        avg_loss = sum(eval_losses) / len(eval_losses)
+        # Average loss across this process's batches
+        local_avg_loss = torch.tensor(sum(eval_losses) / len(eval_losses), device=device)
+        
+        # Gather across all GPUs for accurate reporting
+        all_losses = accelerator.gather(local_avg_loss)
+        avg_loss = all_losses.mean().item()
+        
         if accelerator.is_main_process:
-            wandb.log({'eval_loss': avg_loss.item()}, step=global_step)
+            wandb.log({'eval_loss': avg_loss}, step=global_step)
             
             if stop_on_overfit and current_train_loss and avg_loss > current_train_loss:
                 logger.info(f"Stop trigger: Eval {avg_loss:.4f} > Train {current_train_loss:.4f}")
@@ -541,15 +515,13 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
     if accelerator.is_main_process:
         logger.info(f"Generating eval demos at step {global_step}")
         unwrapped = accelerator.unwrap_model(model)
-        orig_dtype = next(unwrapped.parameters()).dtype
         
         try:
-            # Cast to float32 for generation quality
-            unwrapped = unwrapped.float()
+            # Use model in its native training dtype (likely bf16) for generation safety
             dia_gen = Dia(dia_cfg, device)
             dia_gen.model, dia_gen.dac_model = unwrapped, dac_model
             
-            with torch.inference_mode(), torch.cuda.amp.autocast(enabled=False):
+            with torch.inference_mode():
                 audio_samples = {}
                 
                 # Helper for safe filenames
@@ -580,9 +552,8 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
         except Exception as e:
             logger.exception(f"Demo generation failed: {e}")
         finally:
-            # Always restore original dtype
-            if orig_dtype == torch.float16: unwrapped.half()
-            elif orig_dtype == torch.bfloat16: unwrapped.bfloat16()
+            # No restoration needed as we didn't cast
+            pass
             
     accelerator.wait_for_everyone()
     return should_stop
@@ -648,32 +619,16 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
     accelerator.backward(loss)
     
     if (step + 1) % train_cfg.grad_accum_steps == 0:
-        # Adaptive gradient clipping with optional warmup
-        clip_norm = train_cfg.grad_clip_max_norm
-        if train_cfg.grad_clip_warmup and global_step < train_cfg.warmup_steps:
-            # Start with tighter clipping, relax as model stabilizes
-            warmup_progress = global_step / train_cfg.warmup_steps
-            clip_norm = train_cfg.grad_clip_max_norm * (0.1 + 0.9 * warmup_progress)
-        
-        norm = accelerator.clip_grad_norm_(model.parameters(), clip_norm)
+        norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
         if accelerator.is_main_process:
-            wandb.log({
-                'grad_norm/pre_clip': norm,
-                'grad_norm/clip_threshold': clip_norm,
-            }, step=global_step)
+            wandb.log({'grad_norm/pre_clip': norm}, step=global_step)
             # Post-clip norm computation
             post_clip_sq = 0.0
             for p in model.parameters():
                 if p.grad is not None:
                     g = p.grad.detach()
                     post_clip_sq += g.float().norm(2).item() ** 2
-            post_clip_norm = post_clip_sq ** 0.5
-            # Log clipping ratio to track how aggressive clipping is
-            clip_ratio = norm / clip_norm if clip_norm > 0 else 0.0
-            wandb.log({
-                'grad_norm/post_clip': post_clip_norm,
-                'grad_norm/clip_ratio': clip_ratio,  # >1 means clipping occurred
-            }, step=global_step)
+            wandb.log({'grad_norm/post_clip': post_clip_sq ** 0.5}, step=global_step)
         opt.step()
         sched.step()
         opt.zero_grad()
@@ -852,19 +807,14 @@ def main():
         tag_dropout=args.tag_dropout,
         tag_limit=args.tag_limit,
         no_decay_embed=args.no_decay_embed,
-        grad_clip_max_norm=args.grad_clip,
-        grad_clip_warmup=args.grad_clip_warmup,
-        min_lr_ratio=args.min_lr_ratio,
     )
 
     # 7. Initialize Model & Checkpoints
     model = DiaModel(dia_cfg)
     
     if args.scratch:
-        use_depth_scaling = getattr(args, 'depth_scaling', True)
-        logger.info(f"Initializing model from scratch (depth_scaling={use_depth_scaling})...")
-        if hasattr(model, '_init_weights'): 
-            model._init_weights(use_depth_scaling=use_depth_scaling)
+        logger.info("Initializing model from scratch...")
+        if hasattr(model, '_init_weights'): model._init_weights()
     else:
         # Download or load local
         if args.local_ckpt:

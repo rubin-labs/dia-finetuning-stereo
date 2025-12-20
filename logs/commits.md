@@ -114,3 +114,4 @@
 - `2025-12-19 13:49` [`7023873`] **010**: dia_010_run_6_added depth initialization back and fixed eval loss. running as a test to get a new baseline going and start building momentum again.
 - `2025-12-19 17:32` [`424d065`] **010**: tpu script updated
 - `2025-12-19 19:36` [`b70b7b1`] **010**: fix_tpu_env.sh
+- `2025-12-19 19:47` [`206ea50`] **010**: scripts/fix_libpython.sh

@@ -72,18 +72,41 @@ if [ ! -f "$LIBPYTHON" ]; then
 fi
 echo "✓ libpython3.11.so.1.0 found"
 
-# Step 2: Install conda's libc (for GLIBC compatibility)
+# Step 2: Install conda's glibc (for GLIBC compatibility)
 echo ""
-echo "Step 2: Installing conda's libc (for GLIBC compatibility)..."
-conda install -y -c conda-forge libcxx libstdcxx-ng 2>/dev/null || echo "⚠ libc already installed or installation failed"
+echo "Step 2: Installing conda's glibc (for GLIBC 2.34 compatibility)..."
+# Try to install glibc from conda-forge (newer version)
+echo "Attempting to install glibc from conda-forge..."
+if conda install -y -c conda-forge glibc 2>&1 | tee /tmp/glibc_install.log; then
+    echo "✓ glibc installed from conda-forge"
+else
+    echo "⚠ glibc installation from conda-forge failed"
+    echo "This is expected - glibc is usually a system package."
+    echo "We'll try to work around this by prioritizing conda libs..."
+fi
+# Install other libs
+conda install -y -c conda-forge libcxx libstdcxx-ng 2>/dev/null || echo "⚠ Other libs already installed"
 
-# Step 3: Set LD_LIBRARY_PATH properly (conda libs first, then system)
+# Step 3: Set LD_LIBRARY_PATH properly (conda libs first)
 echo ""
 echo "Step 3: Setting LD_LIBRARY_PATH..."
-export LD_LIBRARY_PATH="$CONDA_ENV_PATH/lib:$CONDA_BASE/lib:$LD_LIBRARY_PATH"
+# Check if conda has glibc installed
+CONDA_GLIBC="$CONDA_BASE/lib/libc.so.6"
+if [ ! -f "$CONDA_GLIBC" ]; then
+    CONDA_GLIBC="$CONDA_ENV_PATH/lib/libc.so.6"
+fi
 
-# Remove any weird entries and clean up
-export LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v '^$' | grep -v '#' | sort -u | tr '\n' ':' | sed 's/:$//')
+# Prioritize conda libs (which may have newer glibc)
+if [ -f "$CONDA_GLIBC" ]; then
+    echo "✓ Found conda's glibc, using it instead of system glibc"
+    export LD_LIBRARY_PATH="$(dirname "$CONDA_GLIBC"):$CONDA_ENV_PATH/lib:$CONDA_BASE/lib"
+else
+    echo "⚠ Conda glibc not found, prioritizing conda libs anyway"
+    export LD_LIBRARY_PATH="$CONDA_ENV_PATH/lib:$CONDA_BASE/lib"
+fi
+
+# Clean up any problematic paths and duplicates
+export LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v '^$' | grep -v '#' | awk '!seen[$0]++' | tr '\n' ':' | sed 's/:$//')
 
 # Add to bashrc (clean version)
 {
@@ -127,13 +150,31 @@ print('✓ torch_xla version:', torch_xla.__version__)
     echo "=== Fix complete! You can now run training. ==="
 } || {
     echo ""
-    echo "❌ Import still failing. Error details:"
-    python -c "import torch_xla" 2>&1 | head -5
+    echo "❌ Import still failing due to GLIBC version mismatch."
+    ERROR_MSG=$(python -c "import torch_xla" 2>&1 | head -1)
+    echo "Error: $ERROR_MSG"
     echo ""
-    echo "Try:"
-    echo "  1. Restart terminal: exit and reconnect"
-    echo "  2. Run: source ~/.bashrc"
-    echo "  3. Try again"
+    
+    if [[ "$ERROR_MSG" == *"GLIBC_2.34"* ]]; then
+        echo "The torch_xla package requires GLIBC 2.34, but Ubuntu 20.04 only has GLIBC 2.31."
+        echo ""
+        echo "Options:"
+        echo "  1. Try installing glibc from conda-forge (may not work):"
+        echo "     conda install -y -c conda-forge glibc"
+        echo ""
+        echo "  2. Use Ubuntu 22.04 instead (has GLIBC 2.35)"
+        echo ""
+        echo "  3. Try building torch_xla from source (complex)"
+        echo ""
+        echo "For now, the environment is partially fixed. You may need to:"
+        echo "  - Use a TPU VM with Ubuntu 22.04, OR"
+        echo "  - Contact Google Cloud support about GLIBC compatibility"
+    else
+        echo "Try:"
+        echo "  1. Restart terminal: exit and reconnect"
+        echo "  2. Run: source ~/.bashrc"
+        echo "  3. Try again"
+    fi
     exit 1
 }
 

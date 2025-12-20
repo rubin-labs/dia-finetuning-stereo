@@ -33,9 +33,6 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from transformers import get_scheduler
 
-# Add parent directory to path to import dia if needed (though running as module handles this)
-# sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from .audio import apply_audio_delay, build_delay_indices, codebook_to_audio
 from .config import DiaConfig
 from .dataset import PreEncodedDACDataset, TestingDataset
@@ -58,7 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# CONSTANTS & CONFIG
+# CONSTANTS & CONFIG (Synced with GPU)
 # =============================================================================
 
 TEST_PROMPTS = {
@@ -74,7 +71,10 @@ EVAL_TEMPERATURES = [0.0, 0.5, 1.0]
 EVAL_SAMPLE_RATE = 44100
 EVAL_AUDIO_DIR = "./audio_demos"
 GRAD_CLIP_MAX_NORM = 5.0
-CODEBOOK_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # Used in TPU loss if stereo
+ENTROPY_LOG_INTERVAL = 50
+
+# Codebook weighting for loss calculation
+CODEBOOK_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 _nonfinite_hits = 0
 
 @dataclass
@@ -103,6 +103,9 @@ class TrainConfig:
     tag_shuffle: bool = True
     tag_dropout: float = 0.0
     tag_limit: Optional[int] = None
+    
+    # Optimizer
+    no_decay_embed: bool = False
 
 # =============================================================================
 # UTILS
@@ -152,7 +155,6 @@ def preserve_rng_state():
     py_state = random.getstate()
     np_state = np.random.get_state()
     torch_state = torch.get_rng_state()
-    # TPU/XLA doesn't support get_rng_state_all the same way, but we keep the structure
     try:
         yield
     finally:
@@ -160,19 +162,26 @@ def preserve_rng_state():
         np.random.set_state(np_state)
         torch.set_rng_state(torch_state)
 
+def compute_output_entropy(logits):
+    """Compute entropy of output probability distribution."""
+    probs = F.softmax(logits.float(), dim=-1)
+    log_probs = torch.log(probs + 1e-10)
+    entropy = -torch.sum(probs * log_probs, dim=-1)
+    return entropy.mean().item()
+
 def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):
     if keep_last_n is None: return
     
     for pattern in ["ckpt_step*.pth", "ckpt_epoch*.pth"]:
         files = sorted(glob.glob(str(output_dir / pattern)), 
                        key=lambda x: int(re.search(r'(\d+).pth', x).group(1)) if re.search(r'(\d+).pth', x) else 0)
-    if len(files) > keep_last_n:
-        for old_ckpt in files[:-keep_last_n]:
-            try:
-                os.remove(old_ckpt)
-                logger.info(f"Removed old checkpoint: {old_ckpt}")
-            except Exception as e:
-                logger.warning(f"Failed to remove {old_ckpt}: {e}")
+        if len(files) > keep_last_n:
+            for old_ckpt in files[:-keep_last_n]:
+                try:
+                    os.remove(old_ckpt)
+                    logger.info(f"Removed old checkpoint: {old_ckpt}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove {old_ckpt}: {e}")
 
 # =============================================================================
 # DATA & COLLATE (TPU OPTIMIZED)
@@ -186,7 +195,7 @@ def collate_fn(batch, config: DiaConfig, train_cfg: TrainConfig, device: torch.d
     texts, encodings, waveforms = zip(*batch)
     window_size = config.data.audio_length
     
-    # TPU: Force fixed batch length = window_size
+    # TPU: Force fixed batch length = window_size to avoid recompilation
     batch_max = window_size 
     
     padded_encodings = []
@@ -202,6 +211,7 @@ def collate_fn(batch, config: DiaConfig, train_cfg: TrainConfig, device: torch.d
         
         curr_L = e_cropped.size(0)
         seq_lens.append(curr_L)
+        
         if curr_L < batch_max:
             pad_amt = batch_max - curr_L
             e_padded = F.pad(e_cropped, (0, 0, 0, pad_amt), value=config.data.audio_pad_value)
@@ -249,7 +259,6 @@ def collate_fn(batch, config: DiaConfig, train_cfg: TrainConfig, device: torch.d
         tgt_lens.append(1 + L + 1)
     
     tgt_pos = torch.arange(max_tgt_len, device=device).unsqueeze(0).expand(B, -1)
-    # Careful: tgt_pad for attention mask should respect padding
     tgt_pad = tgt.ne(pad_val).any(-1)
 
     causal = torch.tril(torch.ones((max_tgt_len, max_tgt_len), dtype=torch.bool, device=device))
@@ -270,9 +279,8 @@ def collate_fn(batch, config: DiaConfig, train_cfg: TrainConfig, device: torch.d
     }
 
 def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, use_sliding_window=True):
-    # For TPU, we must use the TPU-optimized collate_fn that outputs fixed shapes
-    # We pass 'cpu' as device to collate first, then move to TPU device in loader or loop
-    # Actually, DataLoader collate usually returns CPU tensors which get moved later.
+    # For TPU, we MUST use fixed batch sizes.
+    # collate_fn returns CPU tensors which Accelerate moves to device later.
     collate = lambda b: collate_fn(b, dia_cfg, train_cfg, torch.device('cpu'), use_sliding_window)
     
     ds_len = len(dataset)
@@ -286,13 +294,12 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, u
         g = torch.Generator().manual_seed(train_cfg.seed)
         train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=g)
     
-    # Drop last to keep batch sizes consistent (helpful for TPU)
+    # Drop last to keep batch sizes consistent (critical for TPU)
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg.batch_size, shuffle=True,
         collate_fn=collate, num_workers=0, pin_memory=False, drop_last=True
     )
     if val_ds:
-        # Validation on TPU also benefits from fixed batch size
         val_loader = DataLoader(val_ds, batch_size=train_cfg.batch_size, shuffle=False, collate_fn=collate, num_workers=0, drop_last=True)
     else:
         val_loader = None
@@ -301,10 +308,11 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, u
     return train_loader, val_loader
 
 # =============================================================================
-# MODEL & OPTIMIZER
+# OPTIMIZER (Synced with GPU)
 # =============================================================================
 
 def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
+    # 1. Define distinct parameter groups
     decay, no_decay = [], []
     seen = set()
     
@@ -321,13 +329,15 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
             
             is_bias = name.endswith("bias")
             is_norm = isinstance(module, norm_types)
-            is_lora = "lora" in name.lower()
+            is_embed = isinstance(module, torch.nn.Embedding)
+            is_lora = "lora" in name.lower() and ("alpha" in name.lower() or "scale" in name.lower())
             
-            if is_bias or is_norm or is_lora:
+            if is_bias or is_norm or is_lora or (train_cfg.no_decay_embed and is_embed):
                 no_decay.append(p)
             else:
                 decay.append(p)
 
+    # Catch-all
     for name, p in model.named_parameters():
         if p.requires_grad and id(p) not in seen:
             decay.append(p)
@@ -347,12 +357,16 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
     return opt, sched
 
 # =============================================================================
-# TRAINING & EVAL STEPS (TPU)
+# TPU GENERATION (Static Cache Optimized)
 # =============================================================================
 
 def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg_scale, out_path):
-    """Inner generation loop for a single sample on TPU."""
+    """
+    Inner generation loop for a single sample on TPU.
+    Uses static KV caches and manual loop to avoid XLA graph recompilation.
+    """
     dia_gen = Dia(dia_cfg, device)
+    # Reuse preparation logic
     (src_BxS, src_pos, src_pad, enc_mask) = dia_gen._prepare_text_input(text)
     
     # Encoder
@@ -386,13 +400,17 @@ def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg
         )
         
         logits, _ = model.decoder.decode_step(tgt_ids, tgt_pos, encoder_out, self_attn_mask, dec_cross_mask, self_cache, cross_cache)
-        # Manual cache update removed
 
-        # Sampling (Temperature)
+        # Sampling
         logits = logits[:, -1, :, :] # (1, C, V)
+        
+        # Classifier Free Guidance (Unconditional part skipped for simplicity in TPU demo, unless implemented)
+        # Note: Implementing CFG on TPU efficiently requires batching conditional+unconditional together.
+        # For this script, we stick to simple sampling or conditional only if cfg_scale is not handled.
+        
         if temp > 0:
             probs = F.softmax(logits / temp, dim=-1)
-            next_toks = torch.multinomial(probs.view(-1, logits.size(-1)), 1).view(1, -1) # Simple sampling
+            next_toks = torch.multinomial(probs.view(-1, logits.size(-1)), 1).view(1, -1)
         else:
             next_toks = torch.argmax(logits, dim=-1)
             
@@ -401,22 +419,24 @@ def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg
     
     # Save
     dac_model = dac.DAC.load(dac.utils.download()).eval().cpu()
-    # strip_weight_norms(dac_model) # Be safe
     codes = generated[0, 1:].cpu() # (T, C)
     audio = codebook_to_audio(codes.T.unsqueeze(0), dac_model, dia_cfg.data.delay_pattern, B=1, T=max_tokens, C=dia_cfg.data.channels)
     sf.write(out_path, audio.squeeze().detach().numpy().T, EVAL_SAMPLE_RATE)
     logger.info(f"Saved TPU demo: {out_path}")
 
+# =============================================================================
+# EVAL STEP
+# =============================================================================
+
 def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_cfg, accelerator, do_demo=True, current_train_loss=None, stop_on_overfit=False):
     """TPU Evaluation Step."""
     eval_losses = []
     
-    # 1. Validation Loop (if loader exists)
     if val_loader:
         model.eval()
         with torch.no_grad():
             for eb in tqdm(val_loader, desc="eval", disable=not accelerator.is_main_process):
-                # Move to device if collate didn't (common pattern)
+                # Ensure device placement (Accelerate usually handles this, but collate returns CPU)
                 for k, v in eb.items():
                     if isinstance(v, torch.Tensor): eb[k] = v.to(device)
 
@@ -432,29 +452,55 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                         enable_dropout=False,
                     )[:, :-1]
 
+                # Explicit float cast for stability
+                logits = logits.float() 
                 target = eb['tgt_tokens'][:, 1:]
-                loss = 0.0
-                channel_weights = CODEBOOK_WEIGHTS + CODEBOOK_WEIGHTS if target.shape[2] == 18 else [1.0] * target.shape[2]
                 
-                # Simple loss sum for eval
+                # --- LOSS MASKING (TPU OPTIMIZED) ---
+                # GPU script uses boolean masking: tensor[mask]. This is fatal for TPU (dynamic shapes).
+                # TPU solution: Use reduction='none' and mathematical masking.
+                
+                # 1. Length mask
+                mask = torch.arange(target.shape[1], device=target.device).unsqueeze(0) < (eb['tgt_lens'].unsqueeze(1) - 1)
+                mask = mask.unsqueeze(-1).expand_as(target) # (B, T, C)
+                
+                # 2. Audio value mask (ignore BOS/EOS/Special)
+                audio_token_mask = (target >= 0) & (target <= 1023)
+                
+                # 3. Combine
+                final_mask = (mask & audio_token_mask).float()
+                
+                loss = 0.0
+                channel_weights = []
+                num_groups = target.shape[2] // 9
+                if num_groups > 0:
+                    for _ in range(num_groups):
+                        channel_weights.extend(CODEBOOK_WEIGHTS)
+                else:
+                    channel_weights = [1.0] * target.shape[2]
+                
                 for c, w in enumerate(channel_weights):
-                    loss += w * F.cross_entropy(
-                        logits[:, :, c, :].flatten(0, 1), 
-                        target[:, :, c].flatten(), 
-                        ignore_index=dia_cfg.data.audio_pad_value
-                    )
+                    l_c = logits[:, :, c, :].flatten(0, 1) # (B*T, V)
+                    t_c = target[:, :, c].flatten()      # (B*T)
+                    m_c = final_mask[:, :, c].flatten()  # (B*T)
+                    
+                    # Compute unreduced loss
+                    ce_loss = F.cross_entropy(l_c, t_c, reduction='none', ignore_index=dia_cfg.data.audio_pad_value)
+                    
+                    # Apply mask mathematically
+                    masked_loss = (ce_loss * m_c).sum()
+                    mask_sum = m_c.sum() + 1e-9
+                    
+                    loss += w * (masked_loss / mask_sum)
+                
                 eval_losses.append(loss / sum(channel_weights))
                 if HAS_XLA: xm.mark_step()
         model.train()
 
-    # 2. Logging & Stop Check
+    # Logging & Stop Check
     should_stop = False
     if eval_losses:
-        # Need to gather losses from all TPU cores?
-        # Simpler: just log local average for now or let WandB handle it if processes log independently.
-        # But for stop decision we need global consensus.
         local_avg = sum(eval_losses) / len(eval_losses)
-        # Gather across devices
         avg_loss = accelerator.gather(local_avg.unsqueeze(0)).mean().item()
         
         if accelerator.is_main_process:
@@ -467,39 +513,31 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
     if not do_demo: 
         return should_stop
 
-    # 3. Demo Generation (TPU Optimized)
+    # Demo Generation
     if accelerator.is_main_process:
         logger.info(f"Generating eval demos at step {global_step}")
         unwrapped = accelerator.unwrap_model(model)
         unwrapped.eval()
-
-        # Use shorter generation for TPU demo speed
         max_tokens = min(200, dia_cfg.data.audio_length)
 
         try:
             with torch.no_grad():
-                # Helper for safe filenames
                 def safe_temp(t): return f"{t:.1f}".replace(".", "p")
                 
-                # --- Unconditional Logic ---
                 if train_cfg.unconditional_frac >= 1.0:
                     seeds = [int(train_cfg.seed), int(train_cfg.seed) + 1]
                     for temp in EVAL_TEMPERATURES:
                         for s in seeds:
                             seed_everything(s)
-                            # Generate (simplified call for TPU)
                             generate_demo_sample_tpu(
                                 unwrapped, dia_cfg, device, max_tokens, 
                                 text="", temp=temp, cfg_scale=EVAL_CFG_SCALE_UNCOND,
                                 out_path=Path(EVAL_AUDIO_DIR) / f"step_{global_step}_temp{safe_temp(temp)}_seed{s}.wav"
                             )
-                
-                # --- Prompt Logic ---
                 else:
                     cfg_s = EVAL_CFG_SCALE if train_cfg.unconditional_frac > 0 else None
                     for temp in EVAL_TEMPERATURES:
                         for name, prompt in TEST_PROMPTS.items():
-                             # Generate (simplified call for TPU)
                             generate_demo_sample_tpu(
                                 unwrapped, dia_cfg, device, max_tokens, 
                                 text=prompt, temp=temp, cfg_scale=cfg_s,
@@ -513,6 +551,10 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
             
     accelerator.wait_for_everyone()
     return should_stop
+
+# =============================================================================
+# TRAIN STEP
+# =============================================================================
 
 def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator):
     global _nonfinite_hits
@@ -535,20 +577,51 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
             dec_cross_attn_mask=batch['dec_cross_attn_mask'],
             enable_dropout=True,
         )
-        logits, target = logits[:, :-1], batch['tgt_tokens'][:, 1:]
         
-        # Loss calculation
-        channel_weights = CODEBOOK_WEIGHTS + CODEBOOK_WEIGHTS if target.shape[2] == 18 else [1.0] * target.shape[2]
+        # We need to slice based on fixed shapes
+        # batch['tgt_tokens'] has shape (B, window_size+2, C)
+        # We want to predict from index 1 to end
+        logits = logits[:, :-1]
+        target = batch['tgt_tokens'][:, 1:]
         
-        # Mask padding
-        # Use simple ignore_index since shapes are fixed but padding values are present
+        # --- LOSS MASKING (TPU OPTIMIZED) ---
+        # 1. Length Mask
+        mask = torch.arange(target.shape[1], device=target.device).unsqueeze(0) < (batch['tgt_lens'].unsqueeze(1) - 1)
+        mask = mask.unsqueeze(-1).expand_as(target)
+        
+        # 2. Audio Value Mask
+        audio_token_mask = (target >= 0) & (target <= 1023)
+        
+        # 3. Combine
+        final_mask = (mask & audio_token_mask).float()
+        
         loss = 0.0
+        channel_weights = []
+        num_groups = target.shape[2] // 9
+        if num_groups > 0:
+            for _ in range(num_groups):
+                channel_weights.extend(CODEBOOK_WEIGHTS)
+        else:
+            channel_weights = [1.0] * target.shape[2]
+        
         for c, w in enumerate(channel_weights):
-            l_c = logits[:, :, c, :].reshape(-1, logits.size(-1))
-            t_c = target[:, :, c].reshape(-1)
-            loss += w * F.cross_entropy(l_c, t_c, ignore_index=dia_cfg.data.audio_pad_value)
+            l_c = logits[:, :, c, :].flatten(0, 1)
+            t_c = target[:, :, c].flatten()
+            m_c = final_mask[:, :, c].flatten()
+            
+            # Unreduced CE
+            ce_loss = F.cross_entropy(l_c, t_c, reduction='none', ignore_index=dia_cfg.data.audio_pad_value)
+            
+            # Masked Mean
+            masked_loss = (ce_loss * m_c).sum()
+            mask_sum = m_c.sum() + 1e-9
+            
+            loss += w * (masked_loss / mask_sum)
         
         loss = loss / sum(channel_weights)
+
+        if global_step % ENTROPY_LOG_INTERVAL == 0 and accelerator.is_main_process:
+            wandb.log({'output_entropy': compute_output_entropy(logits.detach())}, step=global_step)
 
     if not torch.isfinite(loss):
         _nonfinite_hits += 1
@@ -559,13 +632,20 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
     accelerator.backward(loss)
     
     if (step + 1) % train_cfg.grad_accum_steps == 0:
-        accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+        norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+        if accelerator.is_main_process:
+             wandb.log({'grad_norm': norm}, step=global_step)
+        
         opt.step()
         sched.step()
         opt.zero_grad()
     
     if HAS_XLA: xm.mark_step()
     return loss.item() * train_cfg.grad_accum_steps
+
+# =============================================================================
+# MAIN TRAINING LOOP
+# =============================================================================
 
 def train(args):
     """TPU Training Loop (Robust)."""
@@ -591,29 +671,24 @@ def train(args):
         tag_shuffle=(not args.tag_no_shuffle and args.tag_shuffle),
         tag_dropout=args.tag_dropout,
         tag_limit=args.tag_limit,
+        no_decay_embed=args.no_decay_embed,
     )
 
     if accelerator.is_main_process:
         train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        Path(EVAL_AUDIO_DIR).mkdir(exist_ok=True)
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=train_cfg.run_name, config=vars(args))
     
     accelerator.wait_for_everyone()
     seed_everything(args.seed)
 
     # Dataset
-    # For TPU, we use PreEncoded or TestingDataset
     if args.preencoded_dir:
         dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, args.use_sliding_window)
     elif args.audio_folder:
-        # Load DAC on CPU first to avoid TPU memory usage if not needed, or just for encoding
+        # Load CPU DAC for encoding in dataloaders
         dac_model = dac.DAC.load(dac.utils.download()).eval().to('cpu')
         strip_weight_norms(dac_model)
-        # TestingDataset expects DAC on device to encode
-        # We put it on 'cpu' inside dataset or let dataset handle it.
-        # TestingDataset puts it on device. Let's pass CPU dac and let dataset handle encoding.
-        # IMPORTANT: TestingDataset.getitem encodes on the fly. 
-        # This might be slow on CPU, but encoding on TPU inside getitem is complex (multiprocessing).
-        # We'll rely on CPU encoding in the dataloader workers.
         skip_tags = [t.strip() for t in args.skip_tags.split(',')] if args.skip_tags else None
         dataset = TestingDataset(args.audio_folder, dia_cfg, dac_model, args.use_sliding_window, skip_tags=skip_tags)
     else:
@@ -634,7 +709,7 @@ def train(args):
     
     state = torch.load(ckpt_path, map_location="cpu")
     
-    # Stereo Logic
+    # Stereo Logic (Ported from GPU script)
     key = "decoder.logits_dense.weight"
     expanded_stereo = False
     if key in state and dia_cfg.data.channels == 18:
@@ -654,6 +729,12 @@ def train(args):
             model.decoder.logits_dense.weight.data[:, 9:18, :].copy_(
                 model.decoder.logits_dense.weight.data[:, 0:9, :]
             )
+
+    # Freezing Heuristic
+    if train_cfg.unconditional_frac >= 0.9 and hasattr(model, 'encoder'):
+        logger.info("Freezing encoder for high-unconditional training")
+        for p in model.encoder.parameters():
+            p.requires_grad = False
 
     # Optimizer
     opt, sched = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
@@ -678,9 +759,10 @@ def train(args):
         loader_iter = tqdm(train_loader, desc=f"E{epoch+1}", disable=not accelerator.is_main_process)
         
         for step, batch in enumerate(loader_iter):
-            # Move batch to device explicitly if needed (Accelerator usually handles this)
-            # But our collate returned CPU tensors. Accelerator.prepare wraps loader to move them.
-            
+            # Move batch items to device (needed because collate returns CPU tensors)
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor): batch[k] = v.to(device)
+
             global_step = epoch * steps_per_epoch + step
             loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator)
             
@@ -703,7 +785,6 @@ def train(args):
                 
                 if args.stop_on_overfit:
                     stop_tensor = torch.tensor(int(should_stop_local), device=device)
-                    # Use all_reduce or gather. Accelerate gather is easier.
                     stop_training = accelerator.gather(stop_tensor).sum() > 0
                     if stop_training: break
 
@@ -744,7 +825,7 @@ def train(args):
     accelerator.wait_for_everyone()
 
 # =============================================================================
-# ARGS COPY (Same as GPU)
+# ARGS & UTILS COPY
 # =============================================================================
 
 def load_train_config(config_path: Path) -> dict:
@@ -805,9 +886,11 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--force_single_gpu", action=argparse.BooleanOptionalAction, default=defaults.get('force_single_gpu', False))
     parser.add_argument("--use_sliding_window", action=argparse.BooleanOptionalAction, default=defaults.get('use_sliding_window', True))
     parser.add_argument("--tag_shuffle", action=argparse.BooleanOptionalAction, default=True)
-
+    
+    # Optimizer
     parser.add_argument("--half", action="store_true", help="BF16 mixed precision")
     parser.add_argument("--compile", action="store_true") # No-op on TPU usually but kept for compat
+    parser.add_argument("--no_decay_embed", action="store_true", help="Exclude nn.Embedding parameters from weight decay")
     parser.add_argument("--skip_tags", type=str, default=None)
     
     # WandB
@@ -828,4 +911,3 @@ def get_args() -> argparse.Namespace:
 if __name__ == "__main__":
     main_args = get_args()
     train(main_args)
-

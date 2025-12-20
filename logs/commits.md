@@ -111,3 +111,4 @@
 - `2025-12-18 01:32` [`34ded1a`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}_{NoSpecialToks}
 - `2025-12-18 11:11` [`ed643b0`] **main**: 20251127_dia_010_gpu_refactor_scratch_dataset_{Xavier}_{NoSpecialToks}_eval_fix
 - `2025-12-19 13:18` [`06a2f95`] ****: current
+- `2025-12-19 13:49` [`7023873`] **010**: dia_010_run_6_added depth initialization back and fixed eval loss. running as a test to get a new baseline going and start building momentum again.

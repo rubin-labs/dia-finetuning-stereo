@@ -917,6 +917,10 @@ def get_args() -> argparse.Namespace:
         
     return args
 
+def main():
+    """Entry point for accelerate launch --module."""
+    args = get_args()
+    train(args)
+
 if __name__ == "__main__":
-    main_args = get_args()
-    train(main_args)
+    main()

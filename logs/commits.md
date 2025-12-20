@@ -116,3 +116,4 @@
 - `2025-12-19 19:36` [`b70b7b1`] **010**: fix_tpu_env.sh
 - `2025-12-19 19:47` [`206ea50`] **010**: scripts/fix_libpython.sh
 - `2025-12-19 19:58` [`2c98339`] **010**: scripts/fix_glibc.sh
+- `2025-12-19 20:00` [`74e5995`] **010**: scripts/fix_tpu_complete.sh

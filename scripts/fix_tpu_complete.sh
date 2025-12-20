@@ -7,17 +7,53 @@ set -e
 echo "=== Complete TPU Environment Fix ==="
 echo ""
 
-# Get conda environment path properly
+# Get conda environment path properly - use multiple methods
 CONDA_BASE=$(conda info --base)
-ACTIVE_ENV=$(conda env list | grep '*' | awk '{print $1}' | sed 's/*//' | head -1)
-CONDA_ENV_PATH="$CONDA_BASE/envs/$ACTIVE_ENV"
 
-if [ ! -d "$CONDA_ENV_PATH" ]; then
-    echo "❌ Could not find conda environment: $CONDA_ENV_PATH"
-    exit 1
+# Method 1: Use CONDA_DEFAULT_ENV if set
+if [ -n "$CONDA_DEFAULT_ENV" ] && [ "$CONDA_DEFAULT_ENV" != "base" ]; then
+    CONDA_ENV_PATH="$CONDA_BASE/envs/$CONDA_DEFAULT_ENV"
+# Method 2: Get from Python executable path
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_PATH=$(which python)
+    if [[ "$PYTHON_PATH" == *"envs"* ]]; then
+        # Extract env name from path like /path/to/envs/envname/bin/python
+        CONDA_ENV_PATH=$(echo "$PYTHON_PATH" | sed 's|/bin/python.*||' | sed 's|/bin/python||')
+    else
+        # Fallback: use base
+        CONDA_ENV_PATH="$CONDA_BASE"
+    fi
+# Method 3: Try to parse conda env list
+else
+    ACTIVE_ENV=$(conda env list 2>/dev/null | grep -E '^\s*\*' | awk '{print $NF}' | head -1)
+    if [ -n "$ACTIVE_ENV" ] && [ "$ACTIVE_ENV" != "base" ]; then
+        CONDA_ENV_PATH="$CONDA_BASE/envs/$ACTIVE_ENV"
+    else
+        CONDA_ENV_PATH="$CONDA_BASE"
+    fi
 fi
 
-echo "Conda environment: $CONDA_ENV_PATH"
+# Verify the path exists
+if [ ! -d "$CONDA_ENV_PATH" ]; then
+    echo "❌ Could not find conda environment: $CONDA_ENV_PATH"
+    echo "Trying to use Python's path directly..."
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_LIB=$(python -c "import sys; print(sys.prefix)" 2>/dev/null)
+        if [ -d "$PYTHON_LIB" ]; then
+            CONDA_ENV_PATH="$PYTHON_LIB"
+            echo "Using Python prefix: $CONDA_ENV_PATH"
+        else
+            echo "❌ All methods failed. Using conda base: $CONDA_BASE"
+            CONDA_ENV_PATH="$CONDA_BASE"
+        fi
+    else
+        exit 1
+    fi
+fi
+
+echo "Conda base: $CONDA_BASE"
+echo "Conda environment path: $CONDA_ENV_PATH"
+echo "Python executable: $(which python 2>/dev/null || echo 'not found')"
 echo ""
 
 # Step 1: Ensure libpython3.11.so.1.0 exists

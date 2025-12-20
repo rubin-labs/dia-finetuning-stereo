@@ -35,9 +35,16 @@ from transformers import get_scheduler
 
 from .audio import apply_audio_delay, build_delay_indices, codebook_to_audio
 from .config import DiaConfig
-from .dataset import PreEncodedDACDataset, TestingDataset
+from .dataset import PreEncodedDACDataset
 from .layers import DiaModel, KVCache
 from .model import Dia
+
+# Conditional import for TestingDataset (only needed when using --audio_folder)
+try:
+    from . import dataset as dataset_module
+    TestingDataset = getattr(dataset_module, 'TestingDataset', None)
+except (ImportError, AttributeError):
+    TestingDataset = None
 
 # TPU Imports
 try:
@@ -686,6 +693,8 @@ def train(args):
     if args.preencoded_dir:
         dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, args.use_sliding_window)
     elif args.audio_folder:
+        if TestingDataset is None:
+            raise ImportError("TestingDataset is not available. Please ensure dia/dataset.py contains the TestingDataset class.")
         # Load CPU DAC for encoding in dataloaders
         dac_model = dac.DAC.load(dac.utils.download()).eval().to('cpu')
         strip_weight_norms(dac_model)

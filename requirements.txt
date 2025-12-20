@@ -1,11 +1,25 @@
-descript-audio-codec>=1.0.0
-gradio>=5.25.2
-huggingface-hub>=0.30.2
-numpy>=2.2.4
-pydantic>=2.11.3
-safetensors>=0.5.3
-soundfile>=0.13.1
+# Core TPU and Audio dependencies
 torch==2.6.0
 torchaudio==2.6.0
-triton==3.2.0 ; sys_platform == "linux"
-triton-windows==3.2.0.post18 ; sys_platform == "win32"
+descript-audio-codec>=1.0.0
+soundfile>=0.13.1
+numpy>=2.2.4
+
+# Training Infrastructure (Missing from original file)
+accelerate
+transformers
+wandb
+tqdm
+
+# Utilities
+huggingface-hub>=0.30.2
+safetensors>=0.5.3
+pydantic>=2.11.3
+
+# Fix from setup_tpu_env.sh to prevent version conflicts
+fsspec[http]<=2025.10.0,>=2023.1.0
+
+# Note: torch_xla should ideally be installed via your setup script 
+# to ensure it matches the TPU VM's libtpu version, 
+# but you can include it here if you use the find-links flag:
+# torch_xla==2.6.0 --find-links https://storage.googleapis.com/libtpu-releases/index.html

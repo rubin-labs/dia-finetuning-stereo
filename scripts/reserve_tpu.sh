@@ -27,10 +27,11 @@ elif [[ "$ACCELERATOR_TYPE" == v5e-* ]]; then
     VERSION="tpu-vm-v5e-base"
     TPU_TYPE="v5e"
 elif [[ "$ACCELERATOR_TYPE" == v4-* ]]; then
-    VERSION="tpu-vm-v4-pt-2.0"  # PyTorch 2.0 for v4
+    # Use Ubuntu 22.04 base (tpu-vm-v4-pt-2.0 is Ubuntu 20.04 and has GLIBC issues)
+    VERSION="tpu-ubuntu2204-base"  # Ubuntu 22.04 for GLIBC 2.35 compatibility
     TPU_TYPE="v4"
 else
-    VERSION="tpu-vm-v4-pt-2.0"  # PyTorch 2.0 for v4
+    VERSION="tpu-ubuntu2204-base"  # Ubuntu 22.04 for GLIBC 2.35 compatibility
     TPU_TYPE="v4"
 fi
 

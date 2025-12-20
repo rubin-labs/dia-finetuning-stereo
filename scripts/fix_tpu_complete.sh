@@ -100,8 +100,21 @@ export CUDA_VISIBLE_DEVICES=""
 echo "✓ LD_LIBRARY_PATH set to: $LD_LIBRARY_PATH"
 echo ""
 
-# Step 4: Test
-echo "Step 4: Testing torch_xla import..."
+# Step 4: Check if torch_xla is installed
+echo "Step 4: Checking torch_xla installation..."
+if ! python -c "import torch_xla" 2>/dev/null; then
+    echo "torch_xla not found. Installing..."
+    XLA_VER=$(python -c "import importlib.metadata as md; print(md.version('torch'))" 2>/dev/null || echo "2.9.0")
+    echo "Installing torch_xla version $XLA_VER..."
+    pip install "torch_xla==${XLA_VER}" -f https://storage.googleapis.com/libtpu-releases/index.html
+    echo "✓ torch_xla installed"
+else
+    echo "✓ torch_xla already installed"
+fi
+
+# Step 5: Test
+echo ""
+echo "Step 5: Testing torch_xla import..."
 python -c "
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = ''

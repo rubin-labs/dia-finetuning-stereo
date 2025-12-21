@@ -453,13 +453,18 @@ def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg
             elapsed = time.time() - start_time
             print(f"  [GEN] Token {step}/{max_tokens} ({elapsed:.1f}s elapsed)", flush=True)
         
-        # Get current token (static indexing)
-        tgt_ids = generated[:, step:step+1, :]  # (1, 1, C)
-        tgt_pos = torch.tensor([[step]], dtype=torch.long, device=device)  # (1, 1)
+        # Create step tensor for this iteration
+        step_tensor = torch.tensor([step], dtype=torch.long, device=device)
         
-        # ===== SELECT PRE-COMPUTED MASK (static shape) =====
-        # Select row 'step' from precomputed masks: (max_tokens,) -> (1, 1, 1, max_tokens)
-        self_attn_mask = all_self_attn_masks[step].view(1, 1, 1, max_tokens)
+        # 1. READ INPUT: Get current token (static indexing via index_select)
+        # generated: (1, T_max, C) -> select along dim 1
+        tgt_ids = torch.index_select(generated, 1, step_tensor) # (1, 1, C)
+        tgt_pos = step_tensor.unsqueeze(0)  # (1, 1)
+        
+        # 2. SELECT MASK: Select row 'step' from precomputed masks
+        # all_self_attn_masks: (T_max, T_max)
+        mask_row = torch.index_select(all_self_attn_masks, 0, step_tensor) # (1, T_max)
+        self_attn_mask = mask_row.view(1, 1, 1, max_tokens)
         
         # Decode step with static_kv=True
         logits, _ = model.decoder.decode_step(
@@ -479,8 +484,11 @@ def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg
         else:
             next_toks = torch.argmax(logits, dim=-1)  # (1, C)
         
-        # Write to pre-allocated tensor (static indexing, no concatenation)
-        generated[:, step + 1, :] = next_toks
+        # 3. WRITE OUTPUT: Write to pre-allocated tensor using index_copy_
+        # generated: (1, T_max, C)
+        # next_toks: (1, C) -> reshape to (1, 1, C)
+        next_step_tensor = torch.tensor([step + 1], dtype=torch.long, device=device)
+        generated.index_copy_(1, next_step_tensor, next_toks.unsqueeze(1))
         
         if HAS_XLA: xm.mark_step()
     

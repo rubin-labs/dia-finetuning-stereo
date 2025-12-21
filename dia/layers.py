@@ -232,9 +232,15 @@ class KVCache:
         This avoids dynamic slicing/concatenation that causes XLA recompilation.
         The caller must use an attention mask to ignore positions beyond current_idx+1.
         """
-        # Write current K/V to the current position
-        self.k[:, :, self.current_idx : self.current_idx + 1, :] = current_k
-        self.v[:, :, self.current_idx : self.current_idx + 1, :] = current_v
+        # Create tensor index to ensure XLA treats this as a dynamic input, not a constant
+        # This prevents recompiling the graph for every single index value
+        idx_tensor = torch.tensor([self.current_idx], dtype=torch.long, device=self.k.device)
+        
+        # Use index_copy_ instead of slicing assignment
+        # self.k shape: (B, H, S, D) - update along dim 2
+        self.k.index_copy_(2, idx_tensor, current_k)
+        self.v.index_copy_(2, idx_tensor, current_v)
+        
         self.current_idx += 1
         # Return full cache (static shape: batch, heads, max_len, head_dim)
         return self.k, self.v

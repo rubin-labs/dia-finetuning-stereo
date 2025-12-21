@@ -127,3 +127,4 @@
 - `2025-12-20 18:58` [`b8bf893`] **010**: extra logging
 - `2025-12-20 19:56` [`ce2a3ed`] **010**: tpu_run_pod
 - `2025-12-20 21:20` [`f2311b6`] **010**: Add xmp.spawn for TPU pod
+- `2025-12-21 13:36` [`b08b582`] **010**: TPU with static KV cache for tpu generation to avoid xla recompilation

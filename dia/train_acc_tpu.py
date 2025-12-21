@@ -5,14 +5,28 @@ Adapts dia/train_acc_gpu.py for TPU/XLA compatibility.
 Run with: accelerate launch dia/train_acc_tpu.py --args...
 """
 
+# ============================================================================
+# CRITICAL: Set TPU environment BEFORE any torch_xla imports!
+# This must happen at the very top of the file.
+# ============================================================================
+import os
+import sys
+
+# Check for single-device mode flag (set via --single-device or TPU_SINGLE_DEVICE env)
+_force_single_device = "--single-device" in sys.argv or os.environ.get("TPU_SINGLE_DEVICE") == "1"
+
+if _force_single_device and os.environ.get("PJRT_DEVICE") == "TPU":
+    print("[INIT] Single-device mode requested. Setting TPU_VISIBLE_CHIPS=0", flush=True)
+    os.environ["TPU_VISIBLE_CHIPS"] = "0"
+    os.environ["TPU_PROCESS_BOUNDS"] = "1,1,1"
+# ============================================================================
+
 import argparse
 import glob
 import logging
 import json
-import os
 import random
 import re
-import sys
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -311,10 +325,13 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, u
     # Drop last to keep batch sizes consistent (critical for TPU)
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg.batch_size, shuffle=True,
-        collate_fn=collate, num_workers=0, pin_memory=False, drop_last=True
+        collate_fn=collate, num_workers=4, pin_memory=False, drop_last=True
     )
     if val_ds:
-        val_loader = DataLoader(val_ds, batch_size=train_cfg.batch_size, shuffle=False, collate_fn=collate, num_workers=0, drop_last=True)
+        val_loader = DataLoader(
+            val_ds, batch_size=train_cfg.batch_size, shuffle=False,
+            collate_fn=collate, num_workers=4, pin_memory=False, drop_last=True
+        )
     else:
         val_loader = None
         
@@ -374,69 +391,116 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
 # TPU GENERATION (Static Cache Optimized)
 # =============================================================================
 
-def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg_scale, out_path):
+_dac_model_cache = None
+
+def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg_scale, out_path, dac_model=None):
     """
-    Inner generation loop for a single sample on TPU.
-    Uses static KV caches and manual loop to avoid XLA graph recompilation.
+    TPU-optimized generation using STATIC KV cache shapes.
+    
+    Key optimization: Pre-allocate all tensors at max_tokens size and use
+    attention masking instead of dynamic slicing/concatenation. This prevents
+    XLA graph recompilation at each step.
     """
+    import time
+    start_time = time.time()
+    
     dia_gen = Dia(dia_cfg, device)
     # Reuse preparation logic
     (src_BxS, src_pos, src_pad, enc_mask) = dia_gen._prepare_text_input(text)
     
+    print(f"  [GEN] Running encoder...", flush=True)
     # Encoder
     encoder_out = model.encoder(src_BxS, src_pos, deterministic=True, attn_mask=enc_mask)
+    if HAS_XLA: xm.mark_step()
+    print(f"  [GEN] Encoder done. Setting up static caches...", flush=True)
     
-    # Static Caches
+    # ===== STATIC KV CACHES (pre-allocated at full max_tokens size) =====
     cross_cache = model.decoder.precompute_cross_attention_kv(max_tokens, encoder_out, src_pos)
     self_cache = [KVCache(dia_cfg.model.decoder.gqa_query_heads, max_tokens, dia_cfg.model.decoder.gqa_head_dim, device, batch_size=1) for _ in range(model.decoder.num_layers)]
     
-    generated = torch.full((1, 1, dia_cfg.data.channels), dia_cfg.data.audio_bos_value, dtype=torch.long, device=device)
+    # ===== STATIC GENERATED TENSOR (pre-allocated at full size) =====
+    # Shape: (1, max_tokens + 1, channels) - +1 for BOS token
+    generated = torch.full((1, max_tokens + 1, dia_cfg.data.channels), 0, dtype=torch.long, device=device)
+    generated[:, 0, :] = dia_cfg.data.audio_bos_value  # BOS at position 0
     
-    # Pre-allocate static mask buffer
-    static_indices = torch.arange(max_tokens, device=device).view(1, 1, 1, max_tokens)
+    # ===== PRE-COMPUTE CROSS ATTENTION MASK (static shape) =====
+    # Cross mask is the same for all steps: (1, 1, 1, src_len)
+    dec_cross_mask = dia_gen._create_attn_mask(
+        torch.ones((1, 1), dtype=torch.bool, device=device), 
+        src_pad, 
+        is_causal=False
+    )
+    
+    # ===== PRECOMPUTE ALL SELF-ATTENTION MASKS (fully static) =====
+    # Shape: (max_tokens, max_tokens) - lower triangular structure
+    # Row i: positions 0..i are 0.0 (valid), positions i+1..max-1 are -inf (masked)
+    # This uses O(max_tokens^2) memory but enables fully static indexing
+    row_idx = torch.arange(max_tokens, device=device).unsqueeze(1)  # (T, 1)
+    col_idx = torch.arange(max_tokens, device=device).unsqueeze(0)  # (1, T)
+    all_self_attn_masks = torch.where(
+        col_idx <= row_idx,
+        torch.tensor(0.0, device=device),
+        torch.tensor(float('-inf'), device=device)
+    )  # (max_tokens, max_tokens)
+    if HAS_XLA: xm.mark_step()
+    
+    print(f"  [GEN] Starting decode loop ({max_tokens} tokens) with STATIC shapes...", flush=True)
 
     # Decode Loop
     for step in range(max_tokens):
-        if step % 20 == 0 and HAS_XLA: xm.mark_step()
+        if step % 20 == 0:
+            if HAS_XLA: xm.mark_step()
+            elapsed = time.time() - start_time
+            print(f"  [GEN] Token {step}/{max_tokens} ({elapsed:.1f}s elapsed)", flush=True)
         
-        tgt_ids = generated[:, step].unsqueeze(1)
-        tgt_pos = torch.full((1, 1), step, dtype=torch.long, device=device)
+        # Get current token (static indexing)
+        tgt_ids = generated[:, step:step+1, :]  # (1, 1, C)
+        tgt_pos = torch.tensor([[step]], dtype=torch.long, device=device)  # (1, 1)
         
-        # 1. Cross Mask
-        dec_cross_mask = dia_gen._create_attn_mask(torch.ones((1, 1), dtype=torch.bool, device=device), src_pad, is_causal=False)
+        # ===== SELECT PRE-COMPUTED MASK (static shape) =====
+        # Select row 'step' from precomputed masks: (max_tokens,) -> (1, 1, 1, max_tokens)
+        self_attn_mask = all_self_attn_masks[step].view(1, 1, 1, max_tokens)
         
-        # 2. Self Mask (Static logic)
-        current_step_t = torch.tensor(step, device=device)
-        self_attn_mask = torch.where(
-            static_indices <= current_step_t,
-            torch.tensor(0.0, device=device),
-            torch.tensor(float('-inf'), device=device)
+        # Decode step with static_kv=True
+        logits, _ = model.decoder.decode_step(
+            tgt_ids, tgt_pos, encoder_out, 
+            self_attn_mask,  # Proper mask for static mode
+            dec_cross_mask, 
+            self_cache, cross_cache,
+            static_kv=True  # Use static KV cache mode
         )
-        
-        logits, _ = model.decoder.decode_step(tgt_ids, tgt_pos, encoder_out, self_attn_mask, dec_cross_mask, self_cache, cross_cache)
 
         # Sampling
-        logits = logits[:, -1, :, :] # (1, C, V)
-        
-        # Classifier Free Guidance (Unconditional part skipped for simplicity in TPU demo, unless implemented)
-        # Note: Implementing CFG on TPU efficiently requires batching conditional+unconditional together.
-        # For this script, we stick to simple sampling or conditional only if cfg_scale is not handled.
+        logits = logits[:, -1, :, :]  # (1, C, V)
         
         if temp > 0:
             probs = F.softmax(logits / temp, dim=-1)
             next_toks = torch.multinomial(probs.view(-1, logits.size(-1)), 1).view(1, -1)
         else:
-            next_toks = torch.argmax(logits, dim=-1)
-            
-        generated = torch.cat([generated, next_toks.unsqueeze(1)], dim=1)
+            next_toks = torch.argmax(logits, dim=-1)  # (1, C)
+        
+        # Write to pre-allocated tensor (static indexing, no concatenation)
+        generated[:, step + 1, :] = next_toks
+        
         if HAS_XLA: xm.mark_step()
     
+    print(f"  [GEN] Decode loop complete. Decoding audio with DAC...", flush=True)
+    
     # Save
-    dac_model = dac.DAC.load(dac.utils.download()).eval().cpu()
-    codes = generated[0, 1:].cpu() # (T, C)
-    audio = codebook_to_audio(codes.T.unsqueeze(0), dac_model, dia_cfg.data.delay_pattern, B=1, T=max_tokens, C=dia_cfg.data.channels)
+    dm = dac_model
+    if dm is None:
+        global _dac_model_cache
+        if _dac_model_cache is None:
+            _dac_model_cache = dac.DAC.load(dac.utils.download()).eval().cpu()
+        dm = _dac_model_cache
+
+    # generated shape: (1, max_tokens+1, C) with BOS at position 0
+    codes = generated[0].cpu()  # (max_tokens+1, C)
+    audio = codebook_to_audio(codes.T, dm, dia_cfg.data.delay_pattern, B=1, T=max_tokens, C=dia_cfg.data.channels)
     sf.write(out_path, audio.squeeze().detach().numpy().T, EVAL_SAMPLE_RATE)
-    logger.info(f"Saved TPU demo: {out_path}")
+    
+    total_time = time.time() - start_time
+    print(f"  [GEN] Saved: {out_path} ({total_time:.1f}s total)", flush=True)
 
 # =============================================================================
 # EVAL STEP
@@ -529,41 +593,68 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
 
     # Demo Generation
     if accelerator.is_main_process:
-        logger.info(f"Generating eval demos at step {global_step}")
+        print(f"[DEMO] Starting demo generation at step {global_step}...", flush=True)
         unwrapped = accelerator.unwrap_model(model)
         unwrapped.eval()
         max_tokens = min(200, dia_cfg.data.audio_length)
+        print(f"[DEMO] Max tokens per sample: {max_tokens}", flush=True)
 
         try:
             with torch.no_grad():
                 def safe_temp(t): return f"{t:.1f}".replace(".", "p")
                 
+                # Ensure output dir exists
+                Path(EVAL_AUDIO_DIR).mkdir(exist_ok=True)
+                # Load DAC once for all demos
+                print("[DEMO] Loading DAC model...", flush=True)
+                global _dac_model_cache
+                if _dac_model_cache is None:
+                    _dac_model_cache = dac.DAC.load(dac.utils.download()).eval().cpu()
+                print("[DEMO] DAC model loaded.", flush=True)
+
                 if train_cfg.unconditional_frac >= 1.0:
                     seeds = [int(train_cfg.seed), int(train_cfg.seed) + 1]
+                    total_demos = len(EVAL_TEMPERATURES) * len(seeds)
+                    demo_idx = 0
                     for temp in EVAL_TEMPERATURES:
                         for s in seeds:
+                            demo_idx += 1
+                            print(f"[DEMO] Generating demo {demo_idx}/{total_demos} (temp={temp}, seed={s})...", flush=True)
                             seed_everything(s)
                             generate_demo_sample_tpu(
                                 unwrapped, dia_cfg, device, max_tokens, 
                                 text="", temp=temp, cfg_scale=EVAL_CFG_SCALE_UNCOND,
-                                out_path=Path(EVAL_AUDIO_DIR) / f"step_{global_step}_temp{safe_temp(temp)}_seed{s}.wav"
+                                out_path=Path(EVAL_AUDIO_DIR) / f"step_{global_step}_temp{safe_temp(temp)}_seed{s}.wav",
+                                dac_model=_dac_model_cache
                             )
+                            print(f"[DEMO] Demo {demo_idx}/{total_demos} complete.", flush=True)
                 else:
                     cfg_s = EVAL_CFG_SCALE if train_cfg.unconditional_frac > 0 else None
+                    total_demos = len(EVAL_TEMPERATURES) * len(TEST_PROMPTS)
+                    demo_idx = 0
                     for temp in EVAL_TEMPERATURES:
                         for name, prompt in TEST_PROMPTS.items():
+                            demo_idx += 1
+                            print(f"[DEMO] Generating demo {demo_idx}/{total_demos} ({name}, temp={temp})...", flush=True)
                             generate_demo_sample_tpu(
                                 unwrapped, dia_cfg, device, max_tokens, 
                                 text=prompt, temp=temp, cfg_scale=cfg_s,
-                                out_path=Path(EVAL_AUDIO_DIR) / f"step_{global_step}_{name}_temp{safe_temp(temp)}.wav"
+                                out_path=Path(EVAL_AUDIO_DIR) / f"step_{global_step}_{name}_temp{safe_temp(temp)}.wav",
+                                dac_model=_dac_model_cache
                             )
+                            print(f"[DEMO] Demo {demo_idx}/{total_demos} complete.", flush=True)
+
+                print(f"[DEMO] All demos complete at step {global_step}!", flush=True)
 
         except Exception as e:
-            logger.exception(f"TPU Demo Failed: {e}")
+            print(f"[DEMO ERROR] TPU Demo Failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
         finally:
             unwrapped.train()
             
-    accelerator.wait_for_everyone()
+    if accelerator.num_processes > 1:
+        accelerator.wait_for_everyone()
     return should_stop
 
 # =============================================================================
@@ -573,6 +664,9 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
 def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator):
     global _nonfinite_hits
     
+    if global_step == 0:
+        print("[DEBUG train_step] Starting train_step...", flush=True)
+    
     # Unconditional dropout
     gen_val = ((global_step * 997 + train_cfg.seed) % 10000) / 10000.0
     if gen_val < train_cfg.unconditional_frac:
@@ -580,6 +674,9 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         batch['enc_self_attn_mask'].zero_()
         batch['dec_cross_attn_mask'].zero_()
 
+    if global_step == 0:
+        print("[DEBUG train_step] Starting forward pass (XLA compile happens here)...", flush=True)
+    
     with accelerator.autocast():
         logits = model(
             src_BxS=batch['src_tokens'],
@@ -591,6 +688,9 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
             dec_cross_attn_mask=batch['dec_cross_attn_mask'],
             enable_dropout=True,
         )
+        
+        if global_step == 0:
+            print(f"[DEBUG train_step] Forward pass scheduled. Logits shape: {logits.shape}", flush=True)
         
         # We need to slice based on fixed shapes
         # batch['tgt_tokens'] has shape (B, window_size+2, C)
@@ -637,24 +737,44 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         if global_step % ENTROPY_LOG_INTERVAL == 0 and accelerator.is_main_process:
             wandb.log({'output_entropy': compute_output_entropy(logits.detach())}, step=global_step)
 
+    if global_step == 0:
+        print(f"[DEBUG train_step] Loss computed: {loss}", flush=True)
+    
     if not torch.isfinite(loss):
         _nonfinite_hits += 1
         if HAS_XLA: xm.mark_step()
         return float('nan')
 
     loss = loss / train_cfg.grad_accum_steps
+    
+    if global_step == 0:
+        print("[DEBUG train_step] Starting backward pass...", flush=True)
+    
     accelerator.backward(loss)
+    
+    if global_step == 0:
+        print("[DEBUG train_step] Backward pass scheduled.", flush=True)
     
     if (step + 1) % train_cfg.grad_accum_steps == 0:
         norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
         if accelerator.is_main_process:
              wandb.log({'grad_norm': norm}, step=global_step)
         
+        if global_step == 0:
+            print("[DEBUG train_step] Running optimizer step...", flush=True)
+        
         opt.step()
         sched.step()
         opt.zero_grad()
     
+    if global_step == 0:
+        print("[DEBUG train_step] Calling mark_step (triggers XLA execution)...", flush=True)
+    
     if HAS_XLA: xm.mark_step()
+    
+    if global_step == 0:
+        print("[DEBUG train_step] mark_step complete. Getting loss value...", flush=True)
+    
     return loss.item() * train_cfg.grad_accum_steps
 
 # =============================================================================
@@ -665,11 +785,36 @@ def train(args):
     """TPU Training Loop (Robust)."""
     print("[TRAIN] Starting train()...", flush=True)
     
+    # Debug: Check TPU state before Accelerator
+    if HAS_XLA:
+        try:
+            import torch_xla.runtime as xr
+            print(f"[TRAIN] PJRT runtime detected: {xr.device_type()}", flush=True)
+            print(f"[TRAIN] Global device count: {xr.global_runtime_device_count()}", flush=True)
+            print(f"[TRAIN] Local device count: {xr.addressable_device_count()}", flush=True)
+        except Exception as e:
+            print(f"[TRAIN] Runtime check: {e}", flush=True)
+    
+    # For PJRT, let Accelerator handle device initialization
     # Use bf16 by default for TPU
-    print("[TRAIN] Creating Accelerator...", flush=True)
-    accelerator = Accelerator(mixed_precision="bf16" if args.half else "no")
+    print("[TRAIN] Creating Accelerator (this may hang if TPU pod workers aren't synced)...", flush=True)
+    sys.stdout.flush()
+    
+    # Force single-device mode to avoid distributed hangs
+    accelerator = Accelerator(
+        mixed_precision="bf16" if args.half else "no",
+    )
     print(f"[TRAIN] Accelerator created. Device: {accelerator.device}", flush=True)
+    print(f"[TRAIN] Num processes: {accelerator.num_processes}", flush=True)
+    print(f"[TRAIN] Process index: {accelerator.process_index}", flush=True)
     device = accelerator.device
+    
+    # Log XLA info after Accelerator is initialized
+    if HAS_XLA:
+        try:
+            print(f"[TRAIN] XLA device: {xm.xla_device()}", flush=True)
+        except Exception as e:
+            print(f"[TRAIN] XLA info: {e}", flush=True)
     
     print(f"[TRAIN] Loading config from {args.config}...", flush=True)
     dia_cfg = DiaConfig.load(args.config)
@@ -701,10 +846,14 @@ def train(args):
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=train_cfg.run_name, config=vars(args))
         print(f"[TRAIN] Process {accelerator.process_index}: WandB initialized.", flush=True)
     
-    print(f"[TRAIN] Process {accelerator.process_index}: Waiting for everyone...", flush=True)
-    accelerator.wait_for_everyone()
-    print(f"[TRAIN] Process {accelerator.process_index}: Everyone here!", flush=True)
-    seed_everything(args.seed)
+    # Synchronization: only use barriers when truly distributed
+    if accelerator.num_processes > 1:
+        print(f"[TRAIN] Process {accelerator.process_index}/{accelerator.num_processes}: Waiting for everyone...", flush=True)
+        accelerator.wait_for_everyone()
+        print(f"[TRAIN] Process {accelerator.process_index}: Everyone here!", flush=True)
+    else:
+        print("[TRAIN] Single process detected; skipping wait_for_everyone.", flush=True)
+    seed_everything(args.seed + accelerator.process_index)  # Different seed per process for data diversity
 
     # Dataset
     print(f"[TRAIN] Loading dataset from {args.preencoded_dir or args.audio_folder}...", flush=True)
@@ -797,12 +946,33 @@ def train(args):
         loader_iter = tqdm(train_loader, desc=f"E{epoch+1}", disable=not accelerator.is_main_process)
         
         for step, batch in enumerate(loader_iter):
+            if step == 0:
+                print(f"[DEBUG] Step 0: Got batch from dataloader", flush=True)
+            
             # Move batch items to device (needed because collate returns CPU tensors)
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor): batch[k] = v.to(device)
+            
+            if step == 0:
+                print(f"[DEBUG] Step 0: Batch moved to device. Starting forward pass...", flush=True)
+                print(f"[DEBUG] src_tokens shape: {batch['src_tokens'].shape}", flush=True)
+                print(f"[DEBUG] tgt_tokens shape: {batch['tgt_tokens'].shape}", flush=True)
+                if HAS_XLA: xm.mark_step()  # Trigger data transfer
+                print(f"[DEBUG] Step 0: Data transfer complete. Starting train_step...", flush=True)
 
             global_step = epoch * steps_per_epoch + step
             loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator)
+            
+            if step == 0:
+                print(f"[DEBUG] Step 0: train_step complete. Loss: {loss}", flush=True)
+            
+            # XLA metrics debug on first step
+            if global_step == 0 and HAS_XLA:
+                xm.mark_step()
+                if accelerator.is_main_process:
+                    import torch_xla.debug.metrics as met
+                    print("[XLA METRICS] First step complete:")
+                    print(met.metrics_report())
             
             if accelerator.is_main_process:
                 loader_iter.set_postfix({'loss': f"{loss:.4f}"})
@@ -830,7 +1000,8 @@ def train(args):
             if args.save_every_epochs is None and (epoch + 1) > args.save_after_epoch:
                 save_interval = args.save_every or train_cfg.save_step
                 if global_step > 0 and global_step % save_interval == 0:
-                    accelerator.wait_for_everyone()
+                    if accelerator.num_processes > 1:
+                        accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         accelerator.save(accelerator.unwrap_model(model).state_dict(), train_cfg.output_dir / f"ckpt_step{global_step}.pth")
                         cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
@@ -853,14 +1024,16 @@ def train(args):
         is_last = (epoch + 1) == train_cfg.epochs
         
         if (is_save_epoch or is_last) and (epoch + 1) > args.save_after_epoch:
-            accelerator.wait_for_everyone()
+            if accelerator.num_processes > 1:
+                accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 accelerator.save(accelerator.unwrap_model(model).state_dict(), train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth")
                 if is_last:
                     accelerator.save(accelerator.unwrap_model(model).state_dict(), train_cfg.output_dir / "latest.pth")
                 cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
 
-    accelerator.wait_for_everyone()
+    if accelerator.num_processes > 1:
+        accelerator.wait_for_everyone()
 
 # =============================================================================
 # ARGS & UTILS COPY
@@ -927,6 +1100,7 @@ def get_args() -> argparse.Namespace:
     
     # Optimizer
     parser.add_argument("--half", action="store_true", help="BF16 mixed precision")
+    parser.add_argument("--single-device", action="store_true", help="Force single TPU device mode (avoids distributed hangs)")
     parser.add_argument("--compile", action="store_true") # No-op on TPU usually but kept for compat
     parser.add_argument("--no_decay_embed", action="store_true", help="Exclude nn.Embedding parameters from weight decay")
     parser.add_argument("--skip_tags", type=str, default=None)
@@ -952,19 +1126,35 @@ def _mp_fn(index, args):
     train(args)
 
 def main():
-    """Entry point - spawns processes across TPU cores."""
+    """Entry point for TPU training."""
     print("[MAIN] Parsing args...", flush=True)
     args = get_args()
     print("[MAIN] Args parsed.", flush=True)
     
-    if HAS_XLA:
-        # Spawn 4 processes per host (one per TPU chip)
-        # For multi-host, each host runs this independently
-        print("[MAIN] Launching with xmp.spawn (4 processes per host)...", flush=True)
+    # Check TPU configuration
+    if HAS_XLA and os.environ.get("PJRT_DEVICE"):
+        try:
+            import torch_xla.runtime as xr
+            local_devices = xr.addressable_device_count()
+            global_devices = xr.global_runtime_device_count()
+            print(f"[MAIN] PJRT TPU: {local_devices} local devices, {global_devices} global devices", flush=True)
+            
+            if local_devices == 1:
+                print("[MAIN] Single-device mode active. Running directly.", flush=True)
+            else:
+                print(f"[MAIN] WARNING: {local_devices} devices but running as single process.", flush=True)
+                print("[MAIN] Use --single-device flag for single TPU chip mode.", flush=True)
+                print("[MAIN] Or use torchrun for multi-device: torchrun --nproc_per_node=4 ...", flush=True)
+        except Exception as e:
+            print(f"[MAIN] XLA runtime info: {e}", flush=True)
+    
+    # Legacy XRT mode (TPU v2/v3) - need explicit process spawning
+    if HAS_XLA and os.environ.get("XRT_TPU_CONFIG"):
+        print("[MAIN] XRT mode: Launching with xmp.spawn (4 processes per host)...", flush=True)
         xmp.spawn(_mp_fn, args=(args,), nprocs=4, start_method='fork')
     else:
-        # Fallback for non-TPU
-        print("[MAIN] No XLA, running single process...", flush=True)
+        # Run training directly
+        print("[MAIN] Running training...", flush=True)
         train(args)
 
 if __name__ == "__main__":

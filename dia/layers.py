@@ -226,6 +226,19 @@ class KVCache:
             attn_v = torch.cat((past_v, current_v), dim=2)
             return attn_k, attn_v
 
+    def get_kv_for_attention_static(self, current_k, current_v):
+        """
+        TPU-optimized: Updates cache in-place and returns FULL cache with static shape.
+        This avoids dynamic slicing/concatenation that causes XLA recompilation.
+        The caller must use an attention mask to ignore positions beyond current_idx+1.
+        """
+        # Write current K/V to the current position
+        self.k[:, :, self.current_idx : self.current_idx + 1, :] = current_k
+        self.v[:, :, self.current_idx : self.current_idx + 1, :] = current_v
+        self.current_idx += 1
+        # Return full cache (static shape: batch, heads, max_len, head_dim)
+        return self.k, self.v
+
     def update_cache(self, k, v):
         assert self.current_idx < self.max_len
         self.k[:, :, self.current_idx : self.current_idx + 1, :] = k
@@ -317,6 +330,7 @@ class Attention(nn.Module):
         attn_mask: torch.Tensor | None = None,  # None in Decoder Self Attention, Valid mask in Others
         cache: KVCache | None = None,  # None in Encoder, KVCache in Decoder
         prefill: bool = False,  # True only when prefilling KV Cache
+        static_kv: bool = False,  # TPU: use static cache shapes to avoid recompilation
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """
         Performs attention calculation with optional KV caching.
@@ -327,9 +341,10 @@ class Attention(nn.Module):
             q_positions: Positions for queries (B, T).
             kv_positions: Positions for keys/values (B, S). If None, uses q_positions.
             deterministic: If True, disable dropout.
-            attn_mask: Attention mask.
+            attn_mask: Attention mask. For static_kv=True, must mask unused cache positions.
             cache: KVCache.
             prefill: If True, use prefill mode.
+            static_kv: If True, use static KV cache (returns full cache, caller must mask).
 
         Returns:
             A tuple containing:
@@ -386,7 +401,10 @@ class Attention(nn.Module):
                 if prefill:
                     attn_k, attn_v = Xk_BxNxSxH, Xv_BxNxSxH
                     cache.prefill_kv(attn_k, attn_v)
-                # In decode step, we add current K/V to cache step by step
+                # TPU static mode: use full cache with static shapes
+                elif static_kv:
+                    attn_k, attn_v = cache.get_kv_for_attention_static(Xk_BxNxSxH, Xv_BxNxSxH)
+                # In decode step, we add current K/V to cache step by step (dynamic shapes)
                 else:
                     new_kv_cache = Xk_BxNxSxH, Xv_BxNxSxH
                     attn_k, attn_v = cache.get_kv_for_attention(Xk_BxNxSxH, Xv_BxNxSxH)
@@ -600,6 +618,7 @@ class DecoderLayer(nn.Module):
         self_attn_cache: KVCache,
         cross_attn_cache: KVCache,
         prefill: bool = False,
+        static_kv: bool = False,  # TPU: use static cache shapes
     ) -> torch.Tensor:
         residual = x
         x_norm = self.pre_sa_norm(x)
@@ -613,6 +632,7 @@ class DecoderLayer(nn.Module):
             attn_mask=self_attn_mask,  # (2, 1, 1, S_max)
             cache=self_attn_cache,
             prefill=prefill,
+            static_kv=static_kv,
         )
 
         x = residual + sa_out
@@ -718,19 +738,25 @@ class Decoder(nn.Module):
         tgt_ids_Bx1xC: torch.Tensor,  # [B, 1, C]
         tgt_pos_Bx1: torch.Tensor,  # [B, 1]
         encoder_out: torch.Tensor,  # [B, S, E]
-        self_attn_mask: Any,  # None
+        self_attn_mask: Any,  # None for dynamic mode, mask for static_kv mode
         cross_attn_mask: torch.Tensor,  # [B, 1, 1, S]
         self_attention_cache: list[KVCache],
         cross_attention_cache: list[KVCache],
+        static_kv: bool = False,  # TPU: use static cache shapes
     ) -> torch.Tensor:
         """
         Performs a single decoding step, managing KV caches layer by layer.
+
+        Args:
+            static_kv: If True, use static KV cache (for TPU). Requires self_attn_mask
+                       to be provided to mask unused cache positions.
 
         Returns:
             A tuple containing:
             - logits_Bx1xCV: The final output logits for the current step (B, 1, C*V), cast to float32.
         """
-        assert self_attn_mask is None, "Self-attention mask should be None, kept for pattern"
+        if not static_kv:
+            assert self_attn_mask is None, "Self-attention mask should be None in dynamic mode"
 
         x = None
         for i in range(self.num_channels):
@@ -749,10 +775,11 @@ class Decoder(nn.Module):
                 src_positions=None,  # CA KV is already computed
                 tgt_positions=tgt_pos_Bx1,  # (2, 1)
                 deterministic=True,
-                self_attn_mask=None,
+                self_attn_mask=self_attn_mask,  # None for dynamic, mask for static_kv
                 cross_attn_mask=cross_attn_mask,
                 self_attn_cache=self_cache,
                 cross_attn_cache=cross_cache,
+                static_kv=static_kv,
             )
             new_cache.append(new_kv_cache)
 

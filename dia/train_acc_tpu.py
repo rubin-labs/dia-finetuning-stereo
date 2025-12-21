@@ -50,10 +50,12 @@ except (ImportError, AttributeError):
 print("[INIT] Importing torch_xla...", flush=True)
 try:
     import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.xla_multiprocessing as xmp
     HAS_XLA = True
     print("[INIT] torch_xla imported successfully", flush=True)
 except ImportError:
     HAS_XLA = False
+    xmp = None
     print("[INIT] torch_xla not available", flush=True)
 
 print("[INIT] All imports complete.", flush=True)
@@ -944,12 +946,26 @@ def get_args() -> argparse.Namespace:
         
     return args
 
+def _mp_fn(index, args):
+    """Function called by xmp.spawn on each TPU core."""
+    print(f"[XMP] Process {index} starting train()...", flush=True)
+    train(args)
+
 def main():
-    """Entry point for accelerate launch --module."""
+    """Entry point - spawns processes across TPU cores."""
     print("[MAIN] Parsing args...", flush=True)
     args = get_args()
-    print("[MAIN] Args parsed. Calling train()...", flush=True)
-    train(args)
+    print("[MAIN] Args parsed.", flush=True)
+    
+    if HAS_XLA:
+        # Spawn 4 processes per host (one per TPU chip)
+        # For multi-host, each host runs this independently
+        print("[MAIN] Launching with xmp.spawn (4 processes per host)...", flush=True)
+        xmp.spawn(_mp_fn, args=(args,), nprocs=4, start_method='fork')
+    else:
+        # Fallback for non-TPU
+        print("[MAIN] No XLA, running single process...", flush=True)
+        train(args)
 
 if __name__ == "__main__":
     main()

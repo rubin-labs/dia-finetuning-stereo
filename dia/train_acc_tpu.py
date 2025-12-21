@@ -47,11 +47,16 @@ except (ImportError, AttributeError):
     TestingDataset = None
 
 # TPU Imports
+print("[INIT] Importing torch_xla...", flush=True)
 try:
     import torch_xla.core.xla_model as xm
     HAS_XLA = True
+    print("[INIT] torch_xla imported successfully", flush=True)
 except ImportError:
     HAS_XLA = False
+    print("[INIT] torch_xla not available", flush=True)
+
+print("[INIT] All imports complete.", flush=True)
 
 warnings.filterwarnings("ignore", message="`torch.nn.utils.weight_norm` is deprecated")
 
@@ -656,11 +661,17 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
 
 def train(args):
     """TPU Training Loop (Robust)."""
+    print("[TRAIN] Starting train()...", flush=True)
+    
     # Use bf16 by default for TPU
+    print("[TRAIN] Creating Accelerator...", flush=True)
     accelerator = Accelerator(mixed_precision="bf16" if args.half else "no")
+    print(f"[TRAIN] Accelerator created. Device: {accelerator.device}", flush=True)
     device = accelerator.device
     
+    print(f"[TRAIN] Loading config from {args.config}...", flush=True)
     dia_cfg = DiaConfig.load(args.config)
+    print("[TRAIN] Config loaded.", flush=True)
     
     # Setup Config
     train_cfg = TrainConfig(
@@ -690,8 +701,10 @@ def train(args):
     seed_everything(args.seed)
 
     # Dataset
+    print(f"[TRAIN] Loading dataset from {args.preencoded_dir or args.audio_folder}...", flush=True)
     if args.preencoded_dir:
         dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, args.use_sliding_window)
+        print(f"[TRAIN] Dataset loaded: {len(dataset)} samples", flush=True)
     elif args.audio_folder:
         if TestingDataset is None:
             raise ImportError("TestingDataset is not available. Please ensure dia/dataset.py contains the TestingDataset class.")
@@ -706,17 +719,23 @@ def train(args):
     train_loader, val_loader = setup_loaders(dataset, dia_cfg, train_cfg, device, args.use_sliding_window)
     
     # Model Setup
+    print("[TRAIN] Creating DiaModel...", flush=True)
     model = DiaModel(dia_cfg)
     removed = strip_weight_norms(model)
-    if accelerator.is_main_process: logger.info(f"Stripped {removed} weight_norms from DiaModel")
+    print(f"[TRAIN] Model created. Stripped {removed} weight_norms.", flush=True)
 
     # Checkpoint Loading with Stereo Expansion (Robustness)
     if args.local_ckpt:
         ckpt_path = args.local_ckpt
+        print(f"[TRAIN] Using local checkpoint: {ckpt_path}", flush=True)
     else:
+        print(f"[TRAIN] Downloading checkpoint from HuggingFace Hub: {args.hub_model}...", flush=True)
         ckpt_path = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
+        print(f"[TRAIN] Checkpoint downloaded: {ckpt_path}", flush=True)
     
+    print("[TRAIN] Loading checkpoint state dict...", flush=True)
     state = torch.load(ckpt_path, map_location="cpu")
+    print("[TRAIN] Checkpoint loaded.", flush=True)
     
     # Stereo Logic (Ported from GPU script)
     key = "decoder.logits_dense.weight"
@@ -746,9 +765,13 @@ def train(args):
             p.requires_grad = False
 
     # Optimizer
+    print("[TRAIN] Setting up optimizer and scheduler...", flush=True)
     opt, sched = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
+    print("[TRAIN] Optimizer created.", flush=True)
     
+    print("[TRAIN] Running accelerator.prepare() (this may take a while on TPU)...", flush=True)
     model, opt, train_loader, sched = accelerator.prepare(model, opt, train_loader, sched)
+    print("[TRAIN] accelerator.prepare() complete.", flush=True)
     if val_loader: val_loader = accelerator.prepare(val_loader)
     
     # XLA Optimizer State Init
@@ -919,7 +942,9 @@ def get_args() -> argparse.Namespace:
 
 def main():
     """Entry point for accelerate launch --module."""
+    print("[MAIN] Parsing args...", flush=True)
     args = get_args()
+    print("[MAIN] Args parsed. Calling train()...", flush=True)
     train(args)
 
 if __name__ == "__main__":

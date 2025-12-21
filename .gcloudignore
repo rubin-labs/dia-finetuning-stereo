@@ -1,0 +1,10 @@
+.git
+.DS_Store
+__pycache__
+*.pyc
+*.zip
+venv/
+env/
+terminals/
+logs/
+checkpoints/

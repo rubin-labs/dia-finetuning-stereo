@@ -695,9 +695,13 @@ def train(args):
     if accelerator.is_main_process:
         train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
         Path(EVAL_AUDIO_DIR).mkdir(exist_ok=True)
+        print(f"[TRAIN] Process {accelerator.process_index}: Initializing WandB...", flush=True)
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=train_cfg.run_name, config=vars(args))
+        print(f"[TRAIN] Process {accelerator.process_index}: WandB initialized.", flush=True)
     
+    print(f"[TRAIN] Process {accelerator.process_index}: Waiting for everyone...", flush=True)
     accelerator.wait_for_everyone()
+    print(f"[TRAIN] Process {accelerator.process_index}: Everyone here!", flush=True)
     seed_everything(args.seed)
 
     # Dataset

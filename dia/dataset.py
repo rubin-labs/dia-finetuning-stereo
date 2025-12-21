@@ -154,13 +154,18 @@ class PreEncodedDACDataset(Dataset):
         
         # Find all .pt files in encoded_audio directory or root
         encoded_dir = self.preprocessed_dir / "encoded_audio"
-        if encoded_dir.exists():
-             self.encoded_files = list(encoded_dir.glob("*.pt"))
-        else:
-             # Fallback: look in the root directory
-             self.encoded_files = list(self.preprocessed_dir.glob("*.pt"))
-             encoded_dir = self.preprocessed_dir # specific for error msg below
-             
+        
+        self.encoded_files = []
+        target_dir = encoded_dir if encoded_dir.exists() else self.preprocessed_dir
+        
+        print(f"[DATASET] Scanning {target_dir} for .pt files...", flush=True)
+        count = 0
+        for p in target_dir.glob("*.pt"):
+            self.encoded_files.append(p)
+            count += 1
+            if count % 1000 == 0:
+                print(f"[DATASET] Found {count} files...", flush=True)
+        
         if not self.encoded_files:
             raise FileNotFoundError(f"No .pt files found in {self.preprocessed_dir} or {self.preprocessed_dir}/encoded_audio")
         

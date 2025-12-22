@@ -11,6 +11,12 @@ from .audio import audio_to_codebook, codebook_to_audio
 from .config import DiaConfig
 from .layers import DiaModel, KVCache
 
+# Optional XLA import for TPU optimization
+try:
+    import torch_xla.core.xla_model as xm
+except ImportError:
+    xm = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -435,6 +441,10 @@ class Dia:
                 )
 
             generated_BxTxC[:, step + 1, :] = pred_C.unsqueeze(0).expand(batch_size, -1)
+
+            # Force XLA to execute this step immediately to prevent graph explosion on TPU
+            if xm is not None:
+                xm.mark_step()
 
             if (generation_step_index % gen_log_interval) == 0:
                 logger.info(

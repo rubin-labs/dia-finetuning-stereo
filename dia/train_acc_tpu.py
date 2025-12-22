@@ -3,20 +3,10 @@ Dia Audio Model Fine-tuning on TPU (FSDP Optimized).
 """
 
 # ============================================================================
-# CRITICAL: Sanitize Environment BEFORE any torch_xla imports!
+# CRITICAL: Set TPU environment BEFORE any torch_xla imports!
 # ============================================================================
 import os
 import sys
-
-# Remove GPU-only XLA flags that crash libtpu and keep cache flags clean
-if "XLA_FLAGS" in os.environ:
-    flags = os.environ["XLA_FLAGS"].split()
-    clean_flags = [f for f in flags if "xla_gpu" not in f]
-    os.environ["XLA_FLAGS"] = " ".join(clean_flags)
-    print(f"[INIT] Sanitized XLA_FLAGS: {os.environ['XLA_FLAGS']}")
-
-# Ensure a cache path is present if not provided externally
-os.environ.setdefault("XLA_PERSISTENT_CACHE_PATH", "/home/olivercamp/xla_cache")
 
 # Standard TPU Env setup
 import torch_xla.core.xla_model as xm
@@ -391,26 +381,34 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accele
 # =============================================================================
 
 def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
-    """Generate demo audio samples during training."""
-    if not accelerator.is_main_process:
-        return
+    """Generate demo audio samples during training.
     
+    IMPORTANT: All ranks must participate in generation to avoid FSDP deadlock.
+    The model is sharded across TPU cores, so all processes must run the forward pass
+    together to unshard the weights. Only rank 0 saves/logs the output.
+    """
+    # NOTE: Removed early return for non-main processes to avoid FSDP deadlock.
+    # All ranks must participate in generation, but only rank 0 saves/logs.
+     
     t_start = time.perf_counter()
-    logger.info(f"[DEMO] Generating audio samples at step {global_step}")
-    Path(EVAL_AUDIO_DIR).mkdir(parents=True, exist_ok=True)
+    if accelerator.is_main_process:
+        logger.info(f"[DEMO] Generating audio samples at step {global_step}")
+        Path(EVAL_AUDIO_DIR).mkdir(parents=True, exist_ok=True)
     
+    # ALL processes must unwrap the model (FSDP requirement)
     unwrapped = accelerator.unwrap_model(model)
     
     try:
-        # Create Dia wrapper for generation
+        # Create Dia wrapper for generation (ALL processes)
         dia_gen = Dia(dia_cfg, accelerator.device)
         dia_gen.model = unwrapped
         
-        # Load DAC model for audio decoding (cached per device)
+        # Load DAC model for audio decoding (cached per device, ALL processes)
         dac_load_t0 = time.perf_counter()
         dac_model = get_dac_model(accelerator.device)
         dia_gen.dac_model = dac_model
-        logger.info(f"[DEMO] DAC model attached (ready in {time.perf_counter() - dac_load_t0:.1f}s)")
+        if accelerator.is_main_process:
+            logger.info(f"[DEMO] DAC model attached (ready in {time.perf_counter() - dac_load_t0:.1f}s)")
         
         audio_samples = {}
         
@@ -426,41 +424,58 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
                         for s in seeds:
                             seed_everything(s)
                             demo_t0 = time.perf_counter()
-                            logger.info(f"[DEMO] Start unconditional temp={temp}, seed={s}")
+                            if accelerator.is_main_process:
+                                logger.info(f"[DEMO] Start unconditional temp={temp}, seed={s}")
                             try:
+                                # ALL ranks run generation (FSDP requires all processes to participate)
                                 audio = dia_gen.generate(text="", cfg_scale=EVAL_CFG_SCALE_UNCOND, temperature=temp)
-                                path = Path(EVAL_AUDIO_DIR) / f"step_{global_step}_temp{safe_temp(temp)}_seed{s}.wav"
-                                _save_and_log_audio(audio, path, f"eval_audio/temp{safe_temp(temp)}/seed{s}", 
-                                                 f"temp={temp}", audio_samples)
+                                
+                                # Only main process saves to disk and logs to wandb
+                                if accelerator.is_main_process:
+                                    path = Path(EVAL_AUDIO_DIR) / f"step_{global_step}_temp{safe_temp(temp)}_seed{s}.wav"
+                                    _save_and_log_audio(audio, path, f"eval_audio/temp{safe_temp(temp)}/seed{s}", 
+                                                     f"temp={temp}", audio_samples)
                             except Exception as e:
-                                logger.warning(f"Demo generation failed for temp={temp}, seed={s}: {e}")
+                                if accelerator.is_main_process:
+                                    logger.warning(f"Demo generation failed for temp={temp}, seed={s}: {e}")
                             else:
-                                logger.info(f"[DEMO] Finished temp={temp}, seed={s} in {time.perf_counter() - demo_t0:.1f}s")
+                                if accelerator.is_main_process:
+                                    logger.info(f"[DEMO] Finished temp={temp}, seed={s} in {time.perf_counter() - demo_t0:.1f}s")
             else:
                 # Conditional generation with prompts
                 cfg_s = EVAL_CFG_SCALE if train_cfg.unconditional_frac > 0 else None
                 for temp in EVAL_TEMPERATURES:
                     for name, prompt in TEST_PROMPTS.items():
                         demo_t0 = time.perf_counter()
-                        logger.info(f"[DEMO] Start prompt={name}, temp={temp}")
+                        if accelerator.is_main_process:
+                            logger.info(f"[DEMO] Start prompt={name}, temp={temp}")
                         try:
+                            # ALL ranks run generation (FSDP requires all processes to participate)
                             audio = dia_gen.generate(text=prompt, cfg_scale=cfg_s, temperature=temp, top_p=EVAL_TOP_P)
-                            path = Path(EVAL_AUDIO_DIR) / f"step_{global_step}_{name}_temp{safe_temp(temp)}.wav"
-                            _save_and_log_audio(audio, path, f"eval_audio/temp{safe_temp(temp)}/{name}", 
-                                             prompt, audio_samples)
+                            
+                            # Only main process saves to disk and logs to wandb
+                            if accelerator.is_main_process:
+                                path = Path(EVAL_AUDIO_DIR) / f"step_{global_step}_{name}_temp{safe_temp(temp)}.wav"
+                                _save_and_log_audio(audio, path, f"eval_audio/temp{safe_temp(temp)}/{name}", 
+                                                 prompt, audio_samples)
                         except Exception as e:
-                            logger.warning(f"Demo generation failed for {name}, temp={temp}: {e}")
+                            if accelerator.is_main_process:
+                                logger.warning(f"Demo generation failed for {name}, temp={temp}: {e}")
                         else:
-                            logger.info(f"[DEMO] Finished prompt={name}, temp={temp} in {time.perf_counter() - demo_t0:.1f}s")
+                            if accelerator.is_main_process:
+                                logger.info(f"[DEMO] Finished prompt={name}, temp={temp} in {time.perf_counter() - demo_t0:.1f}s")
             
-            if audio_samples:
+            # Only main process logs to wandb
+            if accelerator.is_main_process and audio_samples:
                 wandb.log(audio_samples, step=global_step)
                 logger.info(f"[DEMO] Logged {len(audio_samples)} audio samples to wandb")
                 
     except Exception as e:
-        logger.exception(f"[DEMO] Demo generation failed: {e}")
+        if accelerator.is_main_process:
+            logger.exception(f"[DEMO] Demo generation failed: {e}")
     finally:
-        logger.info(f"[DEMO] Demo section finished in {time.perf_counter() - t_start:.1f}s")
+        if accelerator.is_main_process:
+            logger.info(f"[DEMO] Demo section finished in {time.perf_counter() - t_start:.1f}s")
 
 # =============================================================================
 # EVALUATION

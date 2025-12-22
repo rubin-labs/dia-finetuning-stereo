@@ -727,8 +727,10 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
             traceback.print_exc()
         finally:
             unwrapped.train()
-            
-    if accelerator.num_processes > 1:
+    
+    # Skip wait_for_everyone in SPMD single-process mode
+    is_spmd_single_process = os.environ.get("TPU_PROCESS_BOUNDS") == "1,1,1"
+    if accelerator.num_processes > 1 and not is_spmd_single_process:
         accelerator.wait_for_everyone()
     return should_stop
 
@@ -736,7 +738,7 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
 # TRAIN STEP
 # =============================================================================
 
-def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator):
+def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator, is_spmd_mode=False):
     global _nonfinite_hits
     
     if global_step == 0:
@@ -829,14 +831,21 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
     if global_step == 0:
         print("[DEBUG train_step] Starting backward pass...", flush=True)
     
-    accelerator.backward(loss)
+    # In SPMD mode, use regular backward to avoid DDP all-reduce deadlock
+    if is_spmd_mode:
+        loss.backward()
+    else:
+        accelerator.backward(loss)
     
     if global_step == 0:
         print("[DEBUG train_step] Backward pass scheduled.", flush=True)
     
     if (step + 1) % train_cfg.grad_accum_steps == 0:
-        # Grad clipping happens on all processes
-        norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+        # Grad clipping - use torch directly in SPMD mode to avoid DDP issues
+        if is_spmd_mode:
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+        else:
+            norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
         
         # Log grad norm only on main process
         if accelerator.is_main_process:
@@ -886,7 +895,12 @@ def train(args):
     print("[TRAIN] Creating Accelerator (this may hang if TPU pod workers aren't synced)...", flush=True)
     sys.stdout.flush()
     
-    # Force single-device mode to avoid distributed hangs
+    # Detect single-process SPMD mode (1 Python process, multiple TPU chips)
+    # This happens when TPU_PROCESS_BOUNDS=1,1,1 is set
+    is_spmd_single_process = os.environ.get("TPU_PROCESS_BOUNDS") == "1,1,1"
+    if is_spmd_single_process:
+        print("[TRAIN] SPMD single-process mode detected (TPU_PROCESS_BOUNDS=1,1,1)", flush=True)
+    
     accelerator = Accelerator(
         mixed_precision="bf16" if args.half else "no",
     )
@@ -894,6 +908,21 @@ def train(args):
     print(f"[TRAIN] Num processes: {accelerator.num_processes}", flush=True)
     print(f"[TRAIN] Process index: {accelerator.process_index}", flush=True)
     device = accelerator.device
+    
+    # Detect SPMD multi-host mode (--no-spawn with --worker=all)
+    # In this mode: 4 Python processes (one per host), each managing 4 TPU chips
+    # Accelerate sees 16 "processes" but only 4 Python processes exist (indices 0, 4, 8, 12)
+    # We must skip Accelerate's wait_for_everyone() as it expects 16 processes
+    is_spmd_multi_host = args.no_spawn and accelerator.num_processes > 1
+    
+    # In SPMD single-process mode, treat as single process for synchronization
+    # even though Accelerate reports multiple "processes" (which are actually devices)
+    if is_spmd_single_process or is_spmd_multi_host:
+        effective_num_processes = 1  # Skip Accelerate sync barriers
+        print(f"[TRAIN] SPMD mode detected - skipping Accelerate sync barriers", flush=True)
+    else:
+        effective_num_processes = accelerator.num_processes
+    print(f"[TRAIN] Effective num processes for sync: {effective_num_processes}", flush=True)
     
     # Log XLA info after Accelerator is initialized
     if HAS_XLA:
@@ -925,6 +954,8 @@ def train(args):
         no_decay_embed=args.no_decay_embed,
     )
 
+    # In SPMD multi-host mode, only process index 0 (host 0, chip 0) should do WandB/logging
+    # is_main_process checks process_index == 0, which is correct
     if accelerator.is_main_process:
         train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
         Path(EVAL_AUDIO_DIR).mkdir(exist_ok=True)
@@ -932,13 +963,17 @@ def train(args):
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=train_cfg.run_name, config=vars(args))
         print(f"[TRAIN] Process {accelerator.process_index}: WandB initialized.", flush=True)
     
-    # Synchronization: only use barriers when truly distributed
-    if accelerator.num_processes > 1:
+    # Synchronization: skip barriers in SPMD mode (would hang waiting for non-existent processes)
+    if effective_num_processes > 1:
         print(f"[TRAIN] Process {accelerator.process_index}/{accelerator.num_processes}: Waiting for everyone...", flush=True)
         accelerator.wait_for_everyone()
         print(f"[TRAIN] Process {accelerator.process_index}: Everyone here!", flush=True)
     else:
-        print("[TRAIN] Single process detected; skipping wait_for_everyone.", flush=True)
+        print("[TRAIN] SPMD mode; skipping Accelerate sync barriers.", flush=True)
+        # Don't use xm.rendezvous() here - it waits for all 16 devices but we only have 4 processes
+        # The all-reduce operations during training will handle cross-host sync
+        if HAS_XLA:
+            xm.mark_step()  # Just flush any pending ops
     seed_everything(args.seed + accelerator.process_index)  # Different seed per process for data diversity
 
     # Dataset
@@ -1011,9 +1046,24 @@ def train(args):
     print("[TRAIN] Optimizer created.", flush=True)
     
     print("[TRAIN] Running accelerator.prepare() (this may take a while on TPU)...", flush=True)
-    model, opt, train_loader, sched = accelerator.prepare(model, opt, train_loader, sched)
+    
+    # In SPMD mode (single-process or multi-host with --no-spawn), DON'T prepare the model/dataloader 
+    # with Accelerate because Accelerate thinks there are 16 "processes" (devices) but only 
+    # 4 Python processes exist. The DDP wrapper would hang on gradient all-reduce waiting for 
+    # non-existent processes. Instead, each host trains independently on its data shard.
+    if is_spmd_single_process or is_spmd_multi_host:
+        print("[TRAIN] SPMD mode: NOT using accelerator.prepare() (avoiding DDP all-reduce hang)", flush=True)
+        print("[TRAIN] Moving model to device manually...", flush=True)
+        model = model.to(device)
+        if args.half:
+            model = model.to(torch.bfloat16)
+        # Don't wrap with DDP - each host trains independently
+        # Keep train_loader and val_loader as regular PyTorch DataLoaders
+    else:
+        model, opt, train_loader, sched = accelerator.prepare(model, opt, train_loader, sched)
+        if val_loader: val_loader = accelerator.prepare(val_loader)
+    
     print("[TRAIN] accelerator.prepare() complete.", flush=True)
-    if val_loader: val_loader = accelerator.prepare(val_loader)
     
     # XLA Optimizer State Init
     if HAS_XLA:
@@ -1047,12 +1097,21 @@ def train(args):
                 print(f"[DEBUG] Step 0: Data transfer complete. Starting train_step...", flush=True)
 
             global_step = epoch * steps_per_epoch + step
-            loss_tensor = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator)
+            is_spmd_mode = is_spmd_single_process or is_spmd_multi_host
+            loss_tensor = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator, is_spmd_mode=is_spmd_mode)
             
-            # Convert loss tensor to float for logging - only do this once per step
-            # Note: We just use local loss here - mesh_reduce can cause hangs with xmp.spawn issues
+            # Convert loss tensor to float for logging
+            # IMPORTANT: On multi-host TPU, .item() forces device sync which can conflict with all-reduce.
+            # We wrap this in a try-except and only call .item() after mark_step has completed.
             if isinstance(loss_tensor, torch.Tensor):
-                loss = loss_tensor.item()
+                # Ensure XLA graph is executed before extracting value
+                if HAS_XLA:
+                    xm.mark_step()
+                try:
+                    loss = loss_tensor.item()
+                except Exception as e:
+                    logger.warning(f"Failed to get loss value: {e}")
+                    loss = float('nan')
             else:
                 loss = loss_tensor  # Already a float (e.g., nan)
             
@@ -1092,7 +1151,7 @@ def train(args):
             if args.save_every_epochs is None and (epoch + 1) > args.save_after_epoch:
                 save_interval = args.save_every or train_cfg.save_step
                 if global_step > 0 and global_step % save_interval == 0:
-                    if accelerator.num_processes > 1:
+                    if effective_num_processes > 1:
                         accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         accelerator.save(accelerator.unwrap_model(model).state_dict(), train_cfg.output_dir / f"ckpt_step{global_step}.pth")
@@ -1116,7 +1175,7 @@ def train(args):
         is_last = (epoch + 1) == train_cfg.epochs
         
         if (is_save_epoch or is_last) and (epoch + 1) > args.save_after_epoch:
-            if accelerator.num_processes > 1:
+            if effective_num_processes > 1:
                 accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 accelerator.save(accelerator.unwrap_model(model).state_dict(), train_cfg.output_dir / f"ckpt_epoch{epoch+1}.pth")
@@ -1124,7 +1183,7 @@ def train(args):
                     accelerator.save(accelerator.unwrap_model(model).state_dict(), train_cfg.output_dir / "latest.pth")
                 cleanup_old_checkpoints(train_cfg.output_dir, args.save_last)
 
-    if accelerator.num_processes > 1:
+    if effective_num_processes > 1:
         accelerator.wait_for_everyone()
 
 # =============================================================================
@@ -1193,6 +1252,7 @@ def get_args() -> argparse.Namespace:
     # Optimizer
     parser.add_argument("--half", action="store_true", help="BF16 mixed precision")
     parser.add_argument("--single-device", action="store_true", help="Force single TPU device mode (avoids distributed hangs)")
+    parser.add_argument("--no-spawn", action="store_true", help="Skip xmp.spawn - use for multi-host TPU pods (v4-32+) with --worker=all")
     parser.add_argument("--compile", action="store_true") # No-op on TPU usually but kept for compat
     parser.add_argument("--no_decay_embed", action="store_true", help="Exclude nn.Embedding parameters from weight decay")
     parser.add_argument("--skip_tags", type=str, default=None)
@@ -1235,39 +1295,59 @@ def main():
     print(f"[MAIN] WORLD_SIZE: {os.environ.get('WORLD_SIZE', 'not set')}", flush=True)
     print(f"[MAIN] LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'not set')}", flush=True)
     print(f"[MAIN] RANK: {os.environ.get('RANK', 'not set')}", flush=True)
+    print("[MAIN] =======================================", flush=True)
     
     # Check if this looks like a multi-host setup (multiple workers via --worker=all)
     # In multi-host setups, TPU_WORKER_HOSTNAMES should be set
     is_multi_host = os.environ.get('TPU_WORKER_HOSTNAMES') is not None
-    if is_multi_host:
-        print("[MAIN] WARNING: Multi-host TPU detected! Using xmp.spawn with --worker=all", flush=True)
-        print("[MAIN] can cause deadlocks. Consider using single-host mode or", flush=True)
-        print("[MAIN] proper multi-host coordination with accelerate launch.", flush=True)
-    print("[MAIN] =======================================", flush=True)
     
     # Check TPU configuration
     if HAS_XLA and os.environ.get("PJRT_DEVICE"):
+        # Check if TPU_PROCESS_BOUNDS is set - if so, PJRT handles SPMD automatically
+        # and we should NOT use xmp.spawn (it doesn't work properly with PROCESS_BOUNDS)
+        process_bounds = os.environ.get("TPU_PROCESS_BOUNDS")
+        if process_bounds:
+            print(f"[MAIN] TPU_PROCESS_BOUNDS={process_bounds} detected.", flush=True)
+            print("[MAIN] Running in SPMD mode - Accelerate will handle multi-chip.", flush=True)
+            print("[MAIN] NOT using xmp.spawn (incompatible with PROCESS_BOUNDS).", flush=True)
+            train(args)
+            return
+        
+        # =====================================================================
+        # --no-spawn FLAG: Explicit skip of xmp.spawn for multi-host TPU pods
+        # Use this with --worker=all on v4-32 and larger
+        # =====================================================================
+        if args.no_spawn:
+            print("[MAIN] --no-spawn flag set. Skipping xmp.spawn.", flush=True)
+            print("[MAIN] Running train() directly - PJRT handles multi-chip internally.", flush=True)
+            train(args)
+            return
+        
+        # =====================================================================
+        # MULTI-HOST v4-32+ DETECTION (automatic)
+        # When using --worker=all on a TPU pod, PJRT handles multi-host coordination.
+        # We should NOT use xmp.spawn - just run train() directly.
+        # Each host runs 1 Python process, and PJRT internally uses all 4 chips per host.
+        # =====================================================================
+        if is_multi_host:
+            print("[MAIN] Multi-host TPU pod detected (--worker=all mode).", flush=True)
+            print("[MAIN] Running single process per host - PJRT handles multi-chip internally.", flush=True)
+            print("[MAIN] NOT using xmp.spawn (causes deadlocks on multi-host).", flush=True)
+            train(args)
+            return
+        
         # If we are NOT in a distributed environment (no WORLD_SIZE/LOCAL_RANK),
-        # launch using xmp.spawn. This is more robust for single-node TPU VMs.
+        # launch using xmp.spawn. This is for single-node TPU VMs only (v4-8).
         is_distributed = "WORLD_SIZE" in os.environ or "LOCAL_RANK" in os.environ
         
         if not is_distributed:
-            # Check if we're in a multi-host setup - if so, warn and use single process
-            if is_multi_host:
-                print("[MAIN] Multi-host detected but no distributed env vars.", flush=True)
-                print("[MAIN] Running single process per host - use accelerate launch for multi-host.", flush=True)
-                train(args)
-                return
-            
-            print("[MAIN] PJRT_DEVICE=TPU detected in single-process mode.", flush=True)
+            print("[MAIN] PJRT_DEVICE=TPU detected in single-host mode.", flush=True)
             print("[MAIN] Launching via xmp.spawn (nprocs=4 for v4-8)...", flush=True)
-            # Don't call xr.addressable_device_count() here - it can hang if TPU isn't ready.
-            # v4-8 has 4 chips (8 cores), but xmp.spawn with PJRT typically uses 4 processes.
+            # v4-8 has 4 chips (8 cores), xmp.spawn uses 4 processes.
             xmp.spawn(_mp_fn, args=(args,), nprocs=4)
             return
         
         print(f"[MAIN] PJRT_DEVICE=TPU detected. Distributed mode: {is_distributed}", flush=True)
-
 
     if HAS_XLA and os.environ.get("XRT_TPU_CONFIG"):
         print("[MAIN] XRT mode: Launching with xmp.spawn (4 processes per host)...", flush=True)

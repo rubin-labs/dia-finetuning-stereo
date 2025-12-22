@@ -13,8 +13,6 @@ export WANDB_API_KEY=2bdd33a710538780b0e66c62afd69104a3a22020
 # --- 3. SYSTEM SETTINGS ---
 # Silence logs
 export PYTHONWARNINGS="ignore"
-# NOTE: XLA_USE_BF16 removed to allow manual FP32 casting for loss stability
-# export XLA_USE_BF16=1
 # Fix the "item()" crash by making transfers safer
 export XLA_TRANSFER_SEED_ASYNC=1
 
@@ -31,15 +29,18 @@ echo "------------------------------------------------"
 
 cd ~/dia-finetuning-stereo || exit
 
-# --- 4b. XLA PERSISTENT CACHE (TPU-safe flags only) ---
-# Make sure no stale GPU-only flags linger (e.g., --xla_gpu_force_compilation_parallelism)
+# --- 4b. XLA PERSISTENT CACHE (FIXED) ---
+# CRITICAL: Unset old flags that cause crashes
 unset TF_XLA_FLAGS
 unset XLA_FLAGS
+
 CACHE_DIR=/home/olivercamp/xla_cache
 mkdir -p "$CACHE_DIR"
-# --undefok lets PJRT ignore flags it doesn't recognize while keeping the cache flags active
-export XLA_FLAGS="--undefok=xla_gpu_force_compilation_parallelism,xla_persistent_cache_dir,xla_persistent_cache_prefix,xla_persistent_cache_max_size_in_bytes --xla_persistent_cache_dir=$CACHE_DIR --xla_persistent_cache_prefix=dia --xla_persistent_cache_max_size_in_bytes=$((20*1024*1024*1024))"
-echo "XLA_FLAGS=$XLA_FLAGS"
+
+# CORRECT WAY: Use the dedicated environment variable for caching
+export XLA_PERSISTENT_CACHE_PATH="$CACHE_DIR"
+
+echo "XLA Cache Path set to: $XLA_PERSISTENT_CACHE_PATH"
 
 # --- 5. GENERATE TPU CONFIG (XLA) ---
 cat <<YAML > tpu_config.yaml

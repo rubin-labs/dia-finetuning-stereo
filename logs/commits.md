@@ -139,3 +139,4 @@
 - `2025-12-22 01:37` [`51dba9f`] **010**: Changed precision
 - `2025-12-22 03:25` [`db6629d`] **010**: Working fsdp, no eval or demos yet
 - `2025-12-22 11:35` [`8e58c31`] **010**: Working fsdp + eval (no inference yet technically)
+- `2025-12-22 13:38` [`a061adf`] **010**: failing tpu compiling caching

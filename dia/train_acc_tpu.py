@@ -3,10 +3,20 @@ Dia Audio Model Fine-tuning on TPU (FSDP Optimized).
 """
 
 # ============================================================================
-# CRITICAL: Set TPU environment BEFORE any torch_xla imports!
+# CRITICAL: Sanitize Environment BEFORE any torch_xla imports!
 # ============================================================================
 import os
 import sys
+
+# Remove GPU-only XLA flags that crash libtpu and keep cache flags clean
+if "XLA_FLAGS" in os.environ:
+    flags = os.environ["XLA_FLAGS"].split()
+    clean_flags = [f for f in flags if "xla_gpu" not in f]
+    os.environ["XLA_FLAGS"] = " ".join(clean_flags)
+    print(f"[INIT] Sanitized XLA_FLAGS: {os.environ['XLA_FLAGS']}")
+
+# Ensure a cache path is present if not provided externally
+os.environ.setdefault("XLA_PERSISTENT_CACHE_PATH", "/home/olivercamp/xla_cache")
 
 # Standard TPU Env setup
 import torch_xla.core.xla_model as xm

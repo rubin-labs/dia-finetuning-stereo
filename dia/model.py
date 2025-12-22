@@ -212,7 +212,7 @@ class Dia:
 
         return src_tokens, src_positions, src_padding_mask, enc_self_attn_mask
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate(
         self,
         text: str,

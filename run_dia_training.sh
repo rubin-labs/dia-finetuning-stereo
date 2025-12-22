@@ -7,10 +7,18 @@ sudo pkill -9 python 2>/dev/null
 rm -f /tmp/libtpu_lockfile 
 sleep 2
 
-# --- 2. CREDENTIALS ---
+# --- 2. MOUNT GCS BUCKET ---
+echo "Mounting GCS bucket..."
+mkdir -p ~/gcs
+# Unmount if already mounted, then remount
+fusermount -u ~/gcs 2>/dev/null || true
+gcsfuse --implicit-dirs typebeats_dataset ~/gcs
+echo "GCS mounted at ~/gcs"
+
+# --- 3. CREDENTIALS ---
 export WANDB_API_KEY=2bdd33a710538780b0e66c62afd69104a3a22020
 
-# --- 3. SYSTEM SETTINGS ---
+# --- 4. SYSTEM SETTINGS ---
 # Silence logs
 export PYTHONWARNINGS="ignore"
 # NOTE: XLA_USE_BF16 removed to allow manual FP32 casting for loss stability
@@ -18,7 +26,7 @@ export PYTHONWARNINGS="ignore"
 # Fix the "item()" crash by making transfers safer
 export XLA_TRANSFER_SEED_ASYNC=1
 
-# --- 4. CONFIGURATION ---
+# --- 5. CONFIGURATION ---
 HOST=$(hostname)
 export NODE_RANK=$(echo $HOST | awk -F'-' '{print $NF}')
 export MASTER_ADDR=$(echo $HOST | sed 's/[0-9]*$/0/')
@@ -31,7 +39,7 @@ echo "------------------------------------------------"
 
 cd ~/dia-finetuning-stereo || exit
 
-# --- 5. GENERATE TPU CONFIG (XLA) ---
+# --- 6. GENERATE TPU CONFIG (XLA) ---
 cat <<YAML > tpu_config.yaml
 compute_environment: LOCAL_MACHINE
 distributed_type: XLA
@@ -46,7 +54,7 @@ num_processes: 32
 use_cpu: 'no'
 YAML
 
-# --- 6. RUN TRAINING ---
+# --- 7. RUN TRAINING ---
 python3 -m accelerate.commands.launch \
     --config_file tpu_config.yaml \
     --main_process_ip=$MASTER_ADDR \
@@ -57,10 +65,12 @@ python3 -m accelerate.commands.launch \
     -m dia.train_acc_tpu \
     --config configs/architecture/experiments/20251127_dia_010_gpu_refactor_scratch_dataset_model.json \
     --preencoded_dir /home/olivercamp/data_local/encoded_audio \
-    --output_dir ./checkpoints \
+    --output_dir ~/gcs/checkpoints/run_001 \
     --batch_size 8 \
-    --learning_rate 1e-5 \
-    --epochs 1 \
+    --learning_rate 1e-4 \
+    --epochs 1000 \
     --wandb_project dia-tpu \
     --scratch \
+    --demo_every 15 \
+    --eval_every 15 \
     2>&1 | tee train_fsdp.log

@@ -309,10 +309,12 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accele
         channel_weights = [1.0] * target.shape[2]
         
         for c, w in enumerate(channel_weights):
-            l_c = logits[:, :, c, :].flatten(0, 1)
+            # CHANGE: Cast logits to float() (FP32) before loss to prevent BF16 overflow
+            l_c = logits[:, :, c, :].flatten(0, 1).float()
             t_c = target[:, :, c].flatten()
             m_c = final_mask[:, :, c].flatten()
             
+            # Now this calculation happens in stable FP32
             ce_loss = F.cross_entropy(l_c, t_c, reduction='none', ignore_index=dia_cfg.data.audio_pad_value)
             masked_loss = (ce_loss * m_c).sum()
             mask_sum = m_c.sum() + 1e-9

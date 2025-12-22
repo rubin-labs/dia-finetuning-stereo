@@ -13,8 +13,8 @@ export WANDB_API_KEY=2bdd33a710538780b0e66c62afd69104a3a22020
 # --- 3. SYSTEM SETTINGS ---
 # Silence logs
 export PYTHONWARNINGS="ignore"
-# Force BF16 for everything (Stability fix)
-export XLA_USE_BF16=1
+# NOTE: XLA_USE_BF16 removed to allow manual FP32 casting for loss stability
+# export XLA_USE_BF16=1
 # Fix the "item()" crash by making transfers safer
 export XLA_TRANSFER_SEED_ASYNC=1
 
@@ -60,7 +60,7 @@ python3 -m accelerate.commands.launch \
     --output_dir ./checkpoints \
     --run_name dia_010_tpu_fsdp \
     --batch_size 8 \
-    --learning_rate 1e-4 \
+    --learning_rate 1e-5 \
     --epochs 1 \
     --warmup_steps 100 \
     --unconditional_frac 1 \

@@ -133,3 +133,4 @@
 - `2025-12-21 17:15` [`bd54a6d`] **010**: spwan, stalling at step 4, about to switch to accelerate
 - `2025-12-21 18:27` [`bb6554f`] **010**: single working + demos
 - `2025-12-21 18:58` [`298c5bd`] **010**: multi-tpu working for the first time
+- `2025-12-21 21:52` [`1fa6e23`] **010**: current

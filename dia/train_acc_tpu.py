@@ -337,7 +337,10 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accele
 # MAIN
 # =============================================================================
 
-def train(args):
+def main():
+    # Parse args inside main() so Accelerate's TPU launcher can call it without arguments
+    args = get_args()
+    
     # Initialize Accelerator with BF16 and FSDP awareness
     accelerator = Accelerator(mixed_precision="bf16", log_with="wandb")
     device = accelerator.device
@@ -379,10 +382,13 @@ def train(args):
     model = DiaModel(dia_cfg)
     strip_weight_norms(model)
     
-    if args.hub_model:
+    if args.hub_model and not args.scratch:
         ckpt_path = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
         state = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(state, strict=False)
+    elif args.scratch:
+        if accelerator.is_main_process:
+            print("[TRAIN] Training from scratch (no pretrained weights)")
 
     # Optimizer
     # Separate params for decay
@@ -412,11 +418,16 @@ def train(args):
     
     for epoch in range(train_cfg.epochs):
         model.train()
-        for batch in tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch}"):
+        for batch in tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"E{epoch+1}"):
             loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator)
             
-            if accelerator.is_main_process:
-                accelerator.log({"train_loss": loss.item(), "lr": sched.get_last_lr()[0]}, step=global_step)
+            # CRITICAL: Force XLA to execute pending ops after each step
+            xm.mark_step()
+
+            # Log every 10 steps to reduce sync overhead while debugging
+            if global_step % 10 == 0:
+                if accelerator.is_main_process:
+                    accelerator.log({"train_loss": loss.item(), "lr": sched.get_last_lr()[0]}, step=global_step)
             
             global_step += 1
             
@@ -446,8 +457,8 @@ def get_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb_project", type=str, default="dia-fsdp")
     parser.add_argument("--use_sliding_window", action="store_true")
+    parser.add_argument("--scratch", action="store_true", help="Train from scratch (skip loading pretrained weights)")
     return parser.parse_args()
 
 if __name__ == "__main__":
-    args = get_args()
-    train(args)
+    main()

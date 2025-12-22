@@ -29,7 +29,7 @@ echo "I am: $HOST (Rank $NODE_RANK)"
 echo "Master is: $MASTER_ADDR"
 echo "------------------------------------------------"
 
-cd ~/dia-finetuning-stereo-main || exit
+cd ~/dia-finetuning-stereo || exit
 
 # --- 5. GENERATE TPU CONFIG (XLA) ---
 cat <<YAML > tpu_config.yaml
@@ -58,16 +58,9 @@ python3 -m accelerate.commands.launch \
     --config configs/architecture/experiments/20251127_dia_010_gpu_refactor_scratch_dataset_model.json \
     --preencoded_dir /home/olivercamp/data_local/encoded_audio \
     --output_dir ./checkpoints \
-    --run_name dia_010_tpu_fsdp \
     --batch_size 8 \
     --learning_rate 1e-5 \
     --epochs 1 \
-    --warmup_steps 100 \
-    --unconditional_frac 1 \
-    --scratch \
-    --tag_no_shuffle \
-    --eval_step 20 \
-    --demo_every 50 \
-    --save_every 5000 \
     --wandb_project dia-tpu \
-    --half 2>&1 | tee train_fsdp.log
+    --scratch \
+    2>&1 | tee train_fsdp.log

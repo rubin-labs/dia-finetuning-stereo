@@ -136,3 +136,4 @@
 - `2025-12-21 21:52` [`1fa6e23`] **010**: current
 - `2025-12-21 22:01` [`3e29f31`] **010**: fsdp first iteration
 - `2025-12-21 23:58` [`c600851`] **010**: getting to 10 steps and stopping
+- `2025-12-22 01:37` [`51dba9f`] **010**: Changed precision

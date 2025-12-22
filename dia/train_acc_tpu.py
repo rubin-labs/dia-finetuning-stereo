@@ -19,6 +19,7 @@ if _force_single_device and os.environ.get("PJRT_DEVICE") == "TPU":
     print("[INIT] Single-device mode requested. Setting TPU_VISIBLE_CHIPS=0", flush=True)
     os.environ["TPU_VISIBLE_CHIPS"] = "0"
     os.environ["TPU_PROCESS_BOUNDS"] = "1,1,1"
+
 # ============================================================================
 
 import argparse
@@ -309,7 +310,9 @@ def collate_fn(batch, config: DiaConfig, train_cfg: TrainConfig, device: torch.d
 def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, use_sliding_window=True):
     # For TPU, we MUST use fixed batch sizes.
     # collate_fn returns CPU tensors which Accelerate moves to device later.
-    collate = lambda b: collate_fn(b, dia_cfg, train_cfg, torch.device('cpu'), use_sliding_window)
+    # Use functools.partial instead of lambda for pickling compatibility with num_workers > 0
+    from functools import partial
+    collate = partial(collate_fn, config=dia_cfg, train_cfg=train_cfg, device=torch.device('cpu'), use_sliding_window=use_sliding_window)
     
     ds_len = len(dataset)
     n_train = int(train_cfg.split_ratio * ds_len)
@@ -325,12 +328,12 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, device, u
     # Drop last to keep batch sizes consistent (critical for TPU)
     train_loader = DataLoader(
         train_ds, batch_size=train_cfg.batch_size, shuffle=True,
-        collate_fn=collate, num_workers=4, pin_memory=False, drop_last=True
+        collate_fn=collate, num_workers=0, pin_memory=False, drop_last=True
     )
     if val_ds:
         val_loader = DataLoader(
             val_ds, batch_size=train_cfg.batch_size, shuffle=False,
-            collate_fn=collate, num_workers=4, pin_memory=False, drop_last=True
+            collate_fn=collate, num_workers=0, pin_memory=False, drop_last=True
         )
     else:
         val_loader = None
@@ -393,6 +396,53 @@ def setup_optimizer_and_scheduler(model, train_loader, train_cfg):
 
 _dac_model_cache = None
 
+def _create_attn_mask(q_padding_mask_1d: torch.Tensor, k_padding_mask_1d: torch.Tensor, device: torch.device, is_causal: bool = False) -> torch.Tensor:
+    """Creates attention mask (self or cross) mimicking JAX segment ID logic."""
+    B1, Tq = q_padding_mask_1d.shape
+    B2, Tk = k_padding_mask_1d.shape
+    assert B1 == B2, "Query and key batch dimensions must match"
+
+    p_mask_q = q_padding_mask_1d.unsqueeze(2)  # [B, Tq, 1]
+    p_mask_k = k_padding_mask_1d.unsqueeze(1)  # [B, 1, Tk]
+
+    non_pad_attends_non_pad = p_mask_q & p_mask_k
+    pad_attends_pad = (~p_mask_q) & (~p_mask_k)
+    mask = non_pad_attends_non_pad | pad_attends_pad
+
+    if is_causal:
+        assert Tq == Tk
+        causal_mask_2d = torch.tril(torch.ones((Tq, Tk), dtype=torch.bool, device=device))
+        causal_mask = mask & causal_mask_2d
+        return causal_mask.unsqueeze(1)
+    else:
+        return mask.unsqueeze(1)
+
+def _prepare_text_input(text: str, config: DiaConfig, device: torch.device) -> tuple:
+    """Encodes text prompt, pads, and creates attention mask and positions."""
+    text_pad_value = config.data.text_pad_value
+    max_len = config.data.text_length
+
+    byte_text = text.encode("utf-8")
+    text_tokens = list(byte_text)
+
+    current_len = len(text_tokens)
+    padding_needed = max_len - current_len
+    if padding_needed <= 0:
+        text_tokens = text_tokens[:max_len]
+        padded_text_np = np.array(text_tokens, dtype=np.uint8)
+    else:
+        padded_text_np = np.pad(
+            text_tokens, (0, padding_needed), mode="constant", constant_values=text_pad_value
+        ).astype(np.uint8)
+
+    src_tokens = torch.from_numpy(padded_text_np).to(torch.long).to(device).unsqueeze(0)
+    src_positions = torch.arange(max_len, device=device).to(torch.long).unsqueeze(0)
+    src_padding_mask = (src_tokens != text_pad_value).to(device)
+
+    enc_self_attn_mask = _create_attn_mask(src_padding_mask, src_padding_mask, device, is_causal=False)
+
+    return src_tokens, src_positions, src_padding_mask, enc_self_attn_mask
+
 def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg_scale, out_path, dac_model=None):
     """
     TPU-optimized generation using STATIC KV cache shapes.
@@ -404,9 +454,8 @@ def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg
     import time
     start_time = time.time()
     
-    dia_gen = Dia(dia_cfg, device)
-    # Reuse preparation logic
-    (src_BxS, src_pos, src_pad, enc_mask) = dia_gen._prepare_text_input(text)
+    # Use helper functions instead of creating a new Dia instance (which duplicates the model)
+    (src_BxS, src_pos, src_pad, enc_mask) = _prepare_text_input(text, dia_cfg, device)
     
     print(f"  [GEN] Running encoder...", flush=True)
     # Encoder
@@ -425,9 +474,10 @@ def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg
     
     # ===== PRE-COMPUTE CROSS ATTENTION MASK (static shape) =====
     # Cross mask is the same for all steps: (1, 1, 1, src_len)
-    dec_cross_mask = dia_gen._create_attn_mask(
+    dec_cross_mask = _create_attn_mask(
         torch.ones((1, 1), dtype=torch.bool, device=device), 
         src_pad, 
+        device=device,
         is_causal=False
     )
     
@@ -505,10 +555,15 @@ def generate_demo_sample_tpu(model, dia_cfg, device, max_tokens, text, temp, cfg
     # generated shape: (1, max_tokens+1, C) with BOS at position 0
     codes = generated[0].cpu()  # (max_tokens+1, C)
     audio = codebook_to_audio(codes.T, dm, dia_cfg.data.delay_pattern, B=1, T=max_tokens, C=dia_cfg.data.channels)
-    sf.write(out_path, audio.squeeze().detach().numpy().T, EVAL_SAMPLE_RATE)
+    
+    # Save to disk
+    audio_np = audio.squeeze().detach().numpy().T
+    sf.write(out_path, audio_np, EVAL_SAMPLE_RATE)
     
     total_time = time.time() - start_time
     print(f"  [GEN] Saved: {out_path} ({total_time:.1f}s total)", flush=True)
+    
+    return audio_np, EVAL_SAMPLE_RATE
 
 # =============================================================================
 # EVAL STEP
@@ -620,6 +675,8 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                     _dac_model_cache = dac.DAC.load(dac.utils.download()).eval().cpu()
                 print("[DEMO] DAC model loaded.", flush=True)
 
+                audio_samples = {}
+
                 if train_cfg.unconditional_frac >= 1.0:
                     seeds = [int(train_cfg.seed), int(train_cfg.seed) + 1]
                     total_demos = len(EVAL_TEMPERATURES) * len(seeds)
@@ -629,12 +686,15 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                             demo_idx += 1
                             print(f"[DEMO] Generating demo {demo_idx}/{total_demos} (temp={temp}, seed={s})...", flush=True)
                             seed_everything(s)
-                            generate_demo_sample_tpu(
+                            audio_np, sr = generate_demo_sample_tpu(
                                 unwrapped, dia_cfg, device, max_tokens, 
                                 text="", temp=temp, cfg_scale=EVAL_CFG_SCALE_UNCOND,
                                 out_path=Path(EVAL_AUDIO_DIR) / f"step_{global_step}_temp{safe_temp(temp)}_seed{s}.wav",
                                 dac_model=_dac_model_cache
                             )
+                            # Log to WandB
+                            key = f"eval_audio/temp{safe_temp(temp)}/seed{s}"
+                            audio_samples[key] = wandb.Audio(audio_np, caption=f"temp={temp}", sample_rate=sr)
                             print(f"[DEMO] Demo {demo_idx}/{total_demos} complete.", flush=True)
                 else:
                     cfg_s = EVAL_CFG_SCALE if train_cfg.unconditional_frac > 0 else None
@@ -644,13 +704,20 @@ def eval_step(model, val_loader, dia_cfg, dac_model, global_step, device, train_
                         for name, prompt in TEST_PROMPTS.items():
                             demo_idx += 1
                             print(f"[DEMO] Generating demo {demo_idx}/{total_demos} ({name}, temp={temp})...", flush=True)
-                            generate_demo_sample_tpu(
+                            audio_np, sr = generate_demo_sample_tpu(
                                 unwrapped, dia_cfg, device, max_tokens, 
                                 text=prompt, temp=temp, cfg_scale=cfg_s,
                                 out_path=Path(EVAL_AUDIO_DIR) / f"step_{global_step}_{name}_temp{safe_temp(temp)}.wav",
                                 dac_model=_dac_model_cache
                             )
+                            # Log to WandB
+                            key = f"eval_audio/temp{safe_temp(temp)}/{name}"
+                            audio_samples[key] = wandb.Audio(audio_np, caption=f"{prompt}", sample_rate=sr)
                             print(f"[DEMO] Demo {demo_idx}/{total_demos} complete.", flush=True)
+
+                if audio_samples:
+                    wandb.log(audio_samples, step=global_step)
+                    print(f"[DEMO] Uploaded {len(audio_samples)} demos to WandB.", flush=True)
 
                 print(f"[DEMO] All demos complete at step {global_step}!", flush=True)
 
@@ -1141,22 +1208,21 @@ def main():
     
     # Check TPU configuration
     if HAS_XLA and os.environ.get("PJRT_DEVICE"):
-        try:
-            import torch_xla.runtime as xr
-            local_devices = xr.addressable_device_count()
-            global_devices = xr.global_runtime_device_count()
-            print(f"[MAIN] PJRT TPU: {local_devices} local devices, {global_devices} global devices", flush=True)
-            
-            if local_devices == 1:
-                print("[MAIN] Single-device mode active. Running directly.", flush=True)
-            else:
-                print(f"[MAIN] WARNING: {local_devices} devices but running as single process.", flush=True)
-                print("[MAIN] Use --single-device flag for single TPU chip mode.", flush=True)
-                print("[MAIN] Or use torchrun for multi-device: torchrun --nproc_per_node=4 ...", flush=True)
-        except Exception as e:
-            print(f"[MAIN] XLA runtime info: {e}", flush=True)
-    
-    # Legacy XRT mode (TPU v2/v3) - need explicit process spawning
+        # If we are NOT in a distributed environment (no WORLD_SIZE/LOCAL_RANK),
+        # launch using xmp.spawn. This is more robust for single-node TPU VMs.
+        is_distributed = "WORLD_SIZE" in os.environ or "LOCAL_RANK" in os.environ
+        
+        if not is_distributed:
+             print("[MAIN] PJRT_DEVICE=TPU detected in single-process mode.", flush=True)
+             print("[MAIN] Launching via xmp.spawn (nprocs=4 for v4-8)...", flush=True)
+             # Don't call xr.addressable_device_count() here - it can hang if TPU isn't ready.
+             # v4-8 has 4 chips (8 cores), but xmp.spawn with PJRT typically uses 4 processes.
+             xmp.spawn(_mp_fn, args=(args,), nprocs=4)
+             return
+        
+        print(f"[MAIN] PJRT_DEVICE=TPU detected. Distributed mode: {is_distributed}", flush=True)
+
+
     if HAS_XLA and os.environ.get("XRT_TPU_CONFIG"):
         print("[MAIN] XRT mode: Launching with xmp.spawn (4 processes per host)...", flush=True)
         xmp.spawn(_mp_fn, args=(args,), nprocs=4, start_method='fork')

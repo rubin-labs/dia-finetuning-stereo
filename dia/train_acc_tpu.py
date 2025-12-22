@@ -1195,41 +1195,20 @@ def get_args() -> argparse.Namespace:
         
     return args
 
-def _mp_fn(index, args):
-    """Function called by xmp.spawn on each TPU core."""
-    print(f"[XMP] Process {index} starting train()...", flush=True)
-    train(args)
-
 def main():
     """Entry point for TPU training."""
     print("[MAIN] Parsing args...", flush=True)
     args = get_args()
     print("[MAIN] Args parsed.", flush=True)
     
-    # Check TPU configuration
+    # Always run training directly - let Accelerate handle distributed setup
+    # Do NOT use xmp.spawn as it conflicts with Accelerate's distributed handling
     if HAS_XLA and os.environ.get("PJRT_DEVICE"):
-        # If we are NOT in a distributed environment (no WORLD_SIZE/LOCAL_RANK),
-        # launch using xmp.spawn. This is more robust for single-node TPU VMs.
-        is_distributed = "WORLD_SIZE" in os.environ or "LOCAL_RANK" in os.environ
-        
-        if not is_distributed:
-             print("[MAIN] PJRT_DEVICE=TPU detected in single-process mode.", flush=True)
-             print("[MAIN] Launching via xmp.spawn (nprocs=4 for v4-8)...", flush=True)
-             # Don't call xr.addressable_device_count() here - it can hang if TPU isn't ready.
-             # v4-8 has 4 chips (8 cores), but xmp.spawn with PJRT typically uses 4 processes.
-             xmp.spawn(_mp_fn, args=(args,), nprocs=4)
-             return
-        
-        print(f"[MAIN] PJRT_DEVICE=TPU detected. Distributed mode: {is_distributed}", flush=True)
-
-
-    if HAS_XLA and os.environ.get("XRT_TPU_CONFIG"):
-        print("[MAIN] XRT mode: Launching with xmp.spawn (4 processes per host)...", flush=True)
-        xmp.spawn(_mp_fn, args=(args,), nprocs=4, start_method='fork')
-    else:
-        # Run training directly
-        print("[MAIN] Running training...", flush=True)
-        train(args)
+        print("[MAIN] PJRT_DEVICE=TPU detected. Running train() directly.", flush=True)
+        print("[MAIN] For multi-TPU: use 'accelerate launch' with TPU config.", flush=True)
+    
+    print("[MAIN] Starting training...", flush=True)
+    train(args)
 
 if __name__ == "__main__":
     main()

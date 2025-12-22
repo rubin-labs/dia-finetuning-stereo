@@ -138,3 +138,4 @@
 - `2025-12-21 23:58` [`c600851`] **010**: getting to 10 steps and stopping
 - `2025-12-22 01:37` [`51dba9f`] **010**: Changed precision
 - `2025-12-22 03:25` [`db6629d`] **010**: Working fsdp, no eval or demos yet
+- `2025-12-22 11:35` [`8e58c31`] **010**: Working fsdp + eval (no inference yet technically)

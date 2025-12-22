@@ -19,6 +19,7 @@ import json
 import random
 import re
 import warnings
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +77,7 @@ EVAL_AUDIO_DIR = "./audio_demos"
 GRAD_CLIP_MAX_NORM = 1.0 # Lowered slightly for FSDP stability
 ENTROPY_LOG_INTERVAL = 50
 CODEBOOK_WEIGHTS = [1.0] * 9
+_DAC_MODEL_CACHE = {}
 
 @contextmanager
 def preserve_rng_state():
@@ -175,6 +177,19 @@ def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):
                     logger.info(f"Removed old checkpoint: {old_ckpt}")
                 except Exception:
                     pass
+
+def get_dac_model(device):
+    """Load and cache DAC model per device for demo generation."""
+    key = str(device)
+    if key in _DAC_MODEL_CACHE:
+        return _DAC_MODEL_CACHE[key]
+    logger.info(f"[DEMO] Loading DAC model onto {device}")
+    t0 = time.perf_counter()
+    model = dac.DAC.load(dac.utils.download()).eval().to(device)
+    strip_weight_norms(model)
+    _DAC_MODEL_CACHE[key] = model
+    logger.info(f"[DEMO] DAC model ready in {time.perf_counter() - t0:.1f}s")
+    return model
 
 # =============================================================================
 # DATA
@@ -301,19 +316,6 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
 # TRAIN STEP
 # =============================================================================
 
-def compute_grad_norm(model, norm_type: float = 2.0) -> torch.Tensor:
-    """Compute the total gradient norm across all parameters."""
-    parameters = [p for p in model.parameters() if p.grad is not None]
-    if len(parameters) == 0:
-        return torch.tensor(0.0)
-    
-    device = parameters[0].grad.device
-    total_norm = torch.norm(
-        torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]),
-        norm_type
-    )
-    return total_norm
-
 def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator):
     
     # Unconditional dropout
@@ -366,24 +368,13 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accele
     # Backward & Step
     accelerator.backward(loss)
     
-    grad_norm_pre = None
-    grad_norm_post = None
-    
     if (global_step + 1) % train_cfg.grad_accum_steps == 0:
-        # Compute gradient norm BEFORE clipping
-        grad_norm_pre = compute_grad_norm(model)
-        
-        # Clip gradients
         accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
-        
-        # Compute gradient norm AFTER clipping
-        grad_norm_post = compute_grad_norm(model)
-        
         opt.step()
         sched.step()
         opt.zero_grad()
     
-    return loss.detach(), grad_norm_pre, grad_norm_post
+    return loss.detach()
 
 # =============================================================================
 # DEMO GENERATION
@@ -394,6 +385,7 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
     if not accelerator.is_main_process:
         return
     
+    t_start = time.perf_counter()
     logger.info(f"[DEMO] Generating audio samples at step {global_step}")
     Path(EVAL_AUDIO_DIR).mkdir(parents=True, exist_ok=True)
     
@@ -404,10 +396,11 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
         dia_gen = Dia(dia_cfg, accelerator.device)
         dia_gen.model = unwrapped
         
-        # Load DAC model for audio decoding
-        dac_model = dac.DAC.load(dac.utils.download()).eval().to(accelerator.device)
-        strip_weight_norms(dac_model)
+        # Load DAC model for audio decoding (cached per device)
+        dac_load_t0 = time.perf_counter()
+        dac_model = get_dac_model(accelerator.device)
         dia_gen.dac_model = dac_model
+        logger.info(f"[DEMO] DAC model attached (ready in {time.perf_counter() - dac_load_t0:.1f}s)")
         
         audio_samples = {}
         
@@ -422,6 +415,8 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
                     for temp in EVAL_TEMPERATURES:
                         for s in seeds:
                             seed_everything(s)
+                            demo_t0 = time.perf_counter()
+                            logger.info(f"[DEMO] Start unconditional temp={temp}, seed={s}")
                             try:
                                 audio = dia_gen.generate(text="", cfg_scale=EVAL_CFG_SCALE_UNCOND, temperature=temp)
                                 path = Path(EVAL_AUDIO_DIR) / f"step_{global_step}_temp{safe_temp(temp)}_seed{s}.wav"
@@ -429,11 +424,15 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
                                                  f"temp={temp}", audio_samples)
                             except Exception as e:
                                 logger.warning(f"Demo generation failed for temp={temp}, seed={s}: {e}")
+                            else:
+                                logger.info(f"[DEMO] Finished temp={temp}, seed={s} in {time.perf_counter() - demo_t0:.1f}s")
             else:
                 # Conditional generation with prompts
                 cfg_s = EVAL_CFG_SCALE if train_cfg.unconditional_frac > 0 else None
                 for temp in EVAL_TEMPERATURES:
                     for name, prompt in TEST_PROMPTS.items():
+                        demo_t0 = time.perf_counter()
+                        logger.info(f"[DEMO] Start prompt={name}, temp={temp}")
                         try:
                             audio = dia_gen.generate(text=prompt, cfg_scale=cfg_s, temperature=temp, top_p=EVAL_TOP_P)
                             path = Path(EVAL_AUDIO_DIR) / f"step_{global_step}_{name}_temp{safe_temp(temp)}.wav"
@@ -441,6 +440,8 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
                                              prompt, audio_samples)
                         except Exception as e:
                             logger.warning(f"Demo generation failed for {name}, temp={temp}: {e}")
+                        else:
+                            logger.info(f"[DEMO] Finished prompt={name}, temp={temp} in {time.perf_counter() - demo_t0:.1f}s")
             
             if audio_samples:
                 wandb.log(audio_samples, step=global_step)
@@ -449,10 +450,7 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
     except Exception as e:
         logger.exception(f"[DEMO] Demo generation failed: {e}")
     finally:
-        # Clean up DAC model to free memory
-        if 'dac_model' in locals():
-            del dac_model
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        logger.info(f"[DEMO] Demo section finished in {time.perf_counter() - t_start:.1f}s")
 
 # =============================================================================
 # EVALUATION
@@ -608,7 +606,7 @@ def main():
     for epoch in range(train_cfg.epochs):
         model.train()
         for batch in tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"E{epoch+1}"):
-            loss, grad_norm_pre, grad_norm_post = train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator)
+            loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator)
             
             # CRITICAL: Force XLA to execute pending ops after each step
             xm.mark_step()
@@ -616,13 +614,7 @@ def main():
             # Log every 10 steps to reduce sync overhead while debugging
             if global_step % 10 == 0:
                 if accelerator.is_main_process:
-                    log_dict = {"train_loss": loss.item(), "lr": sched.get_last_lr()[0]}
-                    # Add gradient norms if available (only on grad accumulation steps)
-                    if grad_norm_pre is not None:
-                        log_dict["grad_norm_pre_clip"] = grad_norm_pre.item()
-                    if grad_norm_post is not None:
-                        log_dict["grad_norm_post_clip"] = grad_norm_post.item()
-                    accelerator.log(log_dict, step=global_step)
+                    accelerator.log({"train_loss": loss.item(), "lr": sched.get_last_lr()[0]}, step=global_step)
             
             global_step += 1
             

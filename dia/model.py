@@ -1,4 +1,5 @@
 import os
+import logging
 
 import dac
 import numpy as np
@@ -9,6 +10,8 @@ from huggingface_hub import hf_hub_download
 from .audio import audio_to_codebook, codebook_to_audio
 from .config import DiaConfig
 from .layers import DiaModel, KVCache
+
+logger = logging.getLogger(__name__)
 
 
 def get_default_device():
@@ -236,9 +239,14 @@ class Dia:
         audio_pad_value = self.config.data.audio_pad_value
         delay_pattern = self.config.data.delay_pattern
         max_tokens = self.config.data.audio_length
+        gen_log_interval = max(1, int(os.environ.get("DIA_GEN_LOG_INTERVAL", "100")))
         delay_tensor = torch.tensor(delay_pattern, dtype=torch.long, device=self.device)
         max_delay_pattern = max(delay_pattern)
         self.model.eval()
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                f"[GEN] Start generation cfg_scale={cfg_scale} temp={temperature} top_p={top_p} max_tokens={max_tokens} prompt_chars={len(text)}"
+            )
 
         (
             cond_src_BxS,
@@ -428,6 +436,11 @@ class Dia:
 
             generated_BxTxC[:, step + 1, :] = pred_C.unsqueeze(0).expand(batch_size, -1)
 
+            if (generation_step_index % gen_log_interval) == 0:
+                logger.info(
+                    f"[GEN] step {generation_step_index}/{max_tokens} eos_seen={eos_detected_channel_0} temp={temperature} cfg_scale={cfg_scale}"
+                )
+
             if not eos_detected_channel_0 and pred_C[0] == audio_eos_value:
                 eos_detected_channel_0 = True
                 eos_countdown = extra_steps_after_eos
@@ -448,6 +461,7 @@ class Dia:
         output_codes = generated_BxTxC[:, prompt_len_inc_bos : step + 1, :]
 
         generated_codes = output_codes[0]
+        logger.info(f"[GEN] Completed generation tokens={generated_codes.shape[0]} eos_seen={eos_detected_channel_0}")
 
         audio = codebook_to_audio(
             generated_codes.transpose(1, 0), self.dac_model, delay_pattern, B=1, T=max_tokens, C=num_channels

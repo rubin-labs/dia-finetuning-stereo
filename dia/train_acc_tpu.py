@@ -1050,39 +1050,25 @@ def train(args):
             loss_tensor = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator)
             
             # Convert loss tensor to float for logging - only do this once per step
-            # This forces synchronization but is necessary for monitoring
-            # Using xm.mesh_reduce for safer multi-device reduction
+            # Note: We just use local loss here - mesh_reduce can cause hangs with xmp.spawn issues
             if isinstance(loss_tensor, torch.Tensor):
-                if HAS_XLA:
-                    # Use mesh_reduce to safely get loss across all devices
-                    loss = xm.mesh_reduce('loss', loss_tensor, lambda x: sum(x) / len(x)).item()
-                else:
-                    loss = loss_tensor.item()
+                loss = loss_tensor.item()
             else:
                 loss = loss_tensor  # Already a float (e.g., nan)
             
             if step == 0:
                 print(f"[DEBUG] Step 0: train_step complete. Loss: {loss}", flush=True)
             
-            # XLA metrics debug on first step
-            if global_step == 0 and HAS_XLA:
+            # XLA metrics debug on first step (main process only, no sync needed)
+            if global_step == 0 and HAS_XLA and accelerator.is_main_process:
                 xm.mark_step()
-                if accelerator.is_main_process:
-                    import torch_xla.debug.metrics as met
-                    print("[XLA METRICS] First step complete:")
-                    print(met.metrics_report())
-                # Sync after metrics report (only main process runs the report)
-                if accelerator.num_processes > 1:
-                    xm.rendezvous('xla_metrics_report')
+                import torch_xla.debug.metrics as met
+                print("[XLA METRICS] First step complete:")
+                print(met.metrics_report())
             
             if accelerator.is_main_process:
                 loader_iter.set_postfix({'loss': f"{loss:.4f}"})
                 wandb.log({'train_loss': loss, 'lr': sched.get_last_lr()[0]}, step=global_step)
-            
-            # Explicit synchronization after logging to prevent process drift
-            # This ensures all processes stay aligned after conditional code paths
-            if HAS_XLA and accelerator.num_processes > 1:
-                xm.rendezvous('train_step_end')
 
             # Evaluation
             should_eval_step = (args.eval_every_epochs is None) and (global_step % train_cfg.eval_step == 0) and (global_step > 0)

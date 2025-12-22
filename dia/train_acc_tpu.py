@@ -809,8 +809,12 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         
         loss = loss / sum(channel_weights)
 
-        if global_step % ENTROPY_LOG_INTERVAL == 0 and accelerator.is_main_process:
-            wandb.log({'output_entropy': compute_output_entropy(logits.detach())}, step=global_step)
+        # Entropy logging - only on main process at intervals
+        if global_step % ENTROPY_LOG_INTERVAL == 0:
+            # Compute entropy on all processes (needed for proper XLA graph)
+            entropy_val = compute_output_entropy(logits.detach())
+            if accelerator.is_main_process:
+                wandb.log({'output_entropy': entropy_val}, step=global_step)
 
     if global_step == 0:
         print(f"[DEBUG train_step] Loss computed: {loss}", flush=True)
@@ -831,9 +835,14 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
         print("[DEBUG train_step] Backward pass scheduled.", flush=True)
     
     if (step + 1) % train_cfg.grad_accum_steps == 0:
+        # Grad clipping happens on all processes
         norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+        
+        # Log grad norm only on main process
         if accelerator.is_main_process:
-             wandb.log({'grad_norm': norm}, step=global_step)
+            # Convert norm to float if it's a tensor
+            norm_val = norm.item() if isinstance(norm, torch.Tensor) else norm
+            wandb.log({'grad_norm': norm_val}, step=global_step)
         
         if global_step == 0:
             print("[DEBUG train_step] Running optimizer step...", flush=True)
@@ -848,9 +857,11 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, 
     if HAS_XLA: xm.mark_step()
     
     if global_step == 0:
-        print("[DEBUG train_step] mark_step complete. Getting loss value...", flush=True)
+        print("[DEBUG train_step] mark_step complete. Returning detached loss...", flush=True)
     
-    return loss.item() * train_cfg.grad_accum_steps
+    # Return detached tensor - avoid .item() here as it forces synchronization
+    # which can cause deadlocks in multi-host setups. Call .item() only when logging.
+    return (loss.detach() * train_cfg.grad_accum_steps)
 
 # =============================================================================
 # MAIN TRAINING LOOP
@@ -1036,7 +1047,19 @@ def train(args):
                 print(f"[DEBUG] Step 0: Data transfer complete. Starting train_step...", flush=True)
 
             global_step = epoch * steps_per_epoch + step
-            loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator)
+            loss_tensor = train_step(model, batch, dia_cfg, train_cfg, opt, sched, step, global_step, accelerator)
+            
+            # Convert loss tensor to float for logging - only do this once per step
+            # This forces synchronization but is necessary for monitoring
+            # Using xm.mesh_reduce for safer multi-device reduction
+            if isinstance(loss_tensor, torch.Tensor):
+                if HAS_XLA:
+                    # Use mesh_reduce to safely get loss across all devices
+                    loss = xm.mesh_reduce('loss', loss_tensor, lambda x: sum(x) / len(x)).item()
+                else:
+                    loss = loss_tensor.item()
+            else:
+                loss = loss_tensor  # Already a float (e.g., nan)
             
             if step == 0:
                 print(f"[DEBUG] Step 0: train_step complete. Loss: {loss}", flush=True)
@@ -1048,10 +1071,18 @@ def train(args):
                     import torch_xla.debug.metrics as met
                     print("[XLA METRICS] First step complete:")
                     print(met.metrics_report())
+                # Sync after metrics report (only main process runs the report)
+                if accelerator.num_processes > 1:
+                    xm.rendezvous('xla_metrics_report')
             
             if accelerator.is_main_process:
                 loader_iter.set_postfix({'loss': f"{loss:.4f}"})
                 wandb.log({'train_loss': loss, 'lr': sched.get_last_lr()[0]}, step=global_step)
+            
+            # Explicit synchronization after logging to prevent process drift
+            # This ensures all processes stay aligned after conditional code paths
+            if HAS_XLA and accelerator.num_processes > 1:
+                xm.rendezvous('train_step_end')
 
             # Evaluation
             should_eval_step = (args.eval_every_epochs is None) and (global_step % train_cfg.eval_step == 0) and (global_step > 0)
@@ -1195,20 +1226,70 @@ def get_args() -> argparse.Namespace:
         
     return args
 
+def _mp_fn(index, args):
+    """Function called by xmp.spawn on each TPU core."""
+    print(f"[XMP] Process {index} starting train()...", flush=True)
+    train(args)
+
 def main():
     """Entry point for TPU training."""
     print("[MAIN] Parsing args...", flush=True)
     args = get_args()
     print("[MAIN] Args parsed.", flush=True)
     
-    # Always run training directly - let Accelerate handle distributed setup
-    # Do NOT use xmp.spawn as it conflicts with Accelerate's distributed handling
-    if HAS_XLA and os.environ.get("PJRT_DEVICE"):
-        print("[MAIN] PJRT_DEVICE=TPU detected. Running train() directly.", flush=True)
-        print("[MAIN] For multi-TPU: use 'accelerate launch' with TPU config.", flush=True)
+    # =========================================================================
+    # DIAGNOSTIC: Print TPU/multi-host configuration
+    # =========================================================================
+    print("[MAIN] === TPU Configuration Diagnostics ===", flush=True)
+    print(f"[MAIN] PJRT_DEVICE: {os.environ.get('PJRT_DEVICE', 'not set')}", flush=True)
+    print(f"[MAIN] TPU_VISIBLE_CHIPS: {os.environ.get('TPU_VISIBLE_CHIPS', 'not set')}", flush=True)
+    print(f"[MAIN] TPU_PROCESS_BOUNDS: {os.environ.get('TPU_PROCESS_BOUNDS', 'not set')}", flush=True)
+    print(f"[MAIN] TPU_WORKER_ID: {os.environ.get('TPU_WORKER_ID', 'not set')}", flush=True)
+    print(f"[MAIN] TPU_WORKER_HOSTNAMES: {os.environ.get('TPU_WORKER_HOSTNAMES', 'not set')}", flush=True)
+    print(f"[MAIN] WORLD_SIZE: {os.environ.get('WORLD_SIZE', 'not set')}", flush=True)
+    print(f"[MAIN] LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'not set')}", flush=True)
+    print(f"[MAIN] RANK: {os.environ.get('RANK', 'not set')}", flush=True)
     
-    print("[MAIN] Starting training...", flush=True)
-    train(args)
+    # Check if this looks like a multi-host setup (multiple workers via --worker=all)
+    # In multi-host setups, TPU_WORKER_HOSTNAMES should be set
+    is_multi_host = os.environ.get('TPU_WORKER_HOSTNAMES') is not None
+    if is_multi_host:
+        print("[MAIN] WARNING: Multi-host TPU detected! Using xmp.spawn with --worker=all", flush=True)
+        print("[MAIN] can cause deadlocks. Consider using single-host mode or", flush=True)
+        print("[MAIN] proper multi-host coordination with accelerate launch.", flush=True)
+    print("[MAIN] =======================================", flush=True)
+    
+    # Check TPU configuration
+    if HAS_XLA and os.environ.get("PJRT_DEVICE"):
+        # If we are NOT in a distributed environment (no WORLD_SIZE/LOCAL_RANK),
+        # launch using xmp.spawn. This is more robust for single-node TPU VMs.
+        is_distributed = "WORLD_SIZE" in os.environ or "LOCAL_RANK" in os.environ
+        
+        if not is_distributed:
+            # Check if we're in a multi-host setup - if so, warn and use single process
+            if is_multi_host:
+                print("[MAIN] Multi-host detected but no distributed env vars.", flush=True)
+                print("[MAIN] Running single process per host - use accelerate launch for multi-host.", flush=True)
+                train(args)
+                return
+            
+            print("[MAIN] PJRT_DEVICE=TPU detected in single-process mode.", flush=True)
+            print("[MAIN] Launching via xmp.spawn (nprocs=4 for v4-8)...", flush=True)
+            # Don't call xr.addressable_device_count() here - it can hang if TPU isn't ready.
+            # v4-8 has 4 chips (8 cores), but xmp.spawn with PJRT typically uses 4 processes.
+            xmp.spawn(_mp_fn, args=(args,), nprocs=4)
+            return
+        
+        print(f"[MAIN] PJRT_DEVICE=TPU detected. Distributed mode: {is_distributed}", flush=True)
+
+
+    if HAS_XLA and os.environ.get("XRT_TPU_CONFIG"):
+        print("[MAIN] XRT mode: Launching with xmp.spawn (4 processes per host)...", flush=True)
+        xmp.spawn(_mp_fn, args=(args,), nprocs=4, start_method='fork')
+    else:
+        # Run training directly
+        print("[MAIN] Running training...", flush=True)
+        train(args)
 
 if __name__ == "__main__":
     main()

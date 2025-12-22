@@ -130,3 +130,4 @@
 - `2025-12-21 13:36` [`b08b582`] **010**: TPU with static KV cache for tpu generation to avoid xla recompilation
 - `2025-12-21 14:09` [`2af9a7f`] **010**: Faster demos
 - `2025-12-21 16:29` [`cceec11`] **010**: Multi tpu semi working
+- `2025-12-21 17:15` [`bd54a6d`] **010**: spwan, stalling at step 4, about to switch to accelerate

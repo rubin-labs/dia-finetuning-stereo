@@ -662,29 +662,7 @@ def main():
     global_step = 0
     if accelerator.is_main_process:
         print("[DEBUG] Setup complete. global_step=0", flush=True)
-    
-    # === INITIAL DEMO GENERATION (for testing before training starts) ===
-    if accelerator.is_main_process:
-        print("[INIT] Running initial demo generation before training...", flush=True)
-    if accelerator.is_main_process:
-        print("[DEBUG] Calling accelerator.wait_for_everyone() before demo...", flush=True)
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        print("[DEBUG] All processes synchronized. Setting model.eval()...", flush=True)
-    model.eval()
-    if accelerator.is_main_process:
-        print("[DEBUG] Calling generate_demos()...", flush=True)
-    generate_demos(model, dia_cfg, train_cfg, global_step=0, accelerator=accelerator)
-    if accelerator.is_main_process:
-        print("[DEBUG] generate_demos() returned. Setting model.train()...", flush=True)
-    model.train()
-    if accelerator.is_main_process:
-        print("[DEBUG] Calling accelerator.wait_for_everyone() after demo...", flush=True)
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        print("[INIT] Initial demo generation complete. Starting training loop...", flush=True)
-    # =====================================================================
-    
+
     for epoch in range(train_cfg.epochs):
         model.train()
         for batch in tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"E{epoch+1}"):

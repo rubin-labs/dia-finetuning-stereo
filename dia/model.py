@@ -232,6 +232,7 @@ class Dia:
         use_torch_compile: bool = False,
         cfg_filter_top_k: int = 64,
         audio_prompt_path: str | None = None,
+        check_eos: bool = True,  # Set to False on TPU to avoid sync-in-loop performance bug
     ) -> np.ndarray:
         """
         Generates audio from a text prompt (and optional audio prompt) using the Nari model.
@@ -239,6 +240,7 @@ class Dia:
         Returns:
             A tensor of generated audio codes (shape: [max_tokens, num_channels]).
         """
+        print("[GEN DEBUG] Entering generate() function...", flush=True)
         num_channels = self.config.data.channels
         audio_bos_value = self.config.data.audio_bos_value
         audio_eos_value = self.config.data.audio_eos_value
@@ -249,6 +251,7 @@ class Dia:
         delay_tensor = torch.tensor(delay_pattern, dtype=torch.long, device=self.device)
         max_delay_pattern = max(delay_pattern)
         self.model.eval()
+        print(f"[GEN DEBUG] Config loaded: channels={num_channels}, max_tokens={max_tokens}, check_eos={check_eos}", flush=True)
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 f"[GEN] Start generation cfg_scale={cfg_scale} temp={temperature} top_p={top_p} max_tokens={max_tokens} prompt_chars={len(text)}"
@@ -277,6 +280,7 @@ class Dia:
             enc_self_attn_mask_Bx1xSxS = cond_enc_self_attn_mask_Bx1xSxS
 
         # 2. Encoder Pass
+        print("[GEN DEBUG] Running encoder forward pass...", flush=True)
         # with torch.autocast(device_type="cuda", dtype=forward_dtype):
         encoder_out = self.model.encoder(
             x_ids=src_BxS,
@@ -284,12 +288,15 @@ class Dia:
             deterministic=True,
             attn_mask=enc_self_attn_mask_Bx1xSxS,
         )  # Shape: (B, S, E)
+        print(f"[GEN DEBUG] Encoder done. Output shape: {encoder_out.shape}", flush=True)
 
         # 3. Prepare Decoder Inputs
         # 3-1. Allocate KV Cache (Static)
+        print("[GEN DEBUG] Precomputing cross-attention KV cache...", flush=True)
         decoder_cross_attention_cache: list[KVCache] = self.model.decoder.precompute_cross_attention_kv(
             max_tokens, encoder_out, src_positions_BxS
         )
+        print("[GEN DEBUG] Cross-attention KV cache ready.", flush=True)
 
         decoder_self_attention_cache: list[KVCache] = []
         for _ in range(self.model.decoder.num_layers):
@@ -372,12 +379,14 @@ class Dia:
             dim=1,
         )
 
+        print("[GEN DEBUG] Setting up decode_step function...", flush=True)
         decode_step = self.model.decoder.decode_step
         if use_torch_compile:
             decode_step = torch.compile(
                 self.model.decoder.decode_step,
                 mode="default",
             )
+        print("[GEN DEBUG] decode_step ready. Setting up masks...", flush=True)
 
         tgt_padding_mask = (
             (generated_BxTxC[:, -1, :].unsqueeze(1) != audio_pad_value).any(dim=2).to(self.device)
@@ -389,6 +398,7 @@ class Dia:
             is_causal=False,
         )  # [B, 1, 1, S]
 
+        print(f"[GEN DEBUG] Starting generation loop: {max_tokens} steps from current_step={current_step}", flush=True)
         for step in range(current_step, current_step + max_tokens):
             tgt_ids_Bx1xC = generated_BxTxC[:, step, :].unsqueeze(1)
             tgt_pos_Bx1 = torch.full(
@@ -451,20 +461,23 @@ class Dia:
                     f"[GEN] step {generation_step_index}/{max_tokens} eos_seen={eos_detected_channel_0} temp={temperature} cfg_scale={cfg_scale}"
                 )
 
-            if not eos_detected_channel_0 and pred_C[0] == audio_eos_value:
-                eos_detected_channel_0 = True
-                eos_countdown = extra_steps_after_eos
+            # EOS checking - disabled on TPU to avoid sync-in-loop performance bug
+            # When check_eos=False, we generate fixed length quickly instead of checking for early stopping
+            if check_eos:
+                if not eos_detected_channel_0 and pred_C[0] == audio_eos_value:
+                    eos_detected_channel_0 = True
+                    eos_countdown = extra_steps_after_eos
 
-            if eos_countdown > 0:
-                step_after_eos = max_delay_pattern - eos_countdown
-                for i, d in enumerate(delay_pattern):
-                    if step_after_eos == d:
-                        generated_BxTxC[:, step + 1, i] = audio_eos_value
-                    elif step_after_eos > d:
-                        generated_BxTxC[:, step + 1, i] = audio_pad_value
-                eos_countdown -= 1
-                if eos_countdown == 0:
-                    break
+                if eos_countdown > 0:
+                    step_after_eos = max_delay_pattern - eos_countdown
+                    for i, d in enumerate(delay_pattern):
+                        if step_after_eos == d:
+                            generated_BxTxC[:, step + 1, i] = audio_eos_value
+                        elif step_after_eos > d:
+                            generated_BxTxC[:, step + 1, i] = audio_pad_value
+                    eos_countdown -= 1
+                    if eos_countdown == 0:
+                        break
 
             generation_step_index = step - current_step + 1
 

@@ -33,7 +33,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 from accelerate import Accelerator
-from huggingface_hub import hf_hub_download
+# hf_hub_download removed - always training from scratch
 from torch.nn.utils import clip_grad_norm_, parametrize
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
@@ -392,23 +392,33 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
      
     t_start = time.perf_counter()
     if accelerator.is_main_process:
-        logger.info(f"[DEMO] Generating audio samples at step {global_step}")
+        print(f"[DEMO] Generating audio samples at step {global_step}", flush=True)
+        print(f"[DEMO DEBUG] Entered generate_demos function", flush=True)
         Path(EVAL_AUDIO_DIR).mkdir(parents=True, exist_ok=True)
     
     # ALL processes must unwrap the model (FSDP requirement)
+    if accelerator.is_main_process:
+        print("[DEMO DEBUG] Unwrapping model...", flush=True)
     unwrapped = accelerator.unwrap_model(model)
+    if accelerator.is_main_process:
+        print("[DEMO DEBUG] Model unwrapped successfully", flush=True)
     
     try:
         # Create Dia wrapper for generation (ALL processes)
+        if accelerator.is_main_process:
+            print("[DEMO DEBUG] Creating Dia wrapper...", flush=True)
         dia_gen = Dia(dia_cfg, accelerator.device)
         dia_gen.model = unwrapped
+        if accelerator.is_main_process:
+            print("[DEMO DEBUG] Dia wrapper created, loading DAC model...", flush=True)
         
         # Load DAC model for audio decoding (cached per device, ALL processes)
         dac_load_t0 = time.perf_counter()
         dac_model = get_dac_model(accelerator.device)
         dia_gen.dac_model = dac_model
         if accelerator.is_main_process:
-            logger.info(f"[DEMO] DAC model attached (ready in {time.perf_counter() - dac_load_t0:.1f}s)")
+            print(f"[DEMO] DAC model attached (ready in {time.perf_counter() - dac_load_t0:.1f}s)", flush=True)
+            print("[DEMO DEBUG] About to enter generation loop...", flush=True)
         
         audio_samples = {}
         
@@ -428,7 +438,8 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
                                 logger.info(f"[DEMO] Start unconditional temp={temp}, seed={s}")
                             try:
                                 # ALL ranks run generation (FSDP requires all processes to participate)
-                                audio = dia_gen.generate(text="", cfg_scale=EVAL_CFG_SCALE_UNCOND, temperature=temp)
+                                # check_eos=False to avoid TPU sync-in-loop performance bug
+                                audio = dia_gen.generate(text="", cfg_scale=EVAL_CFG_SCALE_UNCOND, temperature=temp, check_eos=False)
                                 
                                 # Only main process saves to disk and logs to wandb
                                 if accelerator.is_main_process:
@@ -451,7 +462,8 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
                             logger.info(f"[DEMO] Start prompt={name}, temp={temp}")
                         try:
                             # ALL ranks run generation (FSDP requires all processes to participate)
-                            audio = dia_gen.generate(text=prompt, cfg_scale=cfg_s, temperature=temp, top_p=EVAL_TOP_P)
+                            # check_eos=False to avoid TPU sync-in-loop performance bug
+                            audio = dia_gen.generate(text=prompt, cfg_scale=cfg_s, temperature=temp, top_p=EVAL_TOP_P, check_eos=False)
                             
                             # Only main process saves to disk and logs to wandb
                             if accelerator.is_main_process:
@@ -580,6 +592,8 @@ def main():
         )
 
     # Dataset
+    if accelerator.is_main_process:
+        print("[DEBUG] Loading dataset...", flush=True)
     if args.preencoded_dir:
         dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, args.use_sliding_window)
     elif args.audio_folder:
@@ -588,22 +602,28 @@ def main():
         strip_weight_norms(dac_model)
         dataset = TestingDataset(args.audio_folder, dia_cfg, dac_model, args.use_sliding_window)
     
+    if accelerator.is_main_process:
+        print(f"[DEBUG] Dataset loaded with {len(dataset)} samples. Setting up data loaders...", flush=True)
     train_loader, val_loader = setup_loaders(dataset, dia_cfg, train_cfg, args.use_sliding_window)
+    if accelerator.is_main_process:
+        print(f"[DEBUG] Data loaders ready. train_loader has {len(train_loader)} batches.", flush=True)
     
     # Model
+    if accelerator.is_main_process:
+        print("[DEBUG] Creating DiaModel...", flush=True)
     model = DiaModel(dia_cfg)
     strip_weight_norms(model)
+    if accelerator.is_main_process:
+        print("[DEBUG] DiaModel created.", flush=True)
     
-    if args.hub_model and not args.scratch:
-        ckpt_path = hf_hub_download(args.hub_model, filename="dia-v0_1.pth")
-        state = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-    elif args.scratch:
-        if accelerator.is_main_process:
-            print("[TRAIN] Training from scratch (no pretrained weights)")
+    # Always train from scratch - no pretrained weights
+    if accelerator.is_main_process:
+        print("[TRAIN] Training from scratch (no pretrained weights)", flush=True)
 
     # Optimizer
     # Separate params for decay
+    if accelerator.is_main_process:
+        print("[DEBUG] Setting up optimizer...", flush=True)
     decay, no_decay = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad: continue
@@ -620,13 +640,46 @@ def main():
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * train_cfg.epochs
     sched = get_scheduler('cosine', opt, num_warmup_steps=train_cfg.warmup_steps, num_training_steps=total_steps)
+    if accelerator.is_main_process:
+        print(f"[DEBUG] Optimizer ready. steps_per_epoch={steps_per_epoch}, total_steps={total_steps}", flush=True)
 
     # CRITICAL FSDP STEP: Prepare everything together
     # FSDP will shard the model across TPUs here
+    if accelerator.is_main_process:
+        print("[DEBUG] Calling accelerator.prepare() - this may take a while for FSDP sharding...", flush=True)
     model, opt, train_loader, sched = accelerator.prepare(model, opt, train_loader, sched)
-    if val_loader: val_loader = accelerator.prepare(val_loader)
+    if accelerator.is_main_process:
+        print("[DEBUG] accelerator.prepare() complete for model, opt, train_loader, sched.", flush=True)
+    if val_loader: 
+        val_loader = accelerator.prepare(val_loader)
+        if accelerator.is_main_process:
+            print("[DEBUG] val_loader prepared.", flush=True)
 
     global_step = 0
+    if accelerator.is_main_process:
+        print("[DEBUG] Setup complete. global_step=0", flush=True)
+    
+    # === INITIAL DEMO GENERATION (for testing before training starts) ===
+    if accelerator.is_main_process:
+        print("[INIT] Running initial demo generation before training...", flush=True)
+    if accelerator.is_main_process:
+        print("[DEBUG] Calling accelerator.wait_for_everyone() before demo...", flush=True)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        print("[DEBUG] All processes synchronized. Setting model.eval()...", flush=True)
+    model.eval()
+    if accelerator.is_main_process:
+        print("[DEBUG] Calling generate_demos()...", flush=True)
+    generate_demos(model, dia_cfg, train_cfg, global_step=0, accelerator=accelerator)
+    if accelerator.is_main_process:
+        print("[DEBUG] generate_demos() returned. Setting model.train()...", flush=True)
+    model.train()
+    if accelerator.is_main_process:
+        print("[DEBUG] Calling accelerator.wait_for_everyone() after demo...", flush=True)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        print("[INIT] Initial demo generation complete. Starting training loop...", flush=True)
+    # =====================================================================
     
     for epoch in range(train_cfg.epochs):
         model.train()
@@ -674,7 +727,6 @@ def main():
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--hub_model", type=str, default="nari-labs/Dia-1.6B")
     parser.add_argument("--audio_folder", type=Path)
     parser.add_argument("--preencoded_dir", type=Path)
     parser.add_argument("--output_dir", type=Path, required=True)
@@ -684,7 +736,6 @@ def get_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb_project", type=str, default="dia-fsdp")
     parser.add_argument("--use_sliding_window", action="store_true")
-    parser.add_argument("--scratch", action="store_true", help="Train from scratch (skip loading pretrained weights)")
     parser.add_argument("--demo_every", type=int, default=None, help="Generate demo audio every N steps")
     parser.add_argument("--eval_every", type=int, default=None, help="Run evaluation every N steps")
     return parser.parse_args()

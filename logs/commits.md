@@ -143,3 +143,4 @@
 - `2025-12-22 14:40` [`dca9f98`] **010**: caching push, running right now, havent tested caching yet
 - `2025-12-22 14:49` [`448bc76`] **010**: proposed demo fix for fsdp, all ranks particiate in generate calls not just rank 0 now, added xm.mark_step() as well in model.py
 - `2025-12-22 15:50` [`646c4d2`] **010**: safety
+- `2025-12-22 16:50` [`a6688a0`] **010**: Safety

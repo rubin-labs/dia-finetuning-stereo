@@ -42,7 +42,8 @@ def _sample_next_token(
     if use_cfg_filter and cfg_filter_top_k is not None:
         _, top_k_indices_BCxV = torch.topk(logits_BCxV, k=cfg_filter_top_k, dim=-1)
         mask = torch.ones_like(logits_BCxV, dtype=torch.bool)
-        mask.scatter_(dim=-1, index=top_k_indices_BCxV, value=False)
+        # CHANGE: Remove underscore, assign result back to mask
+        mask = mask.scatter(dim=-1, index=top_k_indices_BCxV, value=False)
         logits_BCxV = logits_BCxV.masked_fill(mask, -torch.inf)
 
     if top_p < 1.0:
@@ -57,7 +58,8 @@ def _sample_next_token(
         sorted_indices_to_remove_BCxV[..., 0] = 0  # Always keep the most probable token
 
         indices_to_remove_BCxV = torch.zeros_like(sorted_indices_to_remove_BCxV)
-        indices_to_remove_BCxV.scatter_(dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV)
+        # CHANGE: Remove underscore, assign result back to variable
+        indices_to_remove_BCxV = indices_to_remove_BCxV.scatter(dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV)
         logits_BCxV = logits_BCxV.masked_fill(indices_to_remove_BCxV, -torch.inf)
 
     final_probs_BCxV = torch.softmax(logits_BCxV, dim=-1)
@@ -251,7 +253,13 @@ class Dia:
         delay_tensor = torch.tensor(delay_pattern, dtype=torch.long, device=self.device)
         max_delay_pattern = max(delay_pattern)
         self.model.eval()
-        print(f"[GEN DEBUG] Config loaded: channels={num_channels}, max_tokens={max_tokens}, check_eos={check_eos}", flush=True)
+        
+        # Determine if we are on XLA/TPU to use static KV caching
+        use_static_kv = False
+        if xm is not None and self.device.type == "xla":
+            use_static_kv = True
+            
+        print(f"[GEN DEBUG] Config: channels={num_channels}, max_tokens={max_tokens}, check_eos={check_eos}, static_kv={use_static_kv}", flush=True)
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 f"[GEN] Start generation cfg_scale={cfg_scale} temp={temperature} top_p={top_p} max_tokens={max_tokens} prompt_chars={len(text)}"
@@ -364,8 +372,8 @@ class Dia:
         eos_detected_channel_0 = False
         eos_countdown = -1
         extra_steps_after_eos = 30
-        # Make generated_BxTxC a fixed size tensor
-        # Length is either 1 + max tokens or 1 + prompt len + max tokens
+        
+        # Prepare full buffer
         generated_BxTxC = torch.cat(
             [
                 generated_BxTxC,
@@ -391,35 +399,57 @@ class Dia:
         tgt_padding_mask = (
             (generated_BxTxC[:, -1, :].unsqueeze(1) != audio_pad_value).any(dim=2).to(self.device)
         )  # [B, 1]
-        # Generated tokens are never PAD, so we use fixed mask
+        
+        # Mask for cross attention
         decoder_cross_attn_mask = self._create_attn_mask(
             tgt_padding_mask,  # Query mask [B, 1]
             src_padding_mask_BxS,  # Key mask [B, S]
             is_causal=False,
         )  # [B, 1, 1, S]
 
+        full_causal_mask = None
+        if use_static_kv:
+            # Create a full lower-triangular boolean mask [max_tokens, max_tokens]
+            full_causal_mask = torch.tril(
+                torch.ones((max_tokens, max_tokens), device=self.device, dtype=torch.bool)
+            ).unsqueeze(0).unsqueeze(0)
+
         print(f"[GEN DEBUG] Starting generation loop: {max_tokens} steps from current_step={current_step}", flush=True)
         for step in range(current_step, current_step + max_tokens):
-            tgt_ids_Bx1xC = generated_BxTxC[:, step, :].unsqueeze(1)
-            tgt_pos_Bx1 = torch.full(
-                (batch_size, 1),
-                fill_value=step,
-                dtype=torch.long,
-                device=self.device,
-            )
+            if step >= max_tokens: 
+                break 
 
+            # CRITICAL: Create tensor for step to avoid graph recompilation
+            step_tensor = torch.tensor([step], dtype=torch.long, device=self.device)
+            
+            # CRITICAL: Use index_select instead of slice [:, step, :]
+            # generated_BxTxC is [B, T, C]. Select on dim=1. Result: [B, 1, C]
+            tgt_ids_Bx1xC = torch.index_select(generated_BxTxC, 1, step_tensor)
+            
+            # CRITICAL: Expand from tensor, not using 'step' int value
+            tgt_pos_Bx1 = step_tensor.view(1, 1).expand(batch_size, 1)
+
+            # Prepare self-attention mask for this step
+            step_self_attn_mask = None
+            if use_static_kv:
+                # CRITICAL: Use index_select instead of slice
+                step_self_attn_mask = torch.index_select(full_causal_mask, 2, step_tensor)
+                
             logits_Bx1xCxV, new_cache = decode_step(
                 tgt_ids_Bx1xC=tgt_ids_Bx1xC,
                 tgt_pos_Bx1=tgt_pos_Bx1,
                 encoder_out=encoder_out,
-                self_attn_mask=None,
+                self_attn_mask=step_self_attn_mask,
                 cross_attn_mask=decoder_cross_attn_mask,
                 self_attention_cache=decoder_self_attention_cache,
                 cross_attention_cache=decoder_cross_attention_cache,
+                static_kv=use_static_kv 
             )
 
-            for i, layer_cache in enumerate(decoder_self_attention_cache):
-                layer_cache.update_cache(new_cache[i][0], new_cache[i][1])
+            # In dynamic mode (GPU/CPU), update cache explicitly
+            if not use_static_kv:
+                for i, layer_cache in enumerate(decoder_self_attention_cache):
+                    layer_cache.update_cache(new_cache[i][0], new_cache[i][1])
 
             V = self.config.model.tgt_vocab_size
             logits_last_BxCxV = logits_Bx1xCxV[:, -1, :, :]  # B, C, V
@@ -440,29 +470,37 @@ class Dia:
                 top_p=top_p,
                 use_cfg_filter=use_cfg_filter,
                 cfg_filter_top_k=cfg_filter_top_k,
-            )
+            ) # [C]
 
-            generation_step_index = step - current_step
+            # CRITICAL: Use tensor arithmetic for delay logic
             if audio_prompt_path is None:
-                pred_C = torch.where(
-                    generation_step_index >= delay_tensor,
-                    pred_C,
-                    audio_bos_value,
-                )
+                generation_step_index_tensor = step_tensor - current_step
+                is_delay_step = generation_step_index_tensor >= delay_tensor
+                pred_C = torch.where(is_delay_step, pred_C, audio_bos_value)
 
-            generated_BxTxC[:, step + 1, :] = pred_C.unsqueeze(0).expand(batch_size, -1)
+            # CRITICAL: Use scatter (out-of-place) instead of index_copy_ (in-place)
+            next_step_tensor = step_tensor + 1
+            
+            # Prepare source [B, 1, C]
+            pred_C_expanded = pred_C.unsqueeze(0).unsqueeze(1).expand(batch_size, 1, -1)
+            
+            # Prepare indices [B, 1, C] matching the shape of src
+            # We want to write to index 'next_step_tensor' along dimension 1
+            scatter_indices = next_step_tensor.view(1, 1, 1).expand(batch_size, 1, num_channels)
+
+            # Update generated_BxTxC out-of-place (returns new tensor)
+            generated_BxTxC = generated_BxTxC.scatter(1, scatter_indices, pred_C_expanded)
 
             # Force XLA to execute this step immediately to prevent graph explosion on TPU
             if xm is not None:
                 xm.mark_step()
 
-            if (generation_step_index % gen_log_interval) == 0:
+            if (step % gen_log_interval) == 0:
                 logger.info(
-                    f"[GEN] step {generation_step_index}/{max_tokens} eos_seen={eos_detected_channel_0} temp={temperature} cfg_scale={cfg_scale}"
+                    f"[GEN] step {step}/{max_tokens} temp={temperature}"
                 )
 
-            # EOS checking - disabled on TPU to avoid sync-in-loop performance bug
-            # When check_eos=False, we generate fixed length quickly instead of checking for early stopping
+            # EOS checking (Disabled on TPU via check_eos=False for speed)
             if check_eos:
                 if not eos_detected_channel_0 and pred_C[0] == audio_eos_value:
                     eos_detected_channel_0 = True
@@ -479,14 +517,14 @@ class Dia:
                     if eos_countdown == 0:
                         break
 
-            generation_step_index = step - current_step + 1
-
         output_codes = generated_BxTxC[:, prompt_len_inc_bos : step + 1, :]
 
         generated_codes = output_codes[0]
+        print(f"[GEN DEBUG] Generation loop complete. tokens={generated_codes.shape[0]}, calling codebook_to_audio...", flush=True)
         logger.info(f"[GEN] Completed generation tokens={generated_codes.shape[0]} eos_seen={eos_detected_channel_0}")
 
         audio = codebook_to_audio(
             generated_codes.transpose(1, 0), self.dac_model, delay_pattern, B=1, T=max_tokens, C=num_channels
         )
+        print(f"[GEN DEBUG] codebook_to_audio returned, audio shape={audio.shape}", flush=True)
         return audio.squeeze().cpu().numpy()

@@ -219,7 +219,6 @@ def revert_audio_delay(
 
 
 @torch.no_grad()
-@torch.inference_mode()
 def decode(
     model,
     audio_codes,
@@ -273,8 +272,8 @@ def codebook_to_audio(generated_codes: torch.Tensor, model, delay_pattern, B=1, 
     if num_invalid > 0:
         print(f"Warning: Clamping {num_invalid} indices outside range [{min_valid_index}, {max_valid_index}] to 0.")
 
-    # Clamp invalid values to 0 in-place
-    codebook[invalid_mask] = 0
+    # Clamp invalid values to 0 (out-of-place to avoid inference tensor issues)
+    codebook = torch.where(invalid_mask, torch.zeros_like(codebook), codebook)
 
     total_codebooks = codebook.shape[1]
     if total_codebooks == 9:

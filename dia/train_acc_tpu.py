@@ -101,6 +101,7 @@ def _save_and_log_audio(audio, audio_path: Path, wandb_key: str, caption: str, a
         arr = arr.T
     audio_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(audio_path, arr, EVAL_SAMPLE_RATE)
+    print(f"[DEMO] ✓ Saved audio: {audio_path} (shape={arr.shape})", flush=True)
     logger.info(f"Saved demo audio: {audio_path}")
     audio_samples[wandb_key] = wandb.Audio(arr, sample_rate=EVAL_SAMPLE_RATE, caption=caption)
 
@@ -464,6 +465,8 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
                             # ALL ranks run generation (FSDP requires all processes to participate)
                             # check_eos=False to avoid TPU sync-in-loop performance bug
                             audio = dia_gen.generate(text=prompt, cfg_scale=cfg_s, temperature=temp, top_p=EVAL_TOP_P, check_eos=False)
+                            if accelerator.is_main_process:
+                                print(f"[DEMO] Generation returned for {name}, temp={temp}, audio type={type(audio)}", flush=True)
                             
                             # Only main process saves to disk and logs to wandb
                             if accelerator.is_main_process:
@@ -472,6 +475,7 @@ def generate_demos(model, dia_cfg, train_cfg, global_step, accelerator):
                                                  prompt, audio_samples)
                         except Exception as e:
                             if accelerator.is_main_process:
+                                print(f"[DEMO] ✗ Generation FAILED for {name}, temp={temp}: {e}", flush=True)
                                 logger.warning(f"Demo generation failed for {name}, temp={temp}: {e}")
                         else:
                             if accelerator.is_main_process:

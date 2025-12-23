@@ -543,11 +543,16 @@ def run_eval(model, val_loader, dia_cfg, global_step, accelerator):
                     loss += w * (masked_loss / mask_sum)
                 
                 loss = loss / sum(channel_weights)
-                eval_losses.append(loss.detach())
+                
+            # CRITICAL: Force XLA to materialize the loss before reading
+            xm.mark_step()
+            eval_losses.append(loss.detach().item())
     
     # Gather losses across all processes
     if eval_losses:
-        local_avg = torch.stack(eval_losses).mean()
+        # Convert to tensor for gathering (losses are already scalars now)
+        local_avg = torch.tensor(sum(eval_losses) / len(eval_losses), device=accelerator.device)
+        xm.mark_step()  # Ensure tensor is materialized before gather
         all_losses = accelerator.gather(local_avg)
         avg_loss = all_losses.mean().item()
         
@@ -580,6 +585,8 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        warmup_steps=args.warmup_steps,
+        unconditional_frac=args.unconditional_frac,
         output_dir=args.output_dir,
         seed=args.seed,
         demo_every=args.demo_every,
@@ -730,6 +737,8 @@ def get_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps for LR scheduler")
+    parser.add_argument("--unconditional_frac", type=float, default=0.15, help="Fraction of batches to train unconditionally (for CFG)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb_project", type=str, default="dia-fsdp")
     parser.add_argument("--use_sliding_window", action="store_true")

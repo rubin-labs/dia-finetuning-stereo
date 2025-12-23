@@ -1,0 +1,39 @@
+{
+  "experiment_id": "frontier_test",
+  "description": "Quick test run to verify model learns (50 epochs, ~21.5K steps)",
+  
+  "data": {
+    "dataset_size": 55356,
+    "steps_per_epoch": 431,
+    "effective_batch_size": 128
+  },
+  
+  "training": {
+    "batch_size": 8,
+    "epochs": 50,
+    "total_steps": 21550,
+    "learning_rate": 2e-4,
+    "warmup_steps": 1000,
+    "warmup_pct": 4.6,
+    "unconditional_frac": 0.15,
+    "weight_decay": 0.1,
+    "grad_clip_max_norm": 1.0
+  },
+  
+  "checkpointing": {
+    "save_step": 5000,
+    "keep_last_n": 3
+  },
+  
+  "evaluation": {
+    "eval_every": 431,
+    "demo_every": 2155
+  },
+  
+  "notes": {
+    "purpose": "Verify training pipeline works, loss decreases, model can generate coherent audio",
+    "expected_final_loss": "Should see loss drop from ~7 to ~4-5 range",
+    "estimated_time_hours": "~6-12 hours on 4x TPU v4-32"
+  }
+}
+

@@ -58,6 +58,31 @@ use_cpu: 'no'
 YAML
 
 # --- 6. RUN TRAINING ---
+# ============================================================================
+# TRAINING PARAMETER DESIGN (1.65B model, 55K samples, 431 steps/epoch)
+# ============================================================================
+#
+# KEY CALCULATIONS:
+#   - Effective batch size: ~128 samples/step (8 × 16 data-parallel processes)
+#   - Dataset: 55,356 samples → 431 steps/epoch
+#   - Total steps at 500 epochs: 215,500 steps
+#   - Total steps at 1000 epochs: 431,000 steps
+#
+# LEARNING RATE SCALING (sqrt rule for transformers):
+#   - Base LR for batch=256: ~3e-4
+#   - For batch=128: ~2e-4 (conservative) to 3e-4 (aggressive)
+#
+# WARMUP (1-5% of total training):
+#   - Conservative: 4,000 steps (~10 epochs, ~2% of 200K steps)
+#   - Aggressive: 2,000 steps (~5 epochs, ~1% of 200K steps)
+#
+# SCHEDULE OPTIONS:
+#   1. FAST TEST (50 epochs): ~21,550 steps - see if model learns
+#   2. MEDIUM RUN (200 epochs): ~86,200 steps - solid baseline
+#   3. FULL TRAINING (500+ epochs): 215K+ steps - frontier quality
+#
+# ============================================================================
+
 python3 -m accelerate.commands.launch \
     --config_file tpu_config.yaml \
     --main_process_ip=$MASTER_ADDR \
@@ -70,9 +95,11 @@ python3 -m accelerate.commands.launch \
     --preencoded_dir /home/olivercamp/data_local/encoded_audio \
     --output_dir ./checkpoints \
     --batch_size 8 \
-    --learning_rate 1e-4 \
-    --epochs 1000 \
+    --learning_rate 2e-4 \
+    --warmup_steps 1000 \
+    --unconditional_frac 0.15 \
+    --epochs 50 \
     --wandb_project dia-tpu \
-    --demo_every 431 \
-    --eval_every 30 \
+    --demo_every 2155 \
+    --eval_every 431 \
     2>&1 | tee train_fsdp.log

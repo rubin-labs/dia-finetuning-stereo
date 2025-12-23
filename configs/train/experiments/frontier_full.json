@@ -1,0 +1,39 @@
+{
+  "experiment_id": "frontier_full",
+  "description": "Full frontier training run (500 epochs, ~215K steps)",
+  
+  "data": {
+    "dataset_size": 55356,
+    "steps_per_epoch": 431,
+    "effective_batch_size": 128
+  },
+  
+  "training": {
+    "batch_size": 8,
+    "epochs": 500,
+    "total_steps": 215500,
+    "learning_rate": 2e-4,
+    "warmup_steps": 4000,
+    "warmup_pct": 1.9,
+    "unconditional_frac": 0.15,
+    "weight_decay": 0.1,
+    "grad_clip_max_norm": 1.0
+  },
+  
+  "checkpointing": {
+    "save_step": 20000,
+    "keep_last_n": 5
+  },
+  
+  "evaluation": {
+    "eval_every": 2155,
+    "demo_every": 8620
+  },
+  
+  "notes": {
+    "purpose": "Full convergence training for best quality",
+    "expected_final_loss": "Should reach ~1.5-2.5 loss range",
+    "estimated_time_hours": "~72-120 hours on 4x TPU v4-32"
+  }
+}
+

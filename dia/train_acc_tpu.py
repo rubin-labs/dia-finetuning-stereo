@@ -620,7 +620,6 @@ def main():
     if accelerator.is_main_process:
         print("[DEBUG] DiaModel created.", flush=True)
     
-    # Always train from scratch - no pretrained weights
     if accelerator.is_main_process:
         print("[TRAIN] Training from scratch (no pretrained weights)", flush=True)
 
@@ -660,6 +659,10 @@ def main():
             print("[DEBUG] val_loader prepared.", flush=True)
 
     global_step = 0
+    log_interval = 10  # Log every N steps
+    accumulated_loss = 0.0
+    loss_count = 0
+    
     if accelerator.is_main_process:
         print("[DEBUG] Setup complete. global_step=0", flush=True)
 
@@ -668,13 +671,25 @@ def main():
         for batch in tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"E{epoch+1}"):
             loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator)
             
-            # CRITICAL: Force XLA to execute pending ops after each step
+            # CRITICAL: Force XLA to execute pending ops BEFORE reading the loss value
+            # This ensures the loss tensor is materialized and not a stale cached value
             xm.mark_step()
+            
+            # Accumulate loss (now safe to read after mark_step)
+            accumulated_loss += loss.item()
+            loss_count += 1
 
-            # Log every 10 steps to reduce sync overhead while debugging
-            if global_step % 10 == 0:
+            # Log averaged loss every N steps for smoother, more meaningful metrics
+            if (global_step + 1) % log_interval == 0:
+                avg_loss = accumulated_loss / loss_count
                 if accelerator.is_main_process:
-                    accelerator.log({"train_loss": loss.item(), "lr": sched.get_last_lr()[0]}, step=global_step)
+                    accelerator.log({
+                        "train_loss": avg_loss,
+                        "lr": sched.get_last_lr()[0]
+                    }, step=global_step)
+                # Reset accumulators
+                accumulated_loss = 0.0
+                loss_count = 0
             
             global_step += 1
             

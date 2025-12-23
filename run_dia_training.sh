@@ -73,6 +73,6 @@ python3 -m accelerate.commands.launch \
     --learning_rate 1e-4 \
     --epochs 1000 \
     --wandb_project dia-tpu \
-    --demo_every 100 \
-    --eval_every 10 \
+    --demo_every 431 \
+    --eval_every 30 \
     2>&1 | tee train_fsdp.log

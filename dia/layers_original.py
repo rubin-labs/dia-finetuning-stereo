@@ -8,6 +8,7 @@ from torch.nn import RMSNorm
 
 from .config import DiaConfig
 
+
 def _normalize_axes(axes: tuple[int, ...], ndim: int) -> tuple[int, ...]:
     return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
 
@@ -127,6 +128,7 @@ class MlpBlock(nn.Module):
             dtype=compute_dtype,
             weight_dtype=weight_dtype,
         )
+
         self.activation_fn_0 = get_activation_fn(activations[0])  # silu
         self.activation_fn_1 = get_activation_fn(activations[1])  # linear
 
@@ -206,9 +208,9 @@ class RotaryEmbedding(nn.Module):
 
 
 class KVCache:
-    def __init__(self, num_heads, max_len, head_dim, device, batch_size=2, k=None, v=None):
-        self.k = torch.zeros((batch_size, num_heads, max_len, head_dim), device=device) if k is None else k
-        self.v = torch.zeros((batch_size, num_heads, max_len, head_dim), device=device) if v is None else v
+    def __init__(self, num_heads, max_len, head_dim, device, k=None, v=None):
+        self.k = torch.zeros((2, num_heads, max_len, head_dim), device=device) if k is None else k
+        self.v = torch.zeros((2, num_heads, max_len, head_dim), device=device) if v is None else v
         self.current_idx = 0
         self.max_len = max_len
 
@@ -221,25 +223,6 @@ class KVCache:
             attn_k = torch.cat((past_k, current_k), dim=2)
             attn_v = torch.cat((past_v, current_v), dim=2)
             return attn_k, attn_v
-
-    def get_kv_for_attention_static(self, current_k, current_v):
-        """
-        TPU-optimized: Updates cache in-place and returns FULL cache with static shape.
-        This avoids dynamic slicing/concatenation that causes XLA recompilation.
-        The caller must use an attention mask to ignore positions beyond current_idx+1.
-        """
-        # Create tensor index to ensure XLA treats this as a dynamic input, not a constant
-        # This prevents recompiling the graph for every single index value
-        idx_tensor = torch.tensor([self.current_idx], dtype=torch.long, device=self.k.device)
-        
-        # Use index_copy_ instead of slicing assignment
-        # self.k shape: (B, H, S, D) - update along dim 2
-        self.k.index_copy_(2, idx_tensor, current_k)
-        self.v.index_copy_(2, idx_tensor, current_v)
-        
-        self.current_idx += 1
-        # Return full cache (static shape: batch, heads, max_len, head_dim)
-        return self.k, self.v
 
     def update_cache(self, k, v):
         assert self.current_idx < self.max_len
@@ -332,7 +315,6 @@ class Attention(nn.Module):
         attn_mask: torch.Tensor | None = None,  # None in Decoder Self Attention, Valid mask in Others
         cache: KVCache | None = None,  # None in Encoder, KVCache in Decoder
         prefill: bool = False,  # True only when prefilling KV Cache
-        static_kv: bool = False,  # TPU: use static cache shapes to avoid recompilation
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """
         Performs attention calculation with optional KV caching.
@@ -343,10 +325,9 @@ class Attention(nn.Module):
             q_positions: Positions for queries (B, T).
             kv_positions: Positions for keys/values (B, S). If None, uses q_positions.
             deterministic: If True, disable dropout.
-            attn_mask: Attention mask. For static_kv=True, must mask unused cache positions.
+            attn_mask: Attention mask.
             cache: KVCache.
             prefill: If True, use prefill mode.
-            static_kv: If True, use static KV cache (returns full cache, caller must mask).
 
         Returns:
             A tuple containing:
@@ -403,10 +384,7 @@ class Attention(nn.Module):
                 if prefill:
                     attn_k, attn_v = Xk_BxNxSxH, Xv_BxNxSxH
                     cache.prefill_kv(attn_k, attn_v)
-                # TPU static mode: use full cache with static shapes
-                elif static_kv:
-                    attn_k, attn_v = cache.get_kv_for_attention_static(Xk_BxNxSxH, Xv_BxNxSxH)
-                # In decode step, we add current K/V to cache step by step (dynamic shapes)
+                # In decode step, we add current K/V to cache step by step
                 else:
                     new_kv_cache = Xk_BxNxSxH, Xv_BxNxSxH
                     attn_k, attn_v = cache.get_kv_for_attention(Xk_BxNxSxH, Xv_BxNxSxH)
@@ -417,7 +395,7 @@ class Attention(nn.Module):
             attn_v,
             attn_mask=attn_mask,
             dropout_p=self.dropout_rate if not deterministic else 0.0,
-            # Use default scale = 1/sqrt(head_dim) for proper attention scaling
+            scale=1.0,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()  # (B, T, N, H)
@@ -620,7 +598,6 @@ class DecoderLayer(nn.Module):
         self_attn_cache: KVCache,
         cross_attn_cache: KVCache,
         prefill: bool = False,
-        static_kv: bool = False,  # TPU: use static cache shapes
     ) -> torch.Tensor:
         residual = x
         x_norm = self.pre_sa_norm(x)
@@ -634,7 +611,6 @@ class DecoderLayer(nn.Module):
             attn_mask=self_attn_mask,  # (2, 1, 1, S_max)
             cache=self_attn_cache,
             prefill=prefill,
-            static_kv=static_kv,
         )
 
         x = residual + sa_out
@@ -727,7 +703,6 @@ class Decoder(nn.Module):
                     max_len,
                     cross_attn_module.head_dim,
                     k.device,
-                    batch_size=k.shape[0],
                     k=k,
                     v=v,
                 )
@@ -740,25 +715,19 @@ class Decoder(nn.Module):
         tgt_ids_Bx1xC: torch.Tensor,  # [B, 1, C]
         tgt_pos_Bx1: torch.Tensor,  # [B, 1]
         encoder_out: torch.Tensor,  # [B, S, E]
-        self_attn_mask: Any,  # None for dynamic mode, mask for static_kv mode
+        self_attn_mask: Any,  # None
         cross_attn_mask: torch.Tensor,  # [B, 1, 1, S]
         self_attention_cache: list[KVCache],
         cross_attention_cache: list[KVCache],
-        static_kv: bool = False,  # TPU: use static cache shapes
     ) -> torch.Tensor:
         """
         Performs a single decoding step, managing KV caches layer by layer.
-
-        Args:
-            static_kv: If True, use static KV cache (for TPU). Requires self_attn_mask
-                       to be provided to mask unused cache positions.
 
         Returns:
             A tuple containing:
             - logits_Bx1xCV: The final output logits for the current step (B, 1, C*V), cast to float32.
         """
-        if not static_kv:
-            assert self_attn_mask is None, "Self-attention mask should be None in dynamic mode"
+        assert self_attn_mask is None, "Self-attention mask should be None, kept for pattern"
 
         x = None
         for i in range(self.num_channels):
@@ -777,11 +746,10 @@ class Decoder(nn.Module):
                 src_positions=None,  # CA KV is already computed
                 tgt_positions=tgt_pos_Bx1,  # (2, 1)
                 deterministic=True,
-                self_attn_mask=self_attn_mask,  # None for dynamic, mask for static_kv
+                self_attn_mask=None,
                 cross_attn_mask=cross_attn_mask,
                 self_attn_cache=self_cache,
                 cross_attn_cache=cross_cache,
-                static_kv=static_kv,
             )
             new_cache.append(new_kv_cache)
 
@@ -868,17 +836,12 @@ class DiaModel(nn.Module):
         self.config = config
         self.encoder = Encoder(config)
         self.decoder = Decoder(config)
-        self._init_weights()
+        #self._init_weights()
 
     
     def _init_weights(self):
         for module in self.modules():
-            if isinstance(module, DenseGeneral):
-                # DenseGeneral uses torch.empty() so must be explicitly initialized
-                torch.nn.init.xavier_uniform_(module.weight)
-                if hasattr(module, 'bias') and module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
@@ -920,7 +883,6 @@ class DiaModel(nn.Module):
                 max_len=T,
                 head_dim=self.decoder.layers[i].self_attention.head_dim,
                 device=device,
-                batch_size=B,
             )
             for i in range(self.decoder.num_layers)
         ]

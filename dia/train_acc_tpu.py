@@ -74,9 +74,8 @@ EVAL_TOP_P = 0.95
 EVAL_TEMPERATURES = [0.5, 1.0]
 EVAL_SAMPLE_RATE = 44100
 EVAL_AUDIO_DIR = "./audio_demos"
-GRAD_CLIP_MAX_NORM = 1.0 # Lowered slightly for FSDP stability
 ENTROPY_LOG_INTERVAL = 50
-CODEBOOK_WEIGHTS = [1.0] * 9
+CODEBOOK_WEIGHTS = [4.0] + [1.0] * 8  # 4× weight on first channel (semantic/content codebook)
 _DAC_MODEL_CACHE = {}
 
 @contextmanager
@@ -126,6 +125,8 @@ class TrainConfig:
     tag_dropout: float = 0.0
     tag_limit: Optional[int] = None
     no_decay_embed: bool = False
+    keep_last_n: Optional[int] = None
+    grad_clip_max_norm: float = 1.0
 
 # =============================================================================
 # UTILS
@@ -313,9 +314,43 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
         
     return train_loader, val_loader
 
+
+def setup_optimizer_and_scheduler(model, train_loader, train_cfg: TrainConfig):
+    """Setup optimizer and learning rate scheduler.
+    
+    Uses standard AdamW (TPU-compatible) with cosine schedule.
+    Scheduler steps are scaled by grad_accum_steps to match optimizer steps.
+    """
+    opt = optim.AdamW(model.parameters(), lr=train_cfg.learning_rate)
+    
+    # Determine steps per epoch: prefer len(), else use attached attribute
+    try:
+        steps_per_epoch = len(train_loader)
+    except TypeError:
+        if hasattr(train_loader, 'steps_per_epoch'):
+            steps_per_epoch = train_loader.steps_per_epoch
+        else:
+            raise RuntimeError("Cannot determine steps_per_epoch for streaming loader")
+    
+    total_training_steps = steps_per_epoch * train_cfg.epochs
+    sched = get_scheduler(
+        'cosine', opt,
+        num_warmup_steps=train_cfg.warmup_steps / train_cfg.grad_accum_steps,
+        num_training_steps=total_training_steps / train_cfg.grad_accum_steps
+    )
+    return opt, sched, steps_per_epoch
+
 # =============================================================================
 # TRAIN STEP
 # =============================================================================
+
+def compute_grad_norm(model):
+    """Compute total gradient norm across all parameters."""
+    total_norm_sq = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total_norm_sq += p.grad.data.float().pow(2).sum()
+    return total_norm_sq.sqrt()
 
 def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator):
     
@@ -342,15 +377,14 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accele
         logits = logits[:, :-1]
         target = batch['tgt_tokens'][:, 1:]
         
-        # Loss Masking (Safe for TPU/XLA)
+        # Loss Masking (Safe for TPU/XLA) - time-based mask only, EOS included in loss
         mask = torch.arange(target.shape[1], device=target.device).unsqueeze(0) < (batch['tgt_lens'].unsqueeze(1) - 1)
-        mask = mask.unsqueeze(-1).expand_as(target)
-        audio_token_mask = (target >= 0) & (target <= 1023)
-        final_mask = (mask & audio_token_mask).float()
+        final_mask = mask.unsqueeze(-1).expand_as(target).float()
         
         loss = 0.0
-        # Assuming simplified weights for stability
-        channel_weights = [1.0] * target.shape[2]
+        # apply 4× weight on first channel, 1× on others
+        C = target.shape[2]
+        channel_weights = [4.0] + [1.0] * (C - 1)
         
         for c, w in enumerate(channel_weights):
             # CHANGE: Cast logits to float() (FP32) before loss to prevent BF16 overflow
@@ -369,13 +403,29 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accele
     # Backward & Step
     accelerator.backward(loss)
     
+    # Initialize grad norm tracking
+    pre_clip_grad_norm = None
+    post_clip_grad_norm = None
+    
     if (global_step + 1) % train_cfg.grad_accum_steps == 0:
-        accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+        # Compute gradient norm BEFORE clipping
+        pre_clip_grad_norm = compute_grad_norm(model)
+        
+        # Clip gradients
+        accelerator.clip_grad_norm_(model.parameters(), train_cfg.grad_clip_max_norm)
+        
+        # Compute gradient norm AFTER clipping
+        post_clip_grad_norm = compute_grad_norm(model)
+        
         opt.step()
         sched.step()
         opt.zero_grad()
     
-    return loss.detach()
+    return {
+        'loss': loss.detach(),
+        'pre_clip_grad_norm': pre_clip_grad_norm,
+        'post_clip_grad_norm': post_clip_grad_norm,
+    }
 
 # =============================================================================
 # DEMO GENERATION
@@ -523,14 +573,14 @@ def run_eval(model, val_loader, dia_cfg, global_step, accelerator):
                 logits = logits.float()
                 target = batch['tgt_tokens'][:, 1:]
                 
-                # Masking
+                # Masking (time-based only, EOS included - matches train_step)
                 mask = torch.arange(target.shape[1], device=target.device).unsqueeze(0) < (batch['tgt_lens'].unsqueeze(1) - 1)
-                mask = mask.unsqueeze(-1).expand_as(target)
-                audio_token_mask = (target >= 0) & (target <= 1023)
-                final_mask = (mask & audio_token_mask).float()
+                final_mask = mask.unsqueeze(-1).expand_as(target).float()
                 
                 loss = 0.0
-                channel_weights = [1.0] * target.shape[2]
+                # apply 4× weight on first channel, 1× on others
+                C_e = target.shape[2]
+                channel_weights = [4.0] + [1.0] * (C_e - 1)
                 
                 for c, w in enumerate(channel_weights):
                     l_c = logits[:, :, c, :].flatten(0, 1)
@@ -591,6 +641,10 @@ def main():
         seed=args.seed,
         demo_every=args.demo_every,
         eval_every=args.eval_every,
+        keep_last_n=args.keep_last_n,
+        grad_clip_max_norm=args.grad_clip_max_norm,
+        weight_decay=args.weight_decay,
+        save_step=args.save_step,
     )
     
     # WandB Init (Accelerate handles main process check internally for loggers usually, but we are explicit)
@@ -630,26 +684,11 @@ def main():
     if accelerator.is_main_process:
         print("[TRAIN] Training from scratch (no pretrained weights)", flush=True)
 
-    # Optimizer
-    # Separate params for decay
+    # Optimizer & Scheduler
     if accelerator.is_main_process:
         print("[DEBUG] Setting up optimizer...", flush=True)
-    decay, no_decay = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad: continue
-        if "bias" in name or "norm" in name:
-            no_decay.append(p)
-        else:
-            decay.append(p)
-            
-    opt = optim.AdamW([
-        {"params": decay, "weight_decay": train_cfg.weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ], lr=train_cfg.learning_rate)
-    
-    steps_per_epoch = len(train_loader)
+    opt, sched, steps_per_epoch = setup_optimizer_and_scheduler(model, train_loader, train_cfg)
     total_steps = steps_per_epoch * train_cfg.epochs
-    sched = get_scheduler('cosine', opt, num_warmup_steps=train_cfg.warmup_steps, num_training_steps=total_steps)
     if accelerator.is_main_process:
         print(f"[DEBUG] Optimizer ready. steps_per_epoch={steps_per_epoch}, total_steps={total_steps}", flush=True)
 
@@ -673,10 +712,16 @@ def main():
     if accelerator.is_main_process:
         print("[DEBUG] Setup complete. global_step=0", flush=True)
 
+    # Track gradient norms for logging
+    accumulated_pre_clip_norm = 0.0
+    accumulated_post_clip_norm = 0.0
+    grad_norm_count = 0
+
     for epoch in range(train_cfg.epochs):
         model.train()
         for batch in tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"E{epoch+1}"):
-            loss = train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator)
+            step_output = train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator)
+            loss = step_output['loss']
             
             # CRITICAL: Force XLA to execute pending ops BEFORE reading the loss value
             # This ensures the loss tensor is materialized and not a stale cached value
@@ -685,16 +730,35 @@ def main():
             # Accumulate loss (now safe to read after mark_step)
             accumulated_loss += loss.item()
             loss_count += 1
+            
+            # Accumulate gradient norms (only when available - on grad accum boundaries)
+            if step_output['pre_clip_grad_norm'] is not None:
+                accumulated_pre_clip_norm += step_output['pre_clip_grad_norm'].item()
+                accumulated_post_clip_norm += step_output['post_clip_grad_norm'].item()
+                grad_norm_count += 1
 
             # Log averaged loss every N steps for smoother, more meaningful metrics
             if (global_step + 1) % log_interval == 0:
                 avg_loss = accumulated_loss / loss_count
+                log_dict = {
+                    "train_loss": avg_loss,
+                    "lr": sched.get_last_lr()[0]
+                }
+                
+                # Add gradient norm metrics if we have any
+                if grad_norm_count > 0:
+                    avg_pre_clip = accumulated_pre_clip_norm / grad_norm_count
+                    avg_post_clip = accumulated_post_clip_norm / grad_norm_count
+                    log_dict["grad_norm_pre_clip"] = avg_pre_clip
+                    log_dict["grad_norm_post_clip"] = avg_post_clip
+                    # Reset grad norm accumulators
+                    accumulated_pre_clip_norm = 0.0
+                    accumulated_post_clip_norm = 0.0
+                    grad_norm_count = 0
+                
                 if accelerator.is_main_process:
-                    accelerator.log({
-                        "train_loss": avg_loss,
-                        "lr": sched.get_last_lr()[0]
-                    }, step=global_step)
-                # Reset accumulators
+                    accelerator.log(log_dict, step=global_step)
+                # Reset loss accumulators
                 accumulated_loss = 0.0
                 loss_count = 0
             
@@ -710,6 +774,9 @@ def main():
                     save_path = train_cfg.output_dir / f"ckpt_step{global_step}"
                     accelerator.save_state(output_dir=save_path) 
                     logger.info(f"Saved checkpoint to {save_path}")
+                    # Cleanup old checkpoints if configured
+                    if train_cfg.keep_last_n is not None:
+                        cleanup_old_checkpoints(train_cfg.output_dir, train_cfg.keep_last_n)
             
             # Demo generation
             if train_cfg.demo_every and global_step % train_cfg.demo_every == 0 and global_step > 0:
@@ -744,6 +811,10 @@ def get_args():
     parser.add_argument("--use_sliding_window", action="store_true")
     parser.add_argument("--demo_every", type=int, default=None, help="Generate demo audio every N steps")
     parser.add_argument("--eval_every", type=int, default=None, help="Run evaluation every N steps")
+    parser.add_argument("--keep_last_n", type=int, default=None, help="Keep only the last N checkpoints, delete older ones")
+    parser.add_argument("--grad_clip_max_norm", type=float, default=1.0, help="Maximum gradient norm for clipping")
+    parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay for optimizer")
+    parser.add_argument("--save_step", type=int, default=2000, help="Save checkpoint every N steps")
     return parser.parse_args()
 
 if __name__ == "__main__":

@@ -29,6 +29,32 @@ echo "------------------------------------------------"
 
 cd ~/dia-finetuning-stereo || exit
 
+# --- 4a. MOUNT GCS BUCKET (if not already mounted) ---
+BUCKET_NAME="rubin-dia-dataset"
+BUCKET_MOUNT="/home/olivercamp/bucket_mount"
+
+# Check if bucket is already mounted
+if ! mountpoint -q "$BUCKET_MOUNT" 2>/dev/null; then
+    echo "Mounting GCS bucket: $BUCKET_NAME to $BUCKET_MOUNT"
+    mkdir -p "$BUCKET_MOUNT"
+    
+    # Check if gcsfuse is installed
+    if ! command -v gcsfuse &> /dev/null; then
+        echo "Installing gcsfuse..."
+        export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+        curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt $GCSFUSE_REPO main" | sudo tee /etc/apt/sources.list.d/gcsfuse.list
+        sudo apt-get update
+        sudo apt-get install -y gcsfuse
+    fi
+    
+    # Mount the bucket
+    gcsfuse --implicit-dirs "$BUCKET_NAME" "$BUCKET_MOUNT"
+    echo "Bucket mounted successfully"
+else
+    echo "Bucket already mounted at $BUCKET_MOUNT"
+fi
+
 # --- 4b. XLA PERSISTENT CACHE (FIXED) ---
 # CRITICAL: Unset old flags that cause crashes
 unset TF_XLA_FLAGS
@@ -59,12 +85,12 @@ YAML
 
 # --- 6. RUN TRAINING ---
 # ============================================================================
-# TRAINING PARAMETER DESIGN (1.65B model, 55K samples, 431 steps/epoch)
+# TRAINING PARAMETER DESIGN (1.65B model, ~88.7K samples)
 # ============================================================================
 #
 # KEY CALCULATIONS:
 #   - Effective batch size: ~128 samples/step (8 × 16 data-parallel processes)
-#   - Dataset: 55,356 samples → 431 steps/epoch
+#   - Dataset: ~88,663 samples → ~693 steps/epoch (at batch_size=8, grad_accum=1)
 #   - Total steps at 500 epochs: 215,500 steps
 #   - Total steps at 1000 epochs: 431,000 steps
 #
@@ -92,7 +118,7 @@ python3 -m accelerate.commands.launch \
     --num_processes=32 \
     -m dia.train_acc_tpu \
     --config configs/architecture/experiments/20251127_dia_010_gpu_refactor_scratch_dataset_model.json \
-    --preencoded_dir /home/olivercamp/data_local/encoded_audio \
+    --preencoded_dir /home/olivercamp/bucket_mount/preencoded/SAVING80KENCODEDAUDIOS \
     --output_dir ./checkpoints \
     --batch_size 8 \
     --learning_rate 2e-4 \
@@ -102,4 +128,8 @@ python3 -m accelerate.commands.launch \
     --wandb_project dia-tpu \
     --demo_every 2155 \
     --eval_every 431 \
+    --weight_decay 0.1 \
+    --grad_clip_max_norm 1.0 \
+    --save_step 5000 \
+    --keep_last_n 3 \
     2>&1 | tee train_fsdp.log

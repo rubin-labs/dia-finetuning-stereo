@@ -20,6 +20,7 @@ import random
 import re
 import warnings
 import time
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,8 +66,8 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 TEST_PROMPTS = {
-    "piano_ambient": "piano, pads, ambient, cinematic, melancholic, peaceful, reflective, instrumental",
-    "dark": "cinematic, suspenseful, dark, energetic, mysterious, strings, bells, bass"
+    "trap melodic": "trap, melodic, bass, drums, synth",
+    "hip hop": "hip hop, rap",
 }
 EVAL_CFG_SCALE = 4.0
 EVAL_CFG_SCALE_UNCOND = 0.0
@@ -382,9 +383,9 @@ def train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accele
         final_mask = mask.unsqueeze(-1).expand_as(target).float()
         
         loss = 0.0
-        # apply 4× weight on first channel, 1× on others
+        # equal weight on all channels (better for music - learn full spectrum)
         C = target.shape[2]
-        channel_weights = [4.0] + [1.0] * (C - 1)
+        channel_weights = [1.0] + [1.0] * (C - 1)
         
         for c, w in enumerate(channel_weights):
             # CHANGE: Cast logits to float() (FP32) before loss to prevent BF16 overflow
@@ -578,9 +579,9 @@ def run_eval(model, val_loader, dia_cfg, global_step, accelerator):
                 final_mask = mask.unsqueeze(-1).expand_as(target).float()
                 
                 loss = 0.0
-                # apply 4× weight on first channel, 1× on others
+                # equal weight on all channels (better for music - learn full spectrum)
                 C_e = target.shape[2]
-                channel_weights = [4.0] + [1.0] * (C_e - 1)
+                channel_weights = [1.0] + [1.0] * (C_e - 1)
                 
                 for c, w in enumerate(channel_weights):
                     l_c = logits[:, :, c, :].flatten(0, 1)
@@ -620,6 +621,7 @@ def run_eval(model, val_loader, dia_cfg, global_step, accelerator):
 
 def main():
     # Parse args inside main() so Accelerate's TPU launcher can call it without arguments
+    print("[DEBUG] Python script starting...", flush=True)
     args = get_args()
     
     # Initialize Accelerator with BF16 and FSDP awareness
@@ -659,8 +661,21 @@ def main():
     # Dataset
     if accelerator.is_main_process:
         print("[DEBUG] Loading dataset...", flush=True)
+    
+    dataset = None
     if args.preencoded_dir:
-        dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, args.use_sliding_window)
+        # Optimization: Load on main process first to generate cache and avoid GCS thundering herd
+        if accelerator.is_main_process:
+            print("[DEBUG] Main process scanning dataset...", flush=True)
+            dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, args.use_sliding_window)
+        
+        # Wait for main process to finish scanning/caching
+        accelerator.wait_for_everyone()
+        
+        if not accelerator.is_main_process:
+            print("[DEBUG] Worker process loading dataset from cache...", flush=True)
+            dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, args.use_sliding_window)
+            
     elif args.audio_folder:
         # Load CPU DAC for encoding in dataloaders
         dac_model = dac.DAC.load(dac.utils.download()).eval().to('cpu')
@@ -711,6 +726,7 @@ def main():
     
     if accelerator.is_main_process:
         print("[DEBUG] Setup complete. global_step=0", flush=True)
+        print("[DEBUG] STARTING TRAINING LOOP - VERIFYING LOGGING", flush=True)
 
     # Track gradient norms for logging
     accumulated_pre_clip_norm = 0.0
@@ -720,9 +736,16 @@ def main():
     for epoch in range(train_cfg.epochs):
         model.train()
         for batch in tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"E{epoch+1}"):
+            # Debug: Unconditional print for first 20 steps to trace execution
+            if accelerator.is_main_process and global_step < 20:
+                 print(f"[DEBUG] Step {global_step}: Batch loaded. Starting training step...", flush=True)
+
             step_output = train_step(model, batch, dia_cfg, train_cfg, opt, sched, global_step, accelerator)
             loss = step_output['loss']
             
+            if accelerator.is_main_process and global_step < 20:
+                 print(f"[DEBUG] Step {global_step}: train_step finished. Waiting for XLA mark_step...", flush=True)
+
             # CRITICAL: Force XLA to execute pending ops BEFORE reading the loss value
             # This ensures the loss tensor is materialized and not a stale cached value
             xm.mark_step()
@@ -764,16 +787,61 @@ def main():
             
             global_step += 1
             
+            if accelerator.is_main_process and global_step < 20:
+                 print(f"[DEBUG] Step {global_step}: Computation done. Checking save condition...", flush=True)
+
             # Save
             if global_step % train_cfg.save_step == 0:
-                accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
-                    # FSDP saving requires unwrapping or special state dict policy
-                    # Accelerate handles this via save_state or unwrap_model depending on config
-                    # Standard compliant way for FSDP:
-                    save_path = train_cfg.output_dir / f"ckpt_step{global_step}"
-                    accelerator.save_state(output_dir=save_path) 
+                    print(f"[DEBUG] Step {global_step}: Entering save block. Waiting for everyone...", flush=True)
+                t_wait_start = time.perf_counter()
+                accelerator.wait_for_everyone()
+
+                # FSDP saving requires all processes to participate in save_state
+                save_path = train_cfg.output_dir / f"ckpt_step{global_step}"
+                
+                if accelerator.is_main_process:
+                    print(f"[DEBUG] Step {global_step}: All processes synced. Wait time: {time.perf_counter() - t_wait_start:.2f}s", flush=True)
+                    print(f"[DEBUG] Step {global_step}: Starting save_state to {save_path}...", flush=True)
+                    
+                    # Monitor progress in background
+                    stop_event = threading.Event()
+                    def _monitor():
+                        while not stop_event.wait(5):
+                            if not save_path.exists(): continue
+                            try:
+                                size = sum(p.stat().st_size for p in save_path.rglob('*') if p.is_file())
+                                print(f"[DEBUG] Saving... {size/1e6:.1f} MB written", flush=True)
+                            except: pass
+                    t_mon = threading.Thread(target=_monitor)
+                    t_mon.start()
+                    
+                    t_save_start = time.perf_counter()
+                
+                # WORKAROUND: MpDeviceLoaderWrapper doesn't have .dataset attribute
+                # Patch it temporarily so accelerator.save_state() doesn't crash
+                patched_loaders = []
+                for dl in accelerator._dataloaders:
+                    if not hasattr(dl, 'dataset'):
+                        dl.dataset = None  # Add fake attribute
+                        patched_loaders.append(dl)
+                
+                try:
+                    accelerator.save_state(output_dir=save_path)
+                finally:
+                    # Clean up patches
+                    for dl in patched_loaders:
+                        delattr(dl, 'dataset')
+                
+                if accelerator.is_main_process:
+                    stop_event.set()
+                    t_mon.join()
+                    
+                    save_duration = time.perf_counter() - t_save_start
                     logger.info(f"Saved checkpoint to {save_path}")
+                    print(f"[DEBUG] Step {global_step}: save_state completed in {save_duration:.2f}s", flush=True)
+                    logger.info(f"Saved checkpoint to {save_path} in {save_duration:.2f}s")
+
                     # Cleanup old checkpoints if configured
                     if train_cfg.keep_last_n is not None:
                         cleanup_old_checkpoints(train_cfg.output_dir, train_cfg.keep_last_n)

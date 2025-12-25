@@ -1,21 +1,41 @@
 import os
 import logging
+import sys
 
+print("[MODEL.PY] Starting imports...", flush=True)
+
+print("[MODEL.PY] Importing dac...", flush=True)
 import dac
+print("[MODEL.PY] Importing numpy...", flush=True)
 import numpy as np
+print("[MODEL.PY] Importing torch...", flush=True)
 import torch
+print("[MODEL.PY] Importing torchaudio...", flush=True)
 import torchaudio
+print("[MODEL.PY] Importing huggingface_hub...", flush=True)
 from huggingface_hub import hf_hub_download
+print("[MODEL.PY] Importing safetensors...", flush=True)
+try:
+    from safetensors.torch import load_file as safetensors_load_file
+except Exception:
+    safetensors_load_file = None
+print("[MODEL.PY] Safetensors done.", flush=True)
 
+print("[MODEL.PY] Importing .audio...", flush=True)
 from .audio import audio_to_codebook, codebook_to_audio
+print("[MODEL.PY] Importing .config...", flush=True)
 from .config import DiaConfig
+print("[MODEL.PY] Importing .layers...", flush=True)
 from .layers import DiaModel, KVCache
+print("[MODEL.PY] .layers done.", flush=True)
 
 # Optional XLA import for TPU optimization
+print("[MODEL.PY] Importing torch_xla...", flush=True)
 try:
     import torch_xla.core.xla_model as xm
 except ImportError:
     xm = None
+print("[MODEL.PY] All imports complete.", flush=True)
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +101,12 @@ class Dia:
             RuntimeError: If there is an error loading the DAC model.
         """
         super().__init__()
+        print("[DIA INIT] Starting Dia.__init__...", flush=True)
         self.config = config
         self.device = device if device is not None else get_default_device()
+        print(f"[DIA INIT] Device set to {self.device}. Creating DiaModel...", flush=True)
         self.model = DiaModel(config)
+        print("[DIA INIT] DiaModel created.", flush=True)
         self.dac_model = None
 
     @classmethod
@@ -102,26 +125,47 @@ class Dia:
             FileNotFoundError: If the config or checkpoint file is not found.
             RuntimeError: If there is an error loading the checkpoint.
         """
+        print(f"[FROM_LOCAL] Loading config from {config_path}...", flush=True)
         config = DiaConfig.load(config_path)
         if config is None:
             raise FileNotFoundError(f"Config file not found at {config_path}")
+        print("[FROM_LOCAL] Config loaded.", flush=True)
 
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint file not found at {checkpoint_path}")
 
+        print(f"[FROM_LOCAL] Creating Dia instance with device={device}...", flush=True)
         dia = cls(config, device)
+        print(f"[FROM_LOCAL] Dia instance created. Effective device={dia.device}", flush=True)
 
         try:
-            state_dict = torch.load(checkpoint_path, map_location=dia.device)
+            if checkpoint_path.endswith(".safetensors"):
+                if safetensors_load_file is None:
+                    raise RuntimeError(
+                        "safetensors is not available. Install it or provide a .pth checkpoint."
+                    )
+                print(f"[FROM_LOCAL] Loading safetensors checkpoint: {checkpoint_path}...", flush=True)
+                state_dict = safetensors_load_file(checkpoint_path)
+                print(f"[FROM_LOCAL] Safetensors loaded. Keys: {len(state_dict)}", flush=True)
+            else:
+                print(f"[FROM_LOCAL] Loading .pth checkpoint: {checkpoint_path}...", flush=True)
+                state_dict = torch.load(checkpoint_path, map_location=dia.device)
+                print(f"[FROM_LOCAL] .pth loaded. Keys: {len(state_dict)}", flush=True)
+            print("[FROM_LOCAL] Loading state_dict into model...", flush=True)
             dia.model.load_state_dict(state_dict)
+            print("[FROM_LOCAL] state_dict loaded.", flush=True)
         except FileNotFoundError:
             raise FileNotFoundError(f"Checkpoint file not found at {checkpoint_path}")
         except Exception as e:
             raise RuntimeError(f"Error loading checkpoint from {checkpoint_path}: {e}") from e
 
+        print(f"[FROM_LOCAL] Moving model to {dia.device}...", flush=True)
         dia.model.to(dia.device)
+        print("[FROM_LOCAL] Model moved. Setting eval mode...", flush=True)
         dia.model.eval()
+        print("[FROM_LOCAL] Loading DAC model...", flush=True)
         dia._load_dac_model()
+        print("[FROM_LOCAL] DAC model loaded. from_local complete.", flush=True)
         return dia
 
     @classmethod
@@ -150,8 +194,13 @@ class Dia:
 
     def _load_dac_model(self):
         try:
+            print("[DAC] Downloading DAC model...", flush=True)
             dac_model_path = dac.utils.download()
-            dac_model = dac.DAC.load(dac_model_path).to(self.device)
+            print(f"[DAC] DAC path: {dac_model_path}. Loading...", flush=True)
+            dac_model = dac.DAC.load(dac_model_path)
+            print(f"[DAC] DAC loaded. Moving to {self.device}...", flush=True)
+            dac_model = dac_model.to(self.device)
+            print("[DAC] DAC on device.", flush=True)
         except Exception as e:
             raise RuntimeError("Failed to load DAC model") from e
         self.dac_model = dac_model

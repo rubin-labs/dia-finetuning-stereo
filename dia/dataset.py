@@ -157,14 +157,34 @@ class PreEncodedDACDataset(Dataset):
         
         self.encoded_files = []
         target_dir = encoded_dir if encoded_dir.exists() else self.preprocessed_dir
+        cache_file = self.preprocessed_dir / "file_list.json"
+        loaded_from_cache = False
         
-        print(f"[DATASET] Scanning {target_dir} for .pt files...", flush=True)
-        count = 0
-        for p in target_dir.glob("*.pt"):
-            self.encoded_files.append(p)
-            count += 1
-            if count % 1000 == 0:
-                print(f"[DATASET] Found {count} files...", flush=True)
+        # 1. Try loading from cache
+        if cache_file.exists():
+            try:
+                print(f"[Dataset] Loading file list from cache: {cache_file}")
+                with open(cache_file, 'r') as f:
+                    rel_paths = json.load(f)
+                    self.encoded_files = [self.preprocessed_dir / p for p in rel_paths]
+                loaded_from_cache = True
+            except Exception as e:
+                print(f"[Dataset] Cache load failed ({e}), falling back to scan.")
+
+        # 2. Scan if not cached
+        if not loaded_from_cache:
+            print(f"[Dataset] Scanning {target_dir} for .pt files (this may take a moment)...")
+            for p in target_dir.glob("*.pt"):
+                self.encoded_files.append(p)
+            
+            # 3. Save cache
+            try:
+                rel_paths = [str(p.relative_to(self.preprocessed_dir)) for p in self.encoded_files]
+                with open(cache_file, 'w') as f:
+                    json.dump(rel_paths, f)
+                print(f"[Dataset] Saved file list cache to {cache_file}")
+            except Exception as e:
+                print(f"[Dataset] Warning: Failed to save cache: {e}")
         
         if not self.encoded_files:
             raise FileNotFoundError(f"No .pt files found in {self.preprocessed_dir} or {self.preprocessed_dir}/encoded_audio")

@@ -1,17 +1,14 @@
 import argparse
 import os
 import random
-
-import numpy as np
-import soundfile as sf
-import torch
-
-from dia.model import Dia
-from dia.finetune_acc_lora import inject_lora_into_model
+import time
 
 
 def set_seed(seed: int):
     """Sets the random seed for reproducibility."""
+    import numpy as np
+    import torch
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -24,6 +21,7 @@ def set_seed(seed: int):
 
 
 def main():
+    print("Starting CLI...")
     parser = argparse.ArgumentParser(description="Generate audio using the Dia model.")
 
     parser.add_argument("text", type=str, help="Input text for speech generation.")
@@ -52,7 +50,9 @@ def main():
     )
 
     gen_group = parser.add_argument_group("Generation Parameters")
-    # Removed --max-tokens; generation always uses config.data.audio_length
+    gen_group.add_argument(
+        "--max-tokens", type=int, default=None, help="Max tokens to generate (default: use config audio_length). Use small value like 10 for quick test."
+    )
     gen_group.add_argument(
         "--cfg-scale", type=float, default=3.0, help="Classifier-Free Guidance scale (default: 3.0)."
     )
@@ -66,34 +66,29 @@ def main():
     infra_group.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run inference on (e.g., 'cuda', 'cpu', default: auto).",
+        default="auto",
+        help="Device to run inference on (e.g., 'cuda', 'cpu', 'tpu', default: auto).",
     )
 
-    lora_group = parser.add_argument_group("LoRA")
-    lora_group.add_argument(
-        "--lora_full_ckpt",
-        type=str,
-        default=None,
-        help="Path to a full checkpoint containing base+LoRA weights.",
-    )
-    lora_group.add_argument(
-        "--lora_adapter",
-        type=str,
-        default=None,
-        help="Path to an adapter-only checkpoint with lora_* keys.",
-    )
-    lora_group.add_argument(
-        "--lora_targets",
-        type=str,
-        default="attn_qkv,attn_o",
-        help="Comma-separated subset of: attn_qkv,attn_o,mlp,logits",
-    )
-    lora_group.add_argument("--lora_r", type=int, default=16)
-    lora_group.add_argument("--lora_alpha", type=int, default=16)
-    lora_group.add_argument("--lora_dropout", type=float, default=0.0)
 
     args = parser.parse_args()
+
+    print("Importing numpy...", flush=True)
+    import numpy as np
+    print("Importing soundfile...", flush=True)
+    import soundfile as sf
+    print("Importing torch...", flush=True)
+    import torch
+
+    try:
+        print("Importing torch_xla...", flush=True)
+        import torch_xla.core.xla_model as xm
+    except Exception:
+        xm = None
+
+    print("Importing Dia...", flush=True)
+    from dia.model import Dia
+    print("Dia import complete.", flush=True)
 
     # Validation for local paths
     if args.local_paths:
@@ -112,65 +107,93 @@ def main():
         print(f"Using random seed: {args.seed}")
 
     # Determine device
-    device = torch.device(args.device)
-    print(f"Using device: {device}")
+    print("Determining device...", flush=True)
+    t_start = time.time()
+    device_arg = args.device.lower()
+    print(f"Device arg: {device_arg}", flush=True)
+    
+    if device_arg == "auto":
+        # For inference CLI, default to CPU to avoid TPU multi-process coordination issues
+        # TPU inference requires proper XLA setup (use Accelerate for that)
+        if torch.cuda.is_available():
+            device_arg = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device_arg = "mps"
+        else:
+            device_arg = "cpu"
+    print(f"Resolved device_arg: {device_arg}", flush=True)
+
+    if device_arg in {"xla", "tpu"}:
+        if xm is None:
+            print("torch_xla is not available. Install it or use --device cpu.", flush=True)
+            exit(1)
+        # For single-process TPU inference, we need special setup
+        # Use PJRT runtime with explicit device specification
+        print("Setting up single-device TPU inference...", flush=True)
+        os.environ.setdefault("PJRT_DEVICE", "TPU")
+        # Get the first TPU core (index 0)
+        print("Calling xm.xla_device()...", flush=True)
+        device = xm.xla_device()
+        print(f"Got XLA device: {device}", flush=True)
+    else:
+        device = torch.device(device_arg)
+    print(f"Using device: {device}", flush=True)
 
     # Load model
-    print("Loading model...")
+    print("Loading model...", flush=True)
     if args.local_paths:
-        print(f"Loading from local paths: config='{args.config}', checkpoint='{args.checkpoint}'")
+        print(f"Loading from local paths: config='{args.config}', checkpoint='{args.checkpoint}'", flush=True)
         try:
+            t_load = time.time()
             model = Dia.from_local(args.config, args.checkpoint, device=device)
+            print(f"Model load time: {time.time() - t_load:.2f}s", flush=True)
         except Exception as e:
-            print(f"Error loading local model: {e}")
+            print(f"Error loading local model: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
             exit(1)
     else:
-        print(f"Loading from Hugging Face Hub: repo_id='{args.repo_id}'")
+        print(f"Loading from Hugging Face Hub: repo_id='{args.repo_id}'", flush=True)
         try:
+            t_load = time.time()
             model = Dia.from_pretrained(args.repo_id, device=device)
+            print(f"Model load time: {time.time() - t_load:.2f}s", flush=True)
         except Exception as e:
-            print(f"Error loading model from Hub: {e}")
+            print(f"Error loading model from Hub: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
             exit(1)
-    print("Model loaded.")
-
-    # Optionally apply LoRA
-    if args.lora_full_ckpt or args.lora_adapter:
-        try:
-            targets = {t.strip() for t in args.lora_targets.split(",") if t.strip()}
-            # Inject wrappers into the underlying torch.nn.Module
-            inject_lora_into_model(model.model, args.lora_r, args.lora_alpha, args.lora_dropout, targets)
-            if args.lora_full_ckpt:
-                print(f"Loading full LoRA checkpoint: {args.lora_full_ckpt}")
-                sd = torch.load(args.lora_full_ckpt, map_location=device)
-                model.model.load_state_dict(sd, strict=True)
-            elif args.lora_adapter:
-                print(f"Loading adapter-only LoRA checkpoint: {args.lora_adapter}")
-                adapter_sd = torch.load(args.lora_adapter, map_location=device)
-                # Partial load (only lora_* keys). strict=False allows base weights to be kept.
-                model.model.load_state_dict(adapter_sd, strict=False)
-            # Ensure newly created LoRA params are on the correct device
-            model.model.to(device)
-            model.model.eval()
-            print("LoRA applied.")
-        except Exception as e:
-            print(f"Error applying LoRA: {e}")
-            exit(1)
+    print("Model loaded.", flush=True)
 
     # Generate audio
-    print("Generating audio...")
+    print("Generating audio...", flush=True)
     try:
         sample_rate = 44100  # Default assumption
 
-        output_audio = model.generate(
+        t_gen = time.time()
+        
+        # Override max_tokens if specified (for quick testing)
+        gen_kwargs = dict(
             text=args.text,
             audio_prompt_path=args.audio_prompt,
             cfg_scale=args.cfg_scale,
             temperature=args.temperature,
             top_p=args.top_p,
         )
-        print("Audio generation complete.")
+        if args.max_tokens:
+            # Temporarily override config's audio_length
+            original_audio_length = model.config.data.audio_length
+            model.config.data.audio_length = args.max_tokens
+            print(f"Overriding audio_length: {original_audio_length} -> {args.max_tokens}", flush=True)
+        
+        output_audio = model.generate(**gen_kwargs)
+        
+        if args.max_tokens:
+            model.config.data.audio_length = original_audio_length
+        print(f"Generation time: {time.time() - t_gen:.2f}s", flush=True)
+        print("Audio generation complete.", flush=True)
 
-        print(f"Saving audio to {args.output}...")
+        print(f"Saving audio to {args.output}...", flush=True)
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
         # Ensure correct shape (frames, channels) and dtype for soundfile
@@ -184,11 +207,15 @@ def main():
             if arr.dtype not in (np.float32, np.float64, np.int16, np.int32):
                 arr = arr.astype(np.float32)
 
+        t_save = time.time()
         sf.write(args.output, arr, sample_rate)
-        print(f"Audio successfully saved to {args.output}")
+        print(f"Save time: {time.time() - t_save:.2f}s", flush=True)
+        print(f"Audio successfully saved to {args.output}", flush=True)
 
     except Exception as e:
-        print(f"Error during audio generation or saving: {e}")
+        print(f"Error during audio generation or saving: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         exit(1)
 
 

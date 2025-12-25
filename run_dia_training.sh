@@ -119,17 +119,17 @@ python3 -m accelerate.commands.launch \
     -m dia.train_acc_tpu \
     --config configs/architecture/experiments/20251127_dia_010_gpu_refactor_scratch_dataset_model.json \
     --preencoded_dir /home/olivercamp/bucket_mount/preencoded/SAVING80KENCODEDAUDIOS \
-    --output_dir ./checkpoints \
+    --output_dir /home/olivercamp/bucket_mount/checkpoints \
     --batch_size 8 \
     --learning_rate 2e-4 \
     --warmup_steps 1000 \
     --unconditional_frac 0.15 \
     --epochs 50 \
     --wandb_project dia-tpu \
-    --demo_every 2155 \
-    --eval_every 431 \
+    --demo_every 1260 \
+    --eval_every 630 \
     --weight_decay 0.1 \
     --grad_clip_max_norm 1.0 \
-    --save_step 5000 \
+    --save_step 1260 \
     --keep_last_n 3 \
     2>&1 | tee train_fsdp.log

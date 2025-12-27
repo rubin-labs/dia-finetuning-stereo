@@ -15,6 +15,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 import argparse
 import glob
 import logging
+import shutil
 import json
 import random
 import re
@@ -42,7 +43,7 @@ from transformers import get_scheduler
 
 from .audio import apply_audio_delay, build_delay_indices, codebook_to_audio
 from .config import DiaConfig
-from .dataset import PreEncodedDACDataset
+from .dataset import PreEncodedDACDataset, HuggingFacePreEncodedDataset
 from .layers import DiaModel, KVCache
 from .model import Dia
 
@@ -66,13 +67,14 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 TEST_PROMPTS = {
-    "trap melodic": "trap, melodic, bass, drums, synth",
-    "hip hop": "hip hop, rap",
+    "celtic": "celtic",
+    "poprock": "poprock, happy, positive",
+    "jazz funk": "funk, jazz, percussions",
 }
 EVAL_CFG_SCALE = 4.0
 EVAL_CFG_SCALE_UNCOND = 0.0
 EVAL_TOP_P = 0.95
-EVAL_TEMPERATURES = [0.5, 1.0]
+EVAL_TEMPERATURES = [1.0]
 EVAL_SAMPLE_RATE = 44100
 EVAL_AUDIO_DIR = "./audio_demos"
 ENTROPY_LOG_INTERVAL = 50
@@ -169,17 +171,97 @@ def _augment_tags(text: str, train_cfg: "TrainConfig") -> str:
     return ', '.join(tags)
 
 def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int):
-    if keep_last_n is None: return
-    for pattern in ["ckpt_step*.pth", "ckpt_epoch*.pth"]:
-        files = sorted(glob.glob(str(output_dir / pattern)), 
-                       key=lambda x: int(re.search(r'(\d+).pth', x).group(1)) if re.search(r'(\d+).pth', x) else 0)
-        if len(files) > keep_last_n:
-            for old_ckpt in files[:-keep_last_n]:
-                try:
-                    os.remove(old_ckpt)
-                    logger.info(f"Removed old checkpoint: {old_ckpt}")
-                except Exception:
-                    pass
+    if keep_last_n is None:
+        return
+    # Look for checkpoint directories (not .pth files)
+    dirs = sorted(
+        [d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("ckpt_step")],
+        key=lambda x: int(re.search(r'(\d+)$', x.name).group(1)) if re.search(r'(\d+)$', x.name) else 0
+    )
+    if len(dirs) > keep_last_n:
+        for old_ckpt_dir in dirs[:-keep_last_n]:
+            try:
+                shutil.rmtree(old_ckpt_dir)
+                logger.info(f"Removed old checkpoint: {old_ckpt_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to remove {old_ckpt_dir}: {e}")
+
+def _extract_step_from_ckpt_name(name: str) -> Optional[int]:
+    match = re.search(r"ckpt_step(\d+)", name)
+    if match:
+        return int(match.group(1))
+    return None
+
+def resolve_resume_path(resume_from: Optional[str], output_dir: Path):
+    if not resume_from:
+        return None, 0
+    if resume_from == "latest":
+        if not output_dir.exists():
+            raise FileNotFoundError(f"Output dir does not exist: {output_dir}")
+        candidates = []
+        for p in output_dir.glob("ckpt_step*"):
+            step = _extract_step_from_ckpt_name(p.name)
+            if step is not None:
+                candidates.append((step, p))
+        if not candidates:
+            raise FileNotFoundError(f"No checkpoints found in {output_dir}")
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        resume_path = candidates[0][1]
+    else:
+        resume_path = Path(resume_from)
+    if not resume_path.exists():
+        raise FileNotFoundError(f"Checkpoint path not found: {resume_path}")
+    step = _extract_step_from_ckpt_name(resume_path.name) or 0
+    return resume_path, step
+
+def prepare_resume_checkpoint(resume_path: Path, accelerator):
+    """Convert safetensors -> .bin for TPU load_state compatibility."""
+    try:
+        from accelerate.utils.constants import SAFE_MODEL_NAME, MODEL_NAME
+    except Exception:
+        return
+    safe_files = list(resume_path.glob(f"{SAFE_MODEL_NAME}*.safetensors"))
+    if not safe_files:
+        return
+    if accelerator.is_main_process:
+        try:
+            from safetensors.torch import load_file as safetensors_load_file
+        except Exception as exc:
+            raise RuntimeError("safetensors is required to convert checkpoints for resume") from exc
+        for safe_path in safe_files:
+            suffix = safe_path.stem[len(SAFE_MODEL_NAME):]
+            bin_path = resume_path / f"{MODEL_NAME}{suffix}.bin"
+            if not bin_path.exists():
+                state = safetensors_load_file(safe_path, device="cpu")
+                torch.save(state, bin_path)
+    accelerator.wait_for_everyone()
+
+@contextmanager
+def disable_safetensors_load():
+    try:
+        import accelerate.checkpointing as ckpt
+    except Exception:
+        yield
+        return
+    original = ckpt.SAFE_MODEL_NAME
+    ckpt.SAFE_MODEL_NAME = "model_disabled"
+    try:
+        yield
+    finally:
+        ckpt.SAFE_MODEL_NAME = original
+
+@contextmanager
+def patch_dataloaders_for_state(accelerator):
+    patched = []
+    for dl in getattr(accelerator, "_dataloaders", []):
+        if not hasattr(dl, "dataset"):
+            dl.dataset = None
+            patched.append(dl)
+    try:
+        yield
+    finally:
+        for dl in patched:
+            delattr(dl, "dataset")
 
 def get_dac_model(device):
     """Load and cache DAC model per device for demo generation."""
@@ -291,6 +373,23 @@ def setup_loaders(dataset, dia_cfg: DiaConfig, train_cfg: TrainConfig, use_slidi
     # Collate runs on CPU, Accelerate handles transfer
     collate = partial(collate_fn, config=dia_cfg, train_cfg=train_cfg, device=None, use_sliding_window=use_sliding_window)
     
+    # Check if this is an IterableDataset (streaming mode)
+    is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
+    
+    if is_iterable:
+        # Streaming dataset: no random_split, no shuffle (shuffling happens via streaming)
+        # For streaming, we skip validation to keep things simple
+        train_loader = DataLoader(
+            dataset, batch_size=train_cfg.batch_size, shuffle=False,
+            collate_fn=collate, num_workers=0,  # num_workers=0 for streaming to avoid issues
+            pin_memory=True, drop_last=True
+        )
+        # Attach length info for scheduler calculation
+        ds_len = len(dataset)  # HuggingFacePreEncodedDataset provides __len__
+        train_loader.steps_per_epoch = ds_len // train_cfg.batch_size
+        return train_loader, None
+    
+    # Map-style dataset: standard handling
     ds_len = len(dataset)
     n_train = int(train_cfg.split_ratio * ds_len)
     n_val = ds_len - n_train
@@ -623,16 +722,21 @@ def main():
     # Parse args inside main() so Accelerate's TPU launcher can call it without arguments
     print("[DEBUG] Python script starting...", flush=True)
     args = get_args()
+    print(f"[DEBUG] Args parsed. hf_dataset={args.hf_dataset}, preencoded_dir={args.preencoded_dir}", flush=True)
     
     # Initialize Accelerator with BF16 and FSDP awareness
+    print("[DEBUG] Initializing Accelerator...", flush=True)
     accelerator = Accelerator(mixed_precision="bf16", log_with="wandb")
     device = accelerator.device
+    print(f"[DEBUG] Accelerator initialized. device={device}, is_main={accelerator.is_main_process}", flush=True)
     
     if accelerator.is_main_process:
         print(f"[INIT] Launching on {accelerator.num_processes} processes (FSDP enabled).")
 
     # Load Config
+    print(f"[DEBUG] Loading config from {args.config}. is_main={accelerator.is_main_process}", flush=True)
     dia_cfg = DiaConfig.load(args.config)
+    print(f"[DEBUG] Config loaded. is_main={accelerator.is_main_process}", flush=True)
     train_cfg = TrainConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -650,20 +754,45 @@ def main():
     )
     
     # WandB Init (Accelerate handles main process check internally for loggers usually, but we are explicit)
+    print(f"[DEBUG] About to init WandB. is_main={accelerator.is_main_process}", flush=True)
     if accelerator.is_main_process:
+        print("[DEBUG] Main process: Initializing WandB...", flush=True)
         train_cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[DEBUG] Main process: Output dir created: {train_cfg.output_dir}", flush=True)
         accelerator.init_trackers(
             project_name=args.wandb_project, 
             config=vars(args),
             init_kwargs={"wandb": {"name": train_cfg.run_name}}
         )
+        print("[DEBUG] Main process: WandB initialized", flush=True)
+    print(f"[DEBUG] WandB section complete. is_main={accelerator.is_main_process}", flush=True)
 
     # Dataset
+    print(f"[DEBUG] About to load dataset. hf_dataset={args.hf_dataset}, preencoded_dir={args.preencoded_dir}, audio_folder={args.audio_folder}", flush=True)
     if accelerator.is_main_process:
         print("[DEBUG] Loading dataset...", flush=True)
     
     dataset = None
-    if args.preencoded_dir:
+    if args.hf_dataset:
+        # Load from HuggingFace datasets in STREAMING mode
+        # Streaming avoids disk space issues (no Arrow cache needed)
+        print(f"[DEBUG] Loading HuggingFace streaming dataset: {args.hf_dataset}", flush=True)
+        try:
+            dataset = HuggingFacePreEncodedDataset(
+                dataset_name=args.hf_dataset,
+                config=dia_cfg,
+                split="train",
+                use_sliding_window=args.use_sliding_window,
+                dataset_length=args.hf_dataset_length,  # Known size for progress tracking
+            )
+            print(f"[DEBUG] Streaming dataset configured, length={len(dataset)}", flush=True)
+        except Exception as e:
+            print(f"[ERROR] Failed to configure streaming dataset: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+            
+    elif args.preencoded_dir:
         # Optimization: Load on main process first to generate cache and avoid GCS thundering herd
         if accelerator.is_main_process:
             print("[DEBUG] Main process scanning dataset...", flush=True)
@@ -673,7 +802,6 @@ def main():
         accelerator.wait_for_everyone()
         
         if not accelerator.is_main_process:
-            print("[DEBUG] Worker process loading dataset from cache...", flush=True)
             dataset = PreEncodedDACDataset(args.preencoded_dir, dia_cfg, args.use_sliding_window)
             
     elif args.audio_folder:
@@ -697,7 +825,10 @@ def main():
         print("[DEBUG] DiaModel created.", flush=True)
     
     if accelerator.is_main_process:
-        print("[TRAIN] Training from scratch (no pretrained weights)", flush=True)
+        if args.resume_from:
+            print("[TRAIN] Resuming from checkpoint", flush=True)
+        else:
+            print("[TRAIN] Training from scratch (no pretrained weights)", flush=True)
 
     # Optimizer & Scheduler
     if accelerator.is_main_process:
@@ -719,13 +850,48 @@ def main():
         if accelerator.is_main_process:
             print("[DEBUG] val_loader prepared.", flush=True)
 
-    global_step = 0
+    resume_path, resume_step = resolve_resume_path(args.resume_from, train_cfg.output_dir)
+    if resume_path is not None:
+        print(f"[RESUME] Worker {accelerator.process_index}: Found checkpoint at {resume_path}, step={resume_step}", flush=True)
+        
+        print(f"[RESUME] Worker {accelerator.process_index}: Calling prepare_resume_checkpoint...", flush=True)
+        prepare_resume_checkpoint(resume_path, accelerator)
+        print(f"[RESUME] Worker {accelerator.process_index}: prepare_resume_checkpoint done", flush=True)
+        
+        if accelerator.is_main_process:
+            # List checkpoint contents for debugging
+            import os
+            ckpt_files = os.listdir(resume_path)
+            total_size = sum(os.path.getsize(resume_path / f) for f in ckpt_files if os.path.isfile(resume_path / f))
+            print(f"[RESUME] Checkpoint contains {len(ckpt_files)} files, total size: {total_size / 1e6:.1f} MB", flush=True)
+            print(f"[RESUME] Files: {ckpt_files[:10]}{'...' if len(ckpt_files) > 10 else ''}", flush=True)
+        
+        print(f"[RESUME] Worker {accelerator.process_index}: Starting load_state...", flush=True)
+        t_load_start = time.perf_counter()
+        
+        with disable_safetensors_load(), patch_dataloaders_for_state(accelerator):
+            accelerator.load_state(resume_path)
+        
+        print(f"[RESUME] Worker {accelerator.process_index}: load_state done in {time.perf_counter() - t_load_start:.1f}s", flush=True)
+        
+        print(f"[RESUME] Worker {accelerator.process_index}: Waiting for everyone...", flush=True)
+        accelerator.wait_for_everyone()
+        print(f"[RESUME] Worker {accelerator.process_index}: All workers synced after load", flush=True)
+
+    global_step = resume_step
+    start_epoch = global_step // steps_per_epoch
+    resume_step_in_epoch = global_step % steps_per_epoch
     log_interval = 10  # Log every N steps
     accumulated_loss = 0.0
     loss_count = 0
     
     if accelerator.is_main_process:
-        print("[DEBUG] Setup complete. global_step=0", flush=True)
+        print(f"[DEBUG] Setup complete. global_step={global_step}", flush=True)
+        if resume_path is not None:
+            print(
+                f"[RESUME] Resuming at epoch {start_epoch + 1} step {resume_step_in_epoch}.",
+                flush=True,
+            )
         print("[DEBUG] STARTING TRAINING LOOP - VERIFYING LOGGING", flush=True)
 
     # Track gradient norms for logging
@@ -733,9 +899,21 @@ def main():
     accumulated_post_clip_norm = 0.0
     grad_norm_count = 0
 
-    for epoch in range(train_cfg.epochs):
+    for epoch in range(start_epoch, train_cfg.epochs):
         model.train()
-        for batch in tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"E{epoch+1}"):
+        loader_iter = tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"E{epoch+1}")
+        if resume_step_in_epoch and epoch == start_epoch:
+            if accelerator.is_main_process:
+                print(
+                    f"[RESUME] Skipping {resume_step_in_epoch} steps to align with checkpoint.",
+                    flush=True,
+                )
+            for _ in range(resume_step_in_epoch):
+                try:
+                    next(loader_iter)
+                except StopIteration:
+                    break
+        for batch in loader_iter:
             # Debug: Unconditional print for first 20 steps to trace execution
             if accelerator.is_main_process and global_step < 20:
                  print(f"[DEBUG] Step {global_step}: Batch loaded. Starting training step...", flush=True)
@@ -827,13 +1005,22 @@ def main():
                         patched_loaders.append(dl)
                 
                 try:
-                    accelerator.save_state(output_dir=save_path)
+                    accelerator.save_state(output_dir=save_path, safe_serialization=False)
                 finally:
                     # Clean up patches
                     for dl in patched_loaders:
                         delattr(dl, 'dataset')
+
+                # Ensure all ranks have finished writing before marking the checkpoint complete
+                accelerator.wait_for_everyone()
                 
                 if accelerator.is_main_process:
+                    # Mark checkpoint complete (used by AUTO_RESUME selection in run_dia_training.sh)
+                    try:
+                        (save_path / ".complete").write_text("ok\n")
+                    except Exception as e:
+                        print(f"[DEBUG] Step {global_step}: Warning: failed to write .complete marker: {e}", flush=True)
+
                     stop_event.set()
                     t_mon.join()
                     
@@ -860,6 +1047,8 @@ def main():
                 run_eval(model, val_loader, dia_cfg, global_step, accelerator)
                 model.train()
                 accelerator.wait_for_everyone()
+        if epoch == start_epoch:
+            resume_step_in_epoch = 0
 
     accelerator.end_training()
 
@@ -868,7 +1057,21 @@ def get_args():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--audio_folder", type=Path)
     parser.add_argument("--preencoded_dir", type=Path)
+    parser.add_argument("--hf_dataset", type=str, default=None, 
+                       help="HuggingFace dataset name (e.g., 'oliver-camp/open-source-dataset')")
+    parser.add_argument("--hf_cache_dir", type=str, default=None,
+                       help="Cache directory for HuggingFace datasets (unused in streaming mode)")
+    parser.add_argument("--hf_dataset_length", type=int, default=31333,
+                       help="Known dataset size for progress tracking (default: 31333 for oliver-camp/open-source-dataset)")
+    parser.add_argument("--hf_parquet_dir", type=Path, default=None,
+                       help="Directory containing HuggingFace parquet files (from hf_to_gcs_fast.py)")
     parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Checkpoint dir (ckpt_stepXXXX) or 'latest' to auto-resume from output_dir",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=1e-4)

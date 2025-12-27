@@ -13,6 +13,7 @@ tqdm
 
 # Utilities
 huggingface-hub>=0.30.2
+datasets>=2.14.0
 safetensors>=0.5.3
 pydantic>=2.11.3
 

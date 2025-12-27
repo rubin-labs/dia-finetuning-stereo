@@ -149,3 +149,4 @@
 - `2025-12-22 21:07` [`637cafc`] **010**: FULLY WORKING
 - `2025-12-22 21:23` [`ce9194b`] **010**: frontier_test 55356 dataset size, type beat dataset. first actual run. verifying to see if training pipeline works, if loss decreases, and can generate coherent audio.
 - `2025-12-23 14:21` [`75a6240`] **010**: removed 1.0 attention scaling, back to default, GET IN LADSgit add .git add . working finally. grad norm is no longer freaking out
+- `2025-12-25 02:51` [`329e424`] **010**: removed 4x 1st channel weight 2

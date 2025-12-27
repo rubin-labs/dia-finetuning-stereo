@@ -2,40 +2,26 @@ import os
 import logging
 import sys
 
-print("[MODEL.PY] Starting imports...", flush=True)
-
-print("[MODEL.PY] Importing dac...", flush=True)
 import dac
-print("[MODEL.PY] Importing numpy...", flush=True)
 import numpy as np
-print("[MODEL.PY] Importing torch...", flush=True)
 import torch
-print("[MODEL.PY] Importing torchaudio...", flush=True)
 import torchaudio
-print("[MODEL.PY] Importing huggingface_hub...", flush=True)
 from huggingface_hub import hf_hub_download
-print("[MODEL.PY] Importing safetensors...", flush=True)
+
 try:
     from safetensors.torch import load_file as safetensors_load_file
 except Exception:
     safetensors_load_file = None
-print("[MODEL.PY] Safetensors done.", flush=True)
 
-print("[MODEL.PY] Importing .audio...", flush=True)
 from .audio import audio_to_codebook, codebook_to_audio
-print("[MODEL.PY] Importing .config...", flush=True)
 from .config import DiaConfig
-print("[MODEL.PY] Importing .layers...", flush=True)
 from .layers import DiaModel, KVCache
-print("[MODEL.PY] .layers done.", flush=True)
 
 # Optional XLA import for TPU optimization
-print("[MODEL.PY] Importing torch_xla...", flush=True)
 try:
     import torch_xla.core.xla_model as xm
 except ImportError:
     xm = None
-print("[MODEL.PY] All imports complete.", flush=True)
 
 logger = logging.getLogger(__name__)
 
